@@ -1,0 +1,79 @@
+spec_version: 2
+description: |
+  Execute shell commands on a remote host via SSH.
+  This blueprint is designed to be called programmatically by the ShellAgent MCP tool
+  to enable Copilot to run commands on remote servers for troubleshooting.
+
+inputs:
+  agent:
+    type: agent
+    description: The Torque agent to use for execution
+  target_ip:
+    type: string
+    description: The IP address or hostname of the target server
+  ssh_user:
+    type: string
+    description: The SSH username to connect with
+  ssh_private_key:
+    type: string
+    description: The SSH private key (base64 encoded) for authentication
+    sensitive: true
+  command:
+    type: string
+    description: The shell command(s) to execute on the remote host
+
+outputs:
+  command_output:
+    value: '{{ .grains.remote_executor.activities.deploy.commands.run_ssh.outputs.command_output }}'
+  exit_code:
+    value: '{{ .grains.remote_executor.activities.deploy.commands.run_ssh.outputs.exit_code }}'
+
+grains:
+  remote_executor:
+    kind: shell
+    spec:
+      agent:
+        name: '{{ .inputs.agent }}'
+      activities:
+        deploy:
+          commands:
+            - name: run_ssh
+              command: |
+                set -e
+                
+                # Decode the private key from base64 and save to temp file
+                KEY_FILE=$(mktemp)
+                echo "{{ .inputs.ssh_private_key }}" | base64 -d > "$KEY_FILE"
+                chmod 600 "$KEY_FILE"
+                
+                # Prepare output file
+                OUTPUT_FILE=$(mktemp)
+                
+                # Run the SSH command and capture output and exit code
+                set +e
+                ssh -o StrictHostKeyChecking=no \
+                    -o UserKnownHostsFile=/dev/null \
+                    -o LogLevel=ERROR \
+                    -i "$KEY_FILE" \
+                    "{{ .inputs.ssh_user }}@{{ .inputs.target_ip }}" \
+                    "{{ .inputs.command }}" > "$OUTPUT_FILE" 2>&1
+                SSH_EXIT_CODE=$?
+                set -e
+                
+                # Read output
+                COMMAND_OUTPUT=$(cat "$OUTPUT_FILE")
+                
+                # Cleanup
+                rm -f "$KEY_FILE" "$OUTPUT_FILE"
+                
+                # Export outputs for Torque to capture
+                export command_output="$COMMAND_OUTPUT"
+                export exit_code="$SSH_EXIT_CODE"
+                
+                # Also print for visibility in logs
+                echo "=== Command Output ==="
+                echo "$COMMAND_OUTPUT"
+                echo "=== Exit Code: $SSH_EXIT_CODE ==="
+              outputs:
+                - command_output
+                - exit_code
