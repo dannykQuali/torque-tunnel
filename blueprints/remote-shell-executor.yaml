@@ -100,10 +100,10 @@ grains:
                 SSH_EXIT_CODE=${PIPESTATUS[0]}
                 set -e
                 
-                COMMAND_OUTPUT=$(cat "$OUTPUT_FILE")
+                COMMAND_OUTPUT_B64=$(base64 < "$OUTPUT_FILE" | tr -d '\n')
                 rm -f "$KEY_FILE" "$OUTPUT_FILE" "$REMOTE_SCRIPT" "$CMD_FILE" "$INIT_FILE" "$FINALLY_FILE"
                 
-                export command_output="$COMMAND_OUTPUT"
+                export command_output="$COMMAND_OUTPUT_B64"
                 export exit_code="$SSH_EXIT_CODE"
                 
                 echo ""

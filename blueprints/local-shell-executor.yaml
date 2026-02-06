@@ -83,10 +83,11 @@ grains:
                 CMD_EXIT_CODE=${PIPESTATUS[0]}
                 set -e
                 
-                COMMAND_OUTPUT=$(cat "$OUTPUT_FILE")
+                # Base64 encode output to safely pass special characters
+                COMMAND_OUTPUT_B64=$(base64 < "$OUTPUT_FILE" | tr -d '\n')
                 rm -f "$OUTPUT_FILE" "$SCRIPT_FILE" "$INIT_FILE" "$FINALLY_FILE" "$COMBINED"
                 
-                export command_output="$COMMAND_OUTPUT"
+                export command_output="$COMMAND_OUTPUT_B64"
                 export exit_code="$CMD_EXIT_CODE"
                 
                 echo ""

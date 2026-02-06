@@ -349,8 +349,14 @@ class TorqueClient:
             if status == "active":
                 # Environment deployed - extract outputs
                 outputs = self._extract_outputs(env_data)
-                command_output = outputs.get("command_output", "")
+                command_output_b64 = outputs.get("command_output", "")
                 exit_code_str = outputs.get("exit_code", "0")
+                
+                # Decode base64 output
+                try:
+                    command_output = base64.b64decode(command_output_b64).decode('utf-8') if command_output_b64 else ""
+                except Exception:
+                    command_output = command_output_b64  # Fallback to raw if decode fails
                 
                 try:
                     exit_code = int(exit_code_str)
@@ -367,8 +373,14 @@ class TorqueClient:
             # Environment ended - could be success or failure, check outputs
             elif status in ("ended", "inactive") or current_state == "inactive":
                 outputs = self._extract_outputs(env_data)
-                command_output = outputs.get("command_output", "")
+                command_output_b64 = outputs.get("command_output", "")
                 exit_code_str = outputs.get("exit_code", "")
+                
+                # Decode base64 output
+                try:
+                    command_output = base64.b64decode(command_output_b64).decode('utf-8') if command_output_b64 else ""
+                except Exception:
+                    command_output = command_output_b64  # Fallback to raw if decode fails
                 
                 # If we have outputs, consider it a success
                 if command_output or exit_code_str:
