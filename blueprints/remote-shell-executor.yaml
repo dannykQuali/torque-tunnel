@@ -18,16 +18,16 @@ inputs:
     type: string
     description: The SSH private key in PEM format for authentication
     sensitive: true
-  command:
-    type: file
-    description: The shell command(s) to execute on the remote host (content will be written to a file)
-  init_commands:
-    type: file
-    description: Commands to run before the main command (e.g., proxy setup)
+  command_b64:
+    type: string
+    description: Base64-encoded shell command(s) to execute on the remote host
+  init_commands_b64:
+    type: string
+    description: Base64-encoded init commands (e.g., proxy setup)
     default: ""
-  finally_commands:
-    type: file
-    description: Commands to run after the main command (cleanup, always runs)
+  finally_commands_b64:
+    type: string
+    description: Base64-encoded finally commands (cleanup, always runs)
     default: ""
 
 outputs:
@@ -58,24 +58,26 @@ grains:
                 OUTPUT_FILE=$(mktemp)
                 REMOTE_SCRIPT=$(mktemp)
                 
-                # Build the script to send to remote host
+                # Decode base64 inputs
+                MAIN_CMD=$(echo '{{ .inputs.command_b64 }}' | base64 -d)
+                INIT_CMD=$(echo '{{ .inputs.init_commands_b64 }}' | base64 -d 2>/dev/null || true)
+                FINALLY_CMD=$(echo '{{ .inputs.finally_commands_b64 }}' | base64 -d 2>/dev/null || true)
+                
                 echo '#!/bin/bash' > "$REMOTE_SCRIPT"
                 
-                # Add finally trap if provided (file content, not path)
-                if [ -s "{{ .inputs.finally_commands }}" ]; then
-                  echo '__finally() {' >> "$REMOTE_SCRIPT"
-                  cat "{{ .inputs.finally_commands }}" >> "$REMOTE_SCRIPT"
-                  echo '}' >> "$REMOTE_SCRIPT"
+                # Add finally trap if provided
+                if [ -n "$FINALLY_CMD" ]; then
+                  echo "__finally() { $FINALLY_CMD; }" >> "$REMOTE_SCRIPT"
                   echo 'trap __finally EXIT' >> "$REMOTE_SCRIPT"
                 fi
                 
                 # Add init commands if provided
-                if [ -s "{{ .inputs.init_commands }}" ]; then
-                  cat "{{ .inputs.init_commands }}" >> "$REMOTE_SCRIPT"
+                if [ -n "$INIT_CMD" ]; then
+                  echo "$INIT_CMD" >> "$REMOTE_SCRIPT"
                 fi
                 
                 # Add main command
-                cat "{{ .inputs.command }}" >> "$REMOTE_SCRIPT"
+                echo "$MAIN_CMD" >> "$REMOTE_SCRIPT"
                 
                 echo "=== Connecting to {{ .inputs.ssh_user }}@{{ .inputs.target_ip }} ==="
                 echo "=== Output (streaming) ========================================================================================================================="

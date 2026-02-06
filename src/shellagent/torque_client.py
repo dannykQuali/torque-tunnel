@@ -3,6 +3,7 @@ Torque API Client for interacting with Quali Torque REST API.
 """
 
 import asyncio
+import base64
 import time
 from typing import Optional, Callable, Awaitable
 from dataclasses import dataclass
@@ -109,19 +110,24 @@ class TorqueClient:
         if not environment_name:
             environment_name = f"shell-cmd-{int(time.time())}"
         
+        inputs = {
+            "agent": agent_name,
+            "target_ip": target_ip,
+            "ssh_user": ssh_user,
+            "ssh_private_key": ssh_private_key,
+            "command_b64": base64.b64encode(command.encode()).decode(),
+        }
+        # Only include optional inputs if they have values
+        if self.init_commands:
+            inputs["init_commands_b64"] = base64.b64encode(self.init_commands.encode()).decode()
+        if self.finally_commands:
+            inputs["finally_commands_b64"] = base64.b64encode(self.finally_commands.encode()).decode()
+        
         payload = {
             "blueprint_name": self.BLUEPRINT_NAME,
             "environment_name": environment_name,
             "duration": "PT8H",  # 8 hours
-            "inputs": {
-                "agent": agent_name,
-                "target_ip": target_ip,
-                "ssh_user": ssh_user,
-                "ssh_private_key": ssh_private_key,
-                "command": command,
-                "init_commands": self.init_commands,
-                "finally_commands": self.finally_commands,
-            },
+            "inputs": inputs,
         }
         
         response = await self._client.post(
@@ -158,16 +164,21 @@ class TorqueClient:
         if not environment_name:
             environment_name = f"local-cmd-{int(time.time())}"
         
+        inputs = {
+            "agent": agent_name,
+            "command_b64": base64.b64encode(command.encode()).decode(),
+        }
+        # Only include optional inputs if they have values
+        if self.init_commands:
+            inputs["init_commands_b64"] = base64.b64encode(self.init_commands.encode()).decode()
+        if self.finally_commands:
+            inputs["finally_commands_b64"] = base64.b64encode(self.finally_commands.encode()).decode()
+        
         payload = {
             "blueprint_name": self.LOCAL_BLUEPRINT_NAME,
             "environment_name": environment_name,
             "duration": "PT8H",  # 8 hours
-            "inputs": {
-                "agent": agent_name,
-                "command": command,
-                "init_commands": self.init_commands,
-                "finally_commands": self.finally_commands,
-            },
+            "inputs": inputs,
         }
         
         response = await self._client.post(
