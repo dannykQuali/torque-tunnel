@@ -48,21 +48,26 @@ grains:
                 KEYEOF
                 chmod 600 "$KEY_FILE"
                 
-                # Prepare output file
+                # Prepare output file for capturing (while also streaming)
                 OUTPUT_FILE=$(mktemp)
                 
-                # Run the SSH command and capture output and exit code
+                echo "=== Connecting to {{ .inputs.ssh_user }}@{{ .inputs.target_ip }} ==="
+                echo "=== Executing: {{ .inputs.command }} ==="
+                echo "=== Output (streaming) ==="
+                
+                # Run the SSH command with output streaming via tee
+                # This shows output in real-time in Torque logs while also capturing it
                 set +e
                 ssh -o StrictHostKeyChecking=no \
                     -o UserKnownHostsFile=/dev/null \
                     -o LogLevel=ERROR \
                     -i "$KEY_FILE" \
                     "{{ .inputs.ssh_user }}@{{ .inputs.target_ip }}" \
-                    "{{ .inputs.command }}" > "$OUTPUT_FILE" 2>&1
-                SSH_EXIT_CODE=$?
+                    "{{ .inputs.command }}" 2>&1 | tee "$OUTPUT_FILE"
+                SSH_EXIT_CODE=${PIPESTATUS[0]}
                 set -e
                 
-                # Read output
+                # Read captured output
                 COMMAND_OUTPUT=$(cat "$OUTPUT_FILE")
                 
                 # Cleanup
@@ -72,10 +77,8 @@ grains:
                 export command_output="$COMMAND_OUTPUT"
                 export exit_code="$SSH_EXIT_CODE"
                 
-                # Also print for visibility in logs
-                echo "=== Command Output ==="
-                echo "$COMMAND_OUTPUT"
-                echo "=== Exit Code: $SSH_EXIT_CODE ==="
+                echo ""
+                echo "=== Command completed with exit code: $SSH_EXIT_CODE ==="
               outputs:
                 - command_output
                 - exit_code
