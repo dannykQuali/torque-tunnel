@@ -185,14 +185,17 @@ class TorqueClient:
             
             # Status can be in different places depending on API version
             details = env_data.get("details", {})
-            status = details.get("computed_status") or env_data.get("computed_status") or env_data.get("status", "unknown")
+            raw_status = details.get("computed_status") or env_data.get("computed_status") or env_data.get("status", "unknown")
             current_state = details.get("state", {}).get("current_state", "")
+            
+            # Normalize status: lowercase and replace spaces with underscores
+            status = raw_status.lower().replace(" ", "_")
             
             # Debug: print status for troubleshooting
             # print(f"Environment {environment_id}: status={status}, current_state={current_state}")
             
             # Check if environment has completed successfully (Active means deployment done)
-            if status.lower() in ("active",):
+            if status == "active":
                 # Environment deployed - extract outputs
                 outputs = self._extract_outputs(env_data)
                 command_output = outputs.get("command_output", "")
@@ -211,7 +214,7 @@ class TorqueClient:
                 )
             
             # Environment ended - could be success or failure, check outputs
-            elif status.lower() in ("ended", "inactive") or current_state == "inactive":
+            elif status in ("ended", "inactive") or current_state == "inactive":
                 outputs = self._extract_outputs(env_data)
                 command_output = outputs.get("command_output", "")
                 exit_code_str = outputs.get("exit_code", "")
@@ -233,12 +236,26 @@ class TorqueClient:
                     return EnvironmentResult(
                         environment_id=environment_id,
                         status="ended",
-                        error=f"Environment ended without outputs. Status: {status}",
+                        error=f"Environment ended without outputs. Status: {raw_status}",
                     )
             
-            elif status.lower() in ("active_with_error", "ended_with_error", "error", "failed", "terminating_failed"):
-                errors = env_data.get("errors", [])
-                error_msg = "; ".join(errors) if errors else f"Environment failed with status: {status}"
+            # Error states - check for errors in the environment
+            elif status in ("active_with_error", "ended_with_error", "error", "failed", "terminating_failed"):
+                # Get errors from state.errors array
+                state_errors = details.get("state", {}).get("errors", [])
+                error_messages = []
+                for err in state_errors:
+                    if isinstance(err, dict) and err.get("message"):
+                        error_messages.append(err["message"])
+                    elif isinstance(err, str):
+                        error_messages.append(err)
+                
+                # Fallback to root-level errors
+                if not error_messages:
+                    root_errors = env_data.get("errors", [])
+                    error_messages = [str(e) for e in root_errors if e]
+                
+                error_msg = "; ".join(error_messages) if error_messages else f"Environment failed with status: {raw_status}"
                 return EnvironmentResult(
                     environment_id=environment_id,
                     status="failed",

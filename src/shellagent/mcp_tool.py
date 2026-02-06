@@ -21,6 +21,42 @@ from mcp.types import (
 from .torque_client import TorqueClient
 
 
+# Dangerous commands that can kill the Torque agent
+DANGEROUS_PATTERNS = [
+    "docker restart",
+    "docker stop",
+    "docker kill",
+    "docker rm",
+    "systemctl restart docker",
+    "systemctl stop docker",
+    "service docker restart",
+    "service docker stop",
+    "reboot",
+    "shutdown",
+    "init 0",
+    "init 6",
+    "poweroff",
+    "halt",
+]
+
+
+def check_dangerous_command(command: str) -> str | None:
+    """Check if command matches dangerous patterns. Returns warning message if dangerous."""
+    cmd_lower = command.lower()
+    for pattern in DANGEROUS_PATTERNS:
+        if pattern in cmd_lower:
+            return f"""⚠️ **DANGEROUS COMMAND DETECTED** ⚠️
+
+The command `{command}` contains `{pattern}` which can KILL the Torque agent and cause this operation to fail.
+
+**This command should be run MANUALLY via direct SSH or console access, NOT via this tool.**
+
+If you still want to proceed (NOT RECOMMENDED), call this tool again with the parameter `force=true`.
+
+Reason: The Torque Docker Agent executes commands on the remote server. Restarting Docker or the agent container will terminate the agent mid-execution, causing an unrecoverable error."""
+    return None
+
+
 def read_ssh_key_file(file_path: str) -> str:
     """Read SSH private key from a file path."""
     expanded_path = os.path.expanduser(file_path)
@@ -74,7 +110,7 @@ async def list_tools():
             description="""Execute a shell command on a remote server via SSH.
 
 This tool connects to a remote server using SSH credentials and executes the specified command.
-The command is executed through Torque's Shell Grain infrastructure.
+The command is executed through Torque's Shell Grain infrastructure (a Docker-based agent).
 
 Use this tool when you need to:
 - Troubleshoot a remote server
@@ -82,6 +118,16 @@ Use this tool when you need to:
 - View log files
 - Run diagnostic commands
 - Execute administrative tasks
+
+**CRITICAL WARNING - DANGEROUS COMMANDS:**
+The following commands will KILL the Torque agent and cause the operation to fail:
+- `docker restart`, `docker stop`, `docker kill` (any container operations that affect the agent)
+- `systemctl restart docker` or any Docker daemon restart
+- `reboot`, `shutdown`, `init 6`, `init 0`
+- Any command that restarts/stops the Torque agent container
+
+These commands require MANUAL execution via direct SSH or console access.
+If you must run these commands, warn the user and DO NOT use this tool.
 
 The tool will return the command output and exit code.""",
             inputSchema={
@@ -106,6 +152,10 @@ The tool will return the command output and exit code.""",
                     "agent": {
                         "type": "string",
                         "description": "Optional: The Torque agent name to use. If not specified, uses the default agent.",
+                    },
+                    "force": {
+                        "type": "boolean",
+                        "description": "Optional: Set to true to bypass dangerous command warnings. Use with extreme caution.",
                     },
                 },
                 "required": ["target_ip", "ssh_user", "ssh_private_key", "command"],
@@ -207,12 +257,19 @@ async def handle_run_remote_command(arguments: dict):
     ssh_private_key_path = arguments.get("ssh_private_key") or _config["default_ssh_key"]
     command = arguments.get("command")
     agent = arguments.get("agent")
+    force = arguments.get("force", False)
     
     if not all([target_ip, ssh_user, ssh_private_key_path, command]):
         return [TextContent(
             type="text",
             text="Error: Missing required parameters. Need target_ip, ssh_user, ssh_private_key, and command (or configure defaults).",
         )]
+    
+    # Check for dangerous commands unless force=true
+    if not force:
+        warning = check_dangerous_command(command)
+        if warning:
+            return [TextContent(type="text", text=warning)]
     
     try:
         ssh_private_key = read_ssh_key_file(ssh_private_key_path)
