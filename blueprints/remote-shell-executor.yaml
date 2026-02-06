@@ -19,14 +19,14 @@ inputs:
     description: The SSH private key in PEM format for authentication
     sensitive: true
   command:
-    type: string
-    description: The shell command(s) to execute on the remote host
+    type: file
+    description: The shell command(s) to execute on the remote host (content will be written to a file)
   init_commands:
-    type: string
+    type: file
     description: Commands to run before the main command (e.g., proxy setup)
     default: ""
   finally_commands:
-    type: string
+    type: file
     description: Commands to run after the main command (cleanup, always runs)
     default: ""
 
@@ -48,65 +48,51 @@ grains:
             - name: run_ssh
               command: |
                 echo "=== Beginning of execution ====================================================================================================================="
-                # Save the private key to temp file (key is passed as-is in PEM format)
+                # Save the private key to temp file
                 KEY_FILE=$(mktemp)
                 cat << 'KEYEOF' > "$KEY_FILE"
                 {{ .inputs.ssh_private_key }}
                 KEYEOF
                 chmod 600 "$KEY_FILE"
                 
-                # Prepare output file for capturing (while also streaming)
                 OUTPUT_FILE=$(mktemp)
+                REMOTE_SCRIPT=$(mktemp)
                 
-                # Build the full command with init and finally
-                INIT_COMMANDS='{{ .inputs.init_commands }}'
-                FINALLY_COMMANDS='{{ .inputs.finally_commands }}'
-                MAIN_COMMAND='{{ .inputs.command }}'
+                # Build the script to send to remote host
+                echo '#!/bin/bash' > "$REMOTE_SCRIPT"
                 
-                # Construct the remote script
-                REMOTE_SCRIPT=""
-                
-                # Add init commands if provided
-                if [ -n "$INIT_COMMANDS" ]; then
-                  REMOTE_SCRIPT="$INIT_COMMANDS"$'\n'
+                # Add finally trap if provided (file content, not path)
+                if [ -s "{{ .inputs.finally_commands }}" ]; then
+                  echo '__finally() {' >> "$REMOTE_SCRIPT"
+                  cat "{{ .inputs.finally_commands }}" >> "$REMOTE_SCRIPT"
+                  echo '}' >> "$REMOTE_SCRIPT"
+                  echo 'trap __finally EXIT' >> "$REMOTE_SCRIPT"
                 fi
                 
-                # Add main command with finally block if finally commands exist
-                if [ -n "$FINALLY_COMMANDS" ]; then
-                  # Use trap for cleanup that runs even on failure
-                  REMOTE_SCRIPT="${REMOTE_SCRIPT}__cleanup() { $FINALLY_COMMANDS; }"$'\n'
-                  REMOTE_SCRIPT="${REMOTE_SCRIPT}trap __cleanup EXIT"$'\n'
+                # Add init commands if provided
+                if [ -s "{{ .inputs.init_commands }}" ]; then
+                  cat "{{ .inputs.init_commands }}" >> "$REMOTE_SCRIPT"
                 fi
                 
                 # Add main command
-                REMOTE_SCRIPT="${REMOTE_SCRIPT}${MAIN_COMMAND}"
+                cat "{{ .inputs.command }}" >> "$REMOTE_SCRIPT"
                 
                 echo "=== Connecting to {{ .inputs.ssh_user }}@{{ .inputs.target_ip }} ==="
-                if [ -n "$INIT_COMMANDS" ]; then
-                  echo "=== Init commands configured ==="
-                fi
-                echo "=== Executing: {{ .inputs.command }} ==="
                 echo "=== Output (streaming) ========================================================================================================================="
                 
-                # Run the SSH command with output streaming via tee
-                # This shows output in real-time in Torque logs while also capturing it
                 set +e
                 ssh -o StrictHostKeyChecking=no \
                     -o UserKnownHostsFile=/dev/null \
                     -o LogLevel=ERROR \
                     -i "$KEY_FILE" \
                     "{{ .inputs.ssh_user }}@{{ .inputs.target_ip }}" \
-                    "$REMOTE_SCRIPT" 2>&1 | tee "$OUTPUT_FILE"
+                    "bash -s" < "$REMOTE_SCRIPT" 2>&1 | tee "$OUTPUT_FILE"
                 SSH_EXIT_CODE=${PIPESTATUS[0]}
                 set -e
                 
-                # Read captured output
                 COMMAND_OUTPUT=$(cat "$OUTPUT_FILE")
+                rm -f "$KEY_FILE" "$OUTPUT_FILE" "$REMOTE_SCRIPT"
                 
-                # Cleanup
-                rm -f "$KEY_FILE" "$OUTPUT_FILE"
-                
-                # Export outputs for Torque to capture
                 export command_output="$COMMAND_OUTPUT"
                 export exit_code="$SSH_EXIT_CODE"
                 

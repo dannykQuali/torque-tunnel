@@ -9,14 +9,14 @@ inputs:
     type: agent
     description: The Torque agent to use for execution
   command:
-    type: string
-    description: The shell command(s) to execute on the agent
+    type: file
+    description: The shell script to execute on the agent (content will be written to a file)
   init_commands:
-    type: string
+    type: file
     description: Commands to run before the main command (e.g., environment setup)
     default: ""
   finally_commands:
-    type: string
+    type: file
     description: Commands to run after the main command (cleanup, always runs)
     default: ""
 
@@ -39,52 +39,31 @@ grains:
               command: |
                 echo "=== Beginning of local execution ============================================================================================================="
                 
-                # Prepare output file for capturing (while also streaming)
                 OUTPUT_FILE=$(mktemp)
                 
-                # Build the full command with init and finally
-                INIT_COMMANDS='{{ .inputs.init_commands }}'
-                FINALLY_COMMANDS='{{ .inputs.finally_commands }}'
-                MAIN_COMMAND='{{ .inputs.command }}'
-                
-                # Construct the script
-                SCRIPT=""
-                
-                # Add init commands if provided
-                if [ -n "$INIT_COMMANDS" ]; then
-                  SCRIPT="$INIT_COMMANDS"$'\n'
+                # Setup finally trap if provided
+                if [ -s "{{ .inputs.finally_commands }}" ]; then
+                  trap 'source "{{ .inputs.finally_commands }}"' EXIT
                 fi
                 
-                # Add main command with finally block if finally commands exist
-                if [ -n "$FINALLY_COMMANDS" ]; then
-                  # Use trap for cleanup that runs even on failure
-                  SCRIPT="${SCRIPT}__cleanup() { $FINALLY_COMMANDS; }"$'\n'
-                  SCRIPT="${SCRIPT}trap __cleanup EXIT"$'\n'
+                # Run init commands if provided
+                if [ -s "{{ .inputs.init_commands }}" ]; then
+                  echo "=== Running init commands ==="
+                  source "{{ .inputs.init_commands }}"
                 fi
-                
-                # Add main command
-                SCRIPT="${SCRIPT}${MAIN_COMMAND}"
                 
                 echo "=== Executing on agent container ==="
-                if [ -n "$INIT_COMMANDS" ]; then
-                  echo "=== Init commands configured ==="
-                fi
-                echo "=== Command: {{ .inputs.command }} ==="
                 echo "=== Output (streaming) ========================================================================================================================="
                 
-                # Run the command with output streaming via tee
+                # Run the main command
                 set +e
-                bash -c "$SCRIPT" 2>&1 | tee "$OUTPUT_FILE"
+                source "{{ .inputs.command }}" 2>&1 | tee "$OUTPUT_FILE"
                 CMD_EXIT_CODE=${PIPESTATUS[0]}
                 set -e
                 
-                # Read captured output
                 COMMAND_OUTPUT=$(cat "$OUTPUT_FILE")
-                
-                # Cleanup
                 rm -f "$OUTPUT_FILE"
                 
-                # Export outputs for Torque to capture
                 export command_output="$COMMAND_OUTPUT"
                 export exit_code="$CMD_EXIT_CODE"
                 
