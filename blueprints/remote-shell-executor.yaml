@@ -16,7 +16,7 @@ inputs:
     description: The SSH username to connect with
   ssh_private_key:
     type: string
-    description: The SSH private key (base64 encoded) for authentication
+    description: The SSH private key in PEM format for authentication
     sensitive: true
   command:
     type: string
@@ -41,9 +41,11 @@ grains:
               command: |
                 set -e
                 
-                # Decode the private key from base64 and save to temp file
+                # Save the private key to temp file (key is passed as-is in PEM format)
                 KEY_FILE=$(mktemp)
-                echo "{{ .inputs.ssh_private_key }}" | base64 -d > "$KEY_FILE"
+                cat << 'KEYEOF' > "$KEY_FILE"
+                {{ .inputs.ssh_private_key }}
+                KEYEOF
                 chmod 600 "$KEY_FILE"
                 
                 # Prepare output file

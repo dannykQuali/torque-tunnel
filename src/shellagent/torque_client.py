@@ -3,7 +3,6 @@ Torque API Client for interacting with Quali Torque REST API.
 """
 
 import asyncio
-import base64
 import time
 from typing import Optional
 from dataclasses import dataclass
@@ -99,9 +98,6 @@ class TorqueClient:
         if not agent_name:
             raise ValueError("Agent name must be provided either as argument or default")
         
-        # Base64 encode the private key
-        key_b64 = base64.b64encode(ssh_private_key.encode()).decode()
-        
         # Generate environment name if not provided
         if not environment_name:
             environment_name = f"shell-cmd-{int(time.time())}"
@@ -114,7 +110,7 @@ class TorqueClient:
                 "agent": agent_name,
                 "target_ip": target_ip,
                 "ssh_user": ssh_user,
-                "ssh_private_key": key_b64,
+                "ssh_private_key": ssh_private_key,
                 "command": command,
             },
         }
