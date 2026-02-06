@@ -468,11 +468,11 @@ async def handle_read_remote_file(arguments: dict):
     except FileNotFoundError as e:
         return [TextContent(type="text", text=f"Error: {str(e)}")]
     
-    # Build the command
+    # Build the command - use base64 encoding to handle special characters and binary files
     if tail_lines:
-        command = f"tail -n {tail_lines} {file_path}"
+        command = f"tail -n {tail_lines} '{file_path}' | base64"
     else:
-        command = f"cat {file_path}"
+        command = f"base64 '{file_path}'"
     
     try:
         async with get_torque_client() as client:
@@ -488,10 +488,19 @@ async def handle_read_remote_file(arguments: dict):
         env_url = f"{_config['torque_url']}/{_config['torque_space']}/environments/{result.environment_id}"
         
         if result.status == "completed" and result.exit_code == 0:
+            # Decode the base64 content
+            try:
+                file_content = base64.b64decode(result.command_output).decode('utf-8')
+            except UnicodeDecodeError:
+                # Binary file - show as base64 or indicate it's binary
+                file_content = f"[Binary file - {len(base64.b64decode(result.command_output))} bytes]\n\nBase64 content:\n{result.command_output}"
+            except Exception as decode_err:
+                file_content = f"[Decode error: {decode_err}]\n\nRaw output:\n{result.command_output}"
+            
             output_text = f"""Contents of `{file_path}` on {target_ip}:
 
 ```
-{result.command_output}
+{file_content}
 ```
 
 **Environment:** [{result.environment_id}]( {env_url} )"""
