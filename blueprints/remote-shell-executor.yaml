@@ -125,8 +125,8 @@ grains:
                   echo "${PIPESTATUS[0]}" > "$EXIT_CODE_FILE"
                 }
                 
-                # Run main logic, capturing any errors to the output file
-                __run_main 2>&1 | tee -a "$OUTPUT_FILE"
+                # Run main logic - errors go to output file, stdout is already captured inside
+                __run_main 2>> "$OUTPUT_FILE"
                 
                 # Always export outputs - this section MUST be reached
                 COMMAND_OUTPUT_B64=$(base64 < "$OUTPUT_FILE" 2>/dev/null | tr -d '\n' || echo "")
