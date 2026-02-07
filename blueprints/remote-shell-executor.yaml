@@ -54,7 +54,8 @@ grains:
                 
                 # Initialize variables with defaults
                 OUTPUT_FILE=$(mktemp)
-                SSH_EXIT_CODE=1
+                EXIT_CODE_FILE=$(mktemp)
+                echo "1" > "$EXIT_CODE_FILE"  # Default exit code
                 KEY_FILE=""
                 REMOTE_SCRIPT=""
                 CMD_FILE=""
@@ -121,7 +122,7 @@ grains:
                       -i "$KEY_FILE" \
                       "{{ .inputs.ssh_user }}@{{ .inputs.target_ip }}" \
                       "bash -s" < "$REMOTE_SCRIPT" 2>&1 | tee "$OUTPUT_FILE"
-                  SSH_EXIT_CODE=${PIPESTATUS[0]}
+                  echo "${PIPESTATUS[0]}" > "$EXIT_CODE_FILE"
                 }
                 
                 # Run main logic, capturing any errors to the output file
@@ -129,7 +130,8 @@ grains:
                 
                 # Always export outputs - this section MUST be reached
                 COMMAND_OUTPUT_B64=$(base64 < "$OUTPUT_FILE" 2>/dev/null | tr -d '\n' || echo "")
-                rm -f "$KEY_FILE" "$OUTPUT_FILE" "$REMOTE_SCRIPT" "$CMD_FILE" "$INIT_FILE" "$FINALLY_FILE" 2>/dev/null || true
+                SSH_EXIT_CODE=$(cat "$EXIT_CODE_FILE" 2>/dev/null || echo "1")
+                rm -f "$KEY_FILE" "$OUTPUT_FILE" "$EXIT_CODE_FILE" "$REMOTE_SCRIPT" "$CMD_FILE" "$INIT_FILE" "$FINALLY_FILE" 2>/dev/null || true
                 
                 export command_output="$COMMAND_OUTPUT_B64"
                 export exit_code="$SSH_EXIT_CODE"

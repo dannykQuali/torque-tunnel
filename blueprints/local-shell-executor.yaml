@@ -44,7 +44,8 @@ grains:
                 
                 # Initialize variables with defaults
                 OUTPUT_FILE=$(mktemp)
-                CMD_EXIT_CODE=1
+                EXIT_CODE_FILE=$(mktemp)
+                echo "1" > "$EXIT_CODE_FILE"  # Default exit code
                 SCRIPT_FILE=""
                 INIT_FILE=""
                 FINALLY_FILE=""
@@ -101,7 +102,7 @@ grains:
                   
                   # Run the script (commands inside already have </dev/null protection)
                   bash "$COMBINED" 2>&1 | tee "$OUTPUT_FILE"
-                  CMD_EXIT_CODE=${PIPESTATUS[0]}
+                  echo "${PIPESTATUS[0]}" > "$EXIT_CODE_FILE"
                 }
                 
                 # Run main logic, capturing any errors to the output file
@@ -109,7 +110,8 @@ grains:
                 
                 # Always export outputs - this section MUST be reached
                 COMMAND_OUTPUT_B64=$(base64 < "$OUTPUT_FILE" 2>/dev/null | tr -d '\n' || echo "")
-                rm -f "$OUTPUT_FILE" "$SCRIPT_FILE" "$INIT_FILE" "$FINALLY_FILE" "$COMBINED" 2>/dev/null || true
+                CMD_EXIT_CODE=$(cat "$EXIT_CODE_FILE" 2>/dev/null || echo "1")
+                rm -f "$OUTPUT_FILE" "$EXIT_CODE_FILE" "$SCRIPT_FILE" "$INIT_FILE" "$FINALLY_FILE" "$COMBINED" 2>/dev/null || true
                 
                 export command_output="$COMMAND_OUTPUT_B64"
                 export exit_code="$CMD_EXIT_CODE"
