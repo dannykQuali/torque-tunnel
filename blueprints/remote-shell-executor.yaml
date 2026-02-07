@@ -86,6 +86,9 @@ grains:
                   # Build remote script
                   echo '#!/bin/bash' > "$REMOTE_SCRIPT"
                   
+                  # Track exit code for proper propagation
+                  echo '__EXIT_CODE=0' >> "$REMOTE_SCRIPT"
+                  
                   # Add finally trap if provided - wrapped with </dev/null to prevent stdin reads
                   if [ -s "$FINALLY_FILE" ]; then
                     echo '__finally() {' >> "$REMOTE_SCRIPT"
@@ -97,13 +100,15 @@ grains:
                     echo 'trap __finally EXIT' >> "$REMOTE_SCRIPT"
                   fi
                   
-                  # Add init commands if provided - use curly braces (not subshell) so exports persist
-                  # Redirect stdin to /dev/null to prevent interactive prompts
+                  # Add init commands if provided - check exit code and skip main if failed
+                  # Use curly braces (not subshell) so exports persist
                   if [ -s "$INIT_FILE" ]; then
                     echo '{' >> "$REMOTE_SCRIPT"
                     cat "$INIT_FILE" >> "$REMOTE_SCRIPT"
                     echo '' >> "$REMOTE_SCRIPT"
                     echo '} </dev/null' >> "$REMOTE_SCRIPT"
+                    echo '__EXIT_CODE=$?' >> "$REMOTE_SCRIPT"
+                    echo 'if [ $__EXIT_CODE -ne 0 ]; then exit $__EXIT_CODE; fi' >> "$REMOTE_SCRIPT"
                   fi
                   
                   # Add main command - wrapped with </dev/null to prevent stdin reads from hanging

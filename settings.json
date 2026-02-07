@@ -1,0 +1,18 @@
+{
+  "servers": {
+    "shellagent": {
+      "command": "C:\\ZeroTouch\\ShellAgent\\.venv\\Scripts\\shellagent.exe",
+      "args": [
+        "--torque-url", "https://review1.qualilabs.net",
+        "--torque-token", "------------------------------REDACTED------------------------------",
+        "--torque-space", "shell-cmd",
+        "--torque-agent", "dannyk-revertable-alma2",
+        "--default-ssh-key", "C:\\ZeroTouch\\torque dannyk private key.pem",
+        "--default-target-ip", "10.91.36.245",
+        "--default-ssh-user", "root",
+        "--init-commands", "export HTTP_PROXY=http://proxy.esl.cisco.com:80; export HTTPS_PROXY=http://proxy.esl.cisco.com:80; export NO_PROXY='.local,.internal,.svc,localhost,127.0.0.1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,::1,.cisco.com'; export http_proxy=http://proxy.esl.cisco.com:80; export https_proxy=http://proxy.esl.cisco.com:80; export no_proxy='.local,.internal,.svc,localhost,127.0.0.1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,::1,.cisco.com'",
+        "--auto-delete-environments"
+      ]
+    }
+  }
+}

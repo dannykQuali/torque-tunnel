@@ -68,6 +68,9 @@ grains:
                   COMBINED=$(mktemp)
                   echo '#!/bin/bash' > "$COMBINED"
                   
+                  # Track exit code for proper propagation
+                  echo '__EXIT_CODE=0' >> "$COMBINED"
+                  
                   # Add finally trap if provided - wrapped with </dev/null to prevent stdin reads
                   if [ -s "$FINALLY_FILE" ]; then
                     echo '__finally() {' >> "$COMBINED"
@@ -79,14 +82,16 @@ grains:
                     echo 'trap __finally EXIT' >> "$COMBINED"
                   fi
                   
-                  # Add init commands if provided - use curly braces (not subshell) so exports persist
-                  # Redirect stdin to /dev/null to prevent interactive prompts
+                  # Add init commands if provided - check exit code and skip main if failed
+                  # Use curly braces (not subshell) so exports persist
                   if [ -s "$INIT_FILE" ]; then
                     echo "=== Running init commands ==="
                     echo '{' >> "$COMBINED"
                     cat "$INIT_FILE" >> "$COMBINED"
                     echo '' >> "$COMBINED"
                     echo '} </dev/null' >> "$COMBINED"
+                    echo '__EXIT_CODE=$?' >> "$COMBINED"
+                    echo 'if [ $__EXIT_CODE -ne 0 ]; then exit $__EXIT_CODE; fi' >> "$COMBINED"
                   fi
                   
                   # Add main command - wrapped with </dev/null to prevent stdin reads
