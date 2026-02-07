@@ -877,9 +877,28 @@ async def cli_dispatch(args):
     """Dispatch CLI commands to appropriate handlers."""
     import json as json_module
     
+    skip_preamble = getattr(args, 'skip_preamble', False)
+    
     def cli_log_callback(content: str):
         """Simple callback that prints to stderr for CLI streaming."""
+        # State for skip_preamble - track whether we've seen the full marker line
+        # The echo statement has a trailing " so it doesn't match - only actual execution does
+        state = {'found': not skip_preamble, 'buffer': ''}
+        # Full marker line (117 chars of '=' after the text) - must be at end of line (no trailing ")
+        marker = '=== Beginning of execution =====================================================================================================================\n'
+        
         async def _stream(data: str):
+            if not state['found']:
+                # Buffer data to handle marker split across chunks
+                state['buffer'] += data
+                # Look for marker at end of line (followed by newline, not by ")
+                idx = state['buffer'].find(marker)
+                if idx != -1:
+                    state['found'] = True
+                    # Print from the marker line onwards
+                    print(state['buffer'][idx:], file=sys.stderr, end='', flush=True)
+                    state['buffer'] = ''
+                return
             print(data, file=sys.stderr, end='', flush=True)
         return _stream
     
@@ -1183,6 +1202,11 @@ def main():
         action="store_true",
         default=os.environ.get("AUTO_DELETE_ENVIRONMENTS", "").lower() in ("true", "1", "yes"),
         help="Automatically delete environments after completion",
+    )
+    common_parser.add_argument(
+        "--skip-preamble", "-q",
+        action="store_true",
+        help="Skip streaming output until '=== Beginning of execution ===' marker",
     )
     
     # Main parser with subcommands - also inherits common args for when no subcommand is given
