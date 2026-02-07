@@ -37,86 +37,85 @@ grains:
           commands:
             - name: run_local
               command: |
+                # Disable exit on error so we always reach the export statements
+                set +e
+                
                 echo "=== Beginning of local execution ============================================================================================================="
                 
-                # Initialize variables for trap
+                # Initialize variables with defaults
                 OUTPUT_FILE=$(mktemp)
                 CMD_EXIT_CODE=1
+                SCRIPT_FILE=""
+                INIT_FILE=""
+                FINALLY_FILE=""
+                COMBINED=""
                 
-                # Trap to ensure outputs are always exported, even on script failure
-                __export_outputs() {
-                  local trap_exit_code=$?
-                  # Use CMD_EXIT_CODE if set, otherwise use the trap's exit code
-                  local final_exit_code=${CMD_EXIT_CODE:-$trap_exit_code}
+                # Wrap the main logic in a function so we can capture any errors
+                __run_main() {
+                  SCRIPT_FILE=$(mktemp)
                   
-                  # Export whatever output we captured (empty string if file doesn't exist or is empty)
-                  if [ -f "$OUTPUT_FILE" ]; then
-                    export command_output=$(base64 < "$OUTPUT_FILE" | tr -d '\n')
-                  else
-                    export command_output=""
+                  # Decode base64 inputs directly to files
+                  echo '{{ .inputs.command_b64 }}' | base64 -d > "$SCRIPT_FILE"
+                  
+                  INIT_FILE=$(mktemp)
+                  echo '{{ .inputs.init_commands_b64 }}' | base64 -d > "$INIT_FILE" 2>/dev/null || true
+                  
+                  FINALLY_FILE=$(mktemp)
+                  echo '{{ .inputs.finally_commands_b64 }}' | base64 -d > "$FINALLY_FILE" 2>/dev/null || true
+                  
+                  # Build combined script
+                  COMBINED=$(mktemp)
+                  echo '#!/bin/bash' > "$COMBINED"
+                  
+                  # Add finally trap if provided - wrapped with </dev/null to prevent stdin reads
+                  if [ -s "$FINALLY_FILE" ]; then
+                    echo '__finally() {' >> "$COMBINED"
+                    echo '(' >> "$COMBINED"
+                    cat "$FINALLY_FILE" >> "$COMBINED"
+                    echo '' >> "$COMBINED"
+                    echo ') </dev/null' >> "$COMBINED"
+                    echo '}' >> "$COMBINED"
+                    echo 'trap __finally EXIT' >> "$COMBINED"
                   fi
-                  export exit_code="$final_exit_code"
                   
-                  # Cleanup temp files
-                  rm -f "$OUTPUT_FILE" "$SCRIPT_FILE" "$INIT_FILE" "$FINALLY_FILE" "$COMBINED" 2>/dev/null || true
+                  # Add init commands if provided - use curly braces (not subshell) so exports persist
+                  # Redirect stdin to /dev/null to prevent interactive prompts
+                  if [ -s "$INIT_FILE" ]; then
+                    echo "=== Running init commands ==="
+                    echo '{' >> "$COMBINED"
+                    cat "$INIT_FILE" >> "$COMBINED"
+                    echo '' >> "$COMBINED"
+                    echo '} </dev/null' >> "$COMBINED"
+                  fi
                   
-                  echo ""
-                  echo "=== Command completed with exit code: $final_exit_code ==="
-                }
-                trap __export_outputs EXIT
-                
-                SCRIPT_FILE=$(mktemp)
-                
-                # Decode base64 inputs directly to files
-                echo '{{ .inputs.command_b64 }}' | base64 -d > "$SCRIPT_FILE"
-                
-                INIT_FILE=$(mktemp)
-                echo '{{ .inputs.init_commands_b64 }}' | base64 -d > "$INIT_FILE" 2>/dev/null || true
-                
-                FINALLY_FILE=$(mktemp)
-                echo '{{ .inputs.finally_commands_b64 }}' | base64 -d > "$FINALLY_FILE" 2>/dev/null || true
-                
-                # Build combined script
-                COMBINED=$(mktemp)
-                echo '#!/bin/bash' > "$COMBINED"
-                
-                # Add finally trap if provided - wrapped with </dev/null to prevent stdin reads
-                if [ -s "$FINALLY_FILE" ]; then
-                  echo '__finally() {' >> "$COMBINED"
+                  # Add main command - wrapped with </dev/null to prevent stdin reads
                   echo '(' >> "$COMBINED"
-                  cat "$FINALLY_FILE" >> "$COMBINED"
+                  cat "$SCRIPT_FILE" >> "$COMBINED"
                   echo '' >> "$COMBINED"
                   echo ') </dev/null' >> "$COMBINED"
-                  echo '}' >> "$COMBINED"
-                  echo 'trap __finally EXIT' >> "$COMBINED"
-                fi
+                  
+                  chmod +x "$COMBINED"
+                  
+                  echo "=== Executing on agent container ==="
+                  echo "=== Output (streaming) ========================================================================================================================="
+                  
+                  # Run the script (commands inside already have </dev/null protection)
+                  bash "$COMBINED" 2>&1 | tee "$OUTPUT_FILE"
+                  CMD_EXIT_CODE=${PIPESTATUS[0]}
+                }
                 
-                # Add init commands if provided - use curly braces (not subshell) so exports persist
-                # Redirect stdin to /dev/null to prevent interactive prompts
-                if [ -s "$INIT_FILE" ]; then
-                  echo "=== Running init commands ==="
-                  echo '{' >> "$COMBINED"
-                  cat "$INIT_FILE" >> "$COMBINED"
-                  echo '' >> "$COMBINED"
-                  echo '} </dev/null' >> "$COMBINED"
-                fi
+                # Run main logic, capturing any errors to the output file
+                __run_main 2>&1 | tee -a "$OUTPUT_FILE"
                 
-                # Add main command - wrapped with </dev/null to prevent stdin reads
-                echo '(' >> "$COMBINED"
-                cat "$SCRIPT_FILE" >> "$COMBINED"
-                echo '' >> "$COMBINED"
-                echo ') </dev/null' >> "$COMBINED"
+                # Always export outputs - this section MUST be reached
+                COMMAND_OUTPUT_B64=$(base64 < "$OUTPUT_FILE" 2>/dev/null | tr -d '\n' || echo "")
+                rm -f "$OUTPUT_FILE" "$SCRIPT_FILE" "$INIT_FILE" "$FINALLY_FILE" "$COMBINED" 2>/dev/null || true
                 
-                chmod +x "$COMBINED"
+                export command_output="$COMMAND_OUTPUT_B64"
+                export exit_code="$CMD_EXIT_CODE"
                 
-                echo "=== Executing on agent container ==="
-                echo "=== Output (streaming) ========================================================================================================================="
-                
-                # Run the script (commands inside already have </dev/null protection)
-                set +e
-                bash "$COMBINED" 2>&1 | tee "$OUTPUT_FILE"
-                CMD_EXIT_CODE=${PIPESTATUS[0]}
-                # Trap will handle export and cleanup on exit
+                echo ""
+                echo "=== Command completed with exit code: $CMD_EXIT_CODE ==="
               outputs:
                 - command_output
                 - exit_code

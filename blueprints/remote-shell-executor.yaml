@@ -47,95 +47,95 @@ grains:
           commands:
             - name: run_ssh
               command: |
+                # Disable exit on error so we always reach the export statements
+                set +e
+                
                 echo "=== Beginning of execution ====================================================================================================================="
                 
-                # Initialize variables for trap
+                # Initialize variables with defaults
                 OUTPUT_FILE=$(mktemp)
                 SSH_EXIT_CODE=1
+                KEY_FILE=""
+                REMOTE_SCRIPT=""
+                CMD_FILE=""
+                INIT_FILE=""
+                FINALLY_FILE=""
                 
-                # Trap to ensure outputs are always exported, even on script failure
-                __export_outputs() {
-                  local trap_exit_code=$?
-                  # Use SSH_EXIT_CODE if set, otherwise use the trap's exit code
-                  local final_exit_code=${SSH_EXIT_CODE:-$trap_exit_code}
-                  
-                  # Export whatever output we captured (empty string if file doesn't exist or is empty)
-                  if [ -f "$OUTPUT_FILE" ]; then
-                    export command_output=$(base64 < "$OUTPUT_FILE" | tr -d '\n')
-                  else
-                    export command_output=""
-                  fi
-                  export exit_code="$final_exit_code"
-                  
-                  # Cleanup temp files
-                  rm -f "$KEY_FILE" "$OUTPUT_FILE" "$REMOTE_SCRIPT" "$CMD_FILE" "$INIT_FILE" "$FINALLY_FILE" 2>/dev/null || true
-                  
-                  echo ""
-                  echo "=== Command completed with exit code: $final_exit_code ==="
-                }
-                trap __export_outputs EXIT
-                
-                # Save the private key to temp file
-                KEY_FILE=$(mktemp)
-                cat << 'KEYEOF' > "$KEY_FILE"
+                # Wrap the main logic in a function so we can capture any errors
+                __run_main() {
+                  # Save the private key to temp file
+                  KEY_FILE=$(mktemp)
+                  cat << 'KEYEOF' > "$KEY_FILE"
                 {{ .inputs.ssh_private_key }}
                 KEYEOF
-                chmod 600 "$KEY_FILE"
-                
-                REMOTE_SCRIPT=$(mktemp)
-                
-                # Decode base64 inputs to files
-                CMD_FILE=$(mktemp)
-                echo '{{ .inputs.command_b64 }}' | base64 -d > "$CMD_FILE"
-                
-                INIT_FILE=$(mktemp)
-                echo '{{ .inputs.init_commands_b64 }}' | base64 -d > "$INIT_FILE" 2>/dev/null || true
-                
-                FINALLY_FILE=$(mktemp)
-                echo '{{ .inputs.finally_commands_b64 }}' | base64 -d > "$FINALLY_FILE" 2>/dev/null || true
-                
-                # Build remote script
-                echo '#!/bin/bash' > "$REMOTE_SCRIPT"
-                
-                # Add finally trap if provided - wrapped with </dev/null to prevent stdin reads
-                if [ -s "$FINALLY_FILE" ]; then
-                  echo '__finally() {' >> "$REMOTE_SCRIPT"
+                  chmod 600 "$KEY_FILE"
+                  
+                  REMOTE_SCRIPT=$(mktemp)
+                  
+                  # Decode base64 inputs to files
+                  CMD_FILE=$(mktemp)
+                  echo '{{ .inputs.command_b64 }}' | base64 -d > "$CMD_FILE"
+                  
+                  INIT_FILE=$(mktemp)
+                  echo '{{ .inputs.init_commands_b64 }}' | base64 -d > "$INIT_FILE" 2>/dev/null || true
+                  
+                  FINALLY_FILE=$(mktemp)
+                  echo '{{ .inputs.finally_commands_b64 }}' | base64 -d > "$FINALLY_FILE" 2>/dev/null || true
+                  
+                  # Build remote script
+                  echo '#!/bin/bash' > "$REMOTE_SCRIPT"
+                  
+                  # Add finally trap if provided - wrapped with </dev/null to prevent stdin reads
+                  if [ -s "$FINALLY_FILE" ]; then
+                    echo '__finally() {' >> "$REMOTE_SCRIPT"
+                    echo '(' >> "$REMOTE_SCRIPT"
+                    cat "$FINALLY_FILE" >> "$REMOTE_SCRIPT"
+                    echo '' >> "$REMOTE_SCRIPT"
+                    echo ') </dev/null' >> "$REMOTE_SCRIPT"
+                    echo '}' >> "$REMOTE_SCRIPT"
+                    echo 'trap __finally EXIT' >> "$REMOTE_SCRIPT"
+                  fi
+                  
+                  # Add init commands if provided - use curly braces (not subshell) so exports persist
+                  # Redirect stdin to /dev/null to prevent interactive prompts
+                  if [ -s "$INIT_FILE" ]; then
+                    echo '{' >> "$REMOTE_SCRIPT"
+                    cat "$INIT_FILE" >> "$REMOTE_SCRIPT"
+                    echo '' >> "$REMOTE_SCRIPT"
+                    echo '} </dev/null' >> "$REMOTE_SCRIPT"
+                  fi
+                  
+                  # Add main command - wrapped with </dev/null to prevent stdin reads from hanging
+                  # since this is a non-interactive execution context
                   echo '(' >> "$REMOTE_SCRIPT"
-                  cat "$FINALLY_FILE" >> "$REMOTE_SCRIPT"
+                  cat "$CMD_FILE" >> "$REMOTE_SCRIPT"
                   echo '' >> "$REMOTE_SCRIPT"
                   echo ') </dev/null' >> "$REMOTE_SCRIPT"
-                  echo '}' >> "$REMOTE_SCRIPT"
-                  echo 'trap __finally EXIT' >> "$REMOTE_SCRIPT"
-                fi
+                  
+                  echo "=== Connecting to {{ .inputs.ssh_user }}@{{ .inputs.target_ip }} ==="
+                  echo "=== Output (streaming) ========================================================================================================================="
+                  
+                  ssh -o StrictHostKeyChecking=no \
+                      -o UserKnownHostsFile=/dev/null \
+                      -o LogLevel=ERROR \
+                      -i "$KEY_FILE" \
+                      "{{ .inputs.ssh_user }}@{{ .inputs.target_ip }}" \
+                      "bash -s" < "$REMOTE_SCRIPT" 2>&1 | tee "$OUTPUT_FILE"
+                  SSH_EXIT_CODE=${PIPESTATUS[0]}
+                }
                 
-                # Add init commands if provided - use curly braces (not subshell) so exports persist
-                # Redirect stdin to /dev/null to prevent interactive prompts
-                if [ -s "$INIT_FILE" ]; then
-                  echo '{' >> "$REMOTE_SCRIPT"
-                  cat "$INIT_FILE" >> "$REMOTE_SCRIPT"
-                  echo '' >> "$REMOTE_SCRIPT"
-                  echo '} </dev/null' >> "$REMOTE_SCRIPT"
-                fi
+                # Run main logic, capturing any errors to the output file
+                __run_main 2>&1 | tee -a "$OUTPUT_FILE"
                 
-                # Add main command - wrapped with </dev/null to prevent stdin reads from hanging
-                # since this is a non-interactive execution context
-                echo '(' >> "$REMOTE_SCRIPT"
-                cat "$CMD_FILE" >> "$REMOTE_SCRIPT"
-                echo '' >> "$REMOTE_SCRIPT"
-                echo ') </dev/null' >> "$REMOTE_SCRIPT"
+                # Always export outputs - this section MUST be reached
+                COMMAND_OUTPUT_B64=$(base64 < "$OUTPUT_FILE" 2>/dev/null | tr -d '\n' || echo "")
+                rm -f "$KEY_FILE" "$OUTPUT_FILE" "$REMOTE_SCRIPT" "$CMD_FILE" "$INIT_FILE" "$FINALLY_FILE" 2>/dev/null || true
                 
-                echo "=== Connecting to {{ .inputs.ssh_user }}@{{ .inputs.target_ip }} ==="
-                echo "=== Output (streaming) ========================================================================================================================="
+                export command_output="$COMMAND_OUTPUT_B64"
+                export exit_code="$SSH_EXIT_CODE"
                 
-                set +e
-                ssh -o StrictHostKeyChecking=no \
-                    -o UserKnownHostsFile=/dev/null \
-                    -o LogLevel=ERROR \
-                    -i "$KEY_FILE" \
-                    "{{ .inputs.ssh_user }}@{{ .inputs.target_ip }}" \
-                    "bash -s" < "$REMOTE_SCRIPT" 2>&1 | tee "$OUTPUT_FILE"
-                SSH_EXIT_CODE=${PIPESTATUS[0]}
-                # Trap will handle export and cleanup on exit
+                echo ""
+                echo "=== Command completed with exit code: $SSH_EXIT_CODE ==="
               outputs:
                 - command_output
                 - exit_code
