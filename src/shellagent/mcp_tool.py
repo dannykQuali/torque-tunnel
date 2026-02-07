@@ -821,85 +821,396 @@ async def handle_write_remote_file(arguments: dict):
         return [TextContent(type="text", text=f"Error writing remote file: {str(e)}")]
 
 
-def main():
-    """Main entry point."""
-    parser = argparse.ArgumentParser(
-        description="ShellAgent MCP Tool - Execute remote commands via Torque",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Environment Variables:
-  TORQUE_URL      Torque base URL (e.g., https://portal.qtorque.io)
-  TORQUE_TOKEN    Torque API token
-  TORQUE_SPACE    Torque space name
-  TORQUE_AGENT    Default Torque agent name
-
-Example:
-  shellagent --torque-url https://review1.qualilabs.net --torque-space BMaaS --torque-agent my-agent
-        """,
-    )
+async def cli_dispatch(args):
+    """Dispatch CLI commands to appropriate handlers."""
+    import json as json_module
     
-    parser.add_argument(
+    def cli_log_callback(content: str):
+        """Simple callback that prints to stderr for CLI streaming."""
+        async def _stream(data: str):
+            print(data, file=sys.stderr, end='', flush=True)
+        return _stream
+    
+    try:
+        if args.command == "run":
+            # Remote command execution
+            target_ip = _config["default_target_ip"]
+            ssh_user = getattr(args, 'user', None) or _config["default_ssh_user"]
+            ssh_key_path = getattr(args, 'key', None) or _config["default_ssh_key"]
+            agent = getattr(args, 'agent', None)
+            timeout = getattr(args, 'timeout', None)
+            force = getattr(args, 'force', False)
+            output_json = getattr(args, 'json', False)
+            
+            if not all([target_ip, ssh_user, ssh_key_path]):
+                print("Error: Missing target, user, or SSH key. Use --target, --user, --key or set defaults.", file=sys.stderr)
+                sys.exit(1)
+            
+            # Check dangerous commands
+            if not force:
+                warning = check_dangerous_command(args.cmd)
+                if warning:
+                    print(warning, file=sys.stderr)
+                    sys.exit(2)
+            
+            try:
+                ssh_key = read_ssh_key_file(ssh_key_path)
+            except FileNotFoundError as e:
+                print(f"Error: {e}", file=sys.stderr)
+                sys.exit(1)
+            
+            async with get_torque_client() as client:
+                result = await client.execute_remote_command(
+                    target_ip=target_ip,
+                    ssh_user=ssh_user,
+                    ssh_private_key=ssh_key,
+                    command=args.cmd,
+                    agent=agent,
+                    timeout=timeout,
+                    auto_cleanup=_config["auto_delete_environments"],
+                    log_callback=cli_log_callback(""),
+                )
+            
+            if output_json:
+                print(json_module.dumps({
+                    "status": result.status,
+                    "exit_code": result.exit_code,
+                    "output": result.command_output,
+                    "error": result.error,
+                    "environment_id": result.environment_id,
+                }))
+            else:
+                if result.status == "completed":
+                    print(result.command_output or "", end='')
+                    sys.exit(result.exit_code or 0)
+                else:
+                    print(f"Error: {result.error}", file=sys.stderr)
+                    sys.exit(1)
+        
+        elif args.command == "runner":
+            # Runner command
+            agent = getattr(args, 'agent', None)
+            timeout = getattr(args, 'timeout', None)
+            output_json = getattr(args, 'json', False)
+            
+            async with get_torque_client() as client:
+                result = await client.execute_local_command(
+                    command=args.cmd,
+                    agent=agent,
+                    timeout=timeout,
+                    auto_cleanup=_config["auto_delete_environments"],
+                    log_callback=cli_log_callback(""),
+                )
+            
+            if output_json:
+                print(json_module.dumps({
+                    "status": result.status,
+                    "exit_code": result.exit_code,
+                    "output": result.command_output,
+                    "error": result.error,
+                    "environment_id": result.environment_id,
+                }))
+            else:
+                if result.status == "completed":
+                    print(result.command_output or "", end='')
+                    sys.exit(result.exit_code or 0)
+                else:
+                    print(f"Error: {result.error}", file=sys.stderr)
+                    sys.exit(1)
+        
+        elif args.command == "read":
+            # Read remote file
+            target_ip = _config["default_target_ip"]
+            ssh_user = getattr(args, 'user', None) or _config["default_ssh_user"]
+            ssh_key_path = getattr(args, 'key', None) or _config["default_ssh_key"]
+            agent = getattr(args, 'agent', None)
+            max_size = getattr(args, 'max_size', 102400)
+            
+            if not all([target_ip, ssh_user, ssh_key_path]):
+                print("Error: Missing target, user, or SSH key.", file=sys.stderr)
+                sys.exit(1)
+            
+            ssh_key = read_ssh_key_file(ssh_key_path)
+            
+            # Build safe read command
+            escaped_path = args.path.replace("'", "'\\''")
+            cmd = f"head -c {max_size} '{escaped_path}' 2>/dev/null || cat '{escaped_path}' 2>&1"
+            
+            async with get_torque_client() as client:
+                result = await client.execute_remote_command(
+                    target_ip=target_ip,
+                    ssh_user=ssh_user,
+                    ssh_private_key=ssh_key,
+                    command=cmd,
+                    agent=agent,
+                    auto_cleanup=_config["auto_delete_environments"],
+                )
+            
+            if result.status == "completed":
+                print(result.command_output or "", end='')
+                sys.exit(result.exit_code or 0)
+            else:
+                print(f"Error: {result.error}", file=sys.stderr)
+                sys.exit(1)
+        
+        elif args.command == "list":
+            # List remote directory
+            target_ip = _config["default_target_ip"]
+            ssh_user = getattr(args, 'user', None) or _config["default_ssh_user"]
+            ssh_key_path = getattr(args, 'key', None) or _config["default_ssh_key"]
+            agent = getattr(args, 'agent', None)
+            show_all = getattr(args, 'all', False)
+            long_format = getattr(args, 'long', False)
+            
+            if not all([target_ip, ssh_user, ssh_key_path]):
+                print("Error: Missing target, user, or SSH key.", file=sys.stderr)
+                sys.exit(1)
+            
+            ssh_key = read_ssh_key_file(ssh_key_path)
+            
+            # Build ls command
+            flags = "-"
+            if show_all:
+                flags += "a"
+            if long_format:
+                flags += "lh"
+            flags = flags if len(flags) > 1 else ""
+            
+            escaped_path = args.path.replace("'", "'\\''")
+            cmd = f"ls {flags} '{escaped_path}'" if flags else f"ls '{escaped_path}'"
+            
+            async with get_torque_client() as client:
+                result = await client.execute_remote_command(
+                    target_ip=target_ip,
+                    ssh_user=ssh_user,
+                    ssh_private_key=ssh_key,
+                    command=cmd,
+                    agent=agent,
+                    auto_cleanup=_config["auto_delete_environments"],
+                )
+            
+            if result.status == "completed":
+                print(result.command_output or "", end='')
+                sys.exit(result.exit_code or 0)
+            else:
+                print(f"Error: {result.error}", file=sys.stderr)
+                sys.exit(1)
+        
+        elif args.command == "write":
+            # Write to remote file
+            target_ip = _config["default_target_ip"]
+            ssh_user = getattr(args, 'user', None) or _config["default_ssh_user"]
+            ssh_key_path = getattr(args, 'key', None) or _config["default_ssh_key"]
+            agent = getattr(args, 'agent', None)
+            mode = getattr(args, 'mode', None)
+            backup = getattr(args, 'backup', False)
+            use_stdin = getattr(args, 'stdin', False)
+            
+            if not all([target_ip, ssh_user, ssh_key_path]):
+                print("Error: Missing target, user, or SSH key.", file=sys.stderr)
+                sys.exit(1)
+            
+            # Get content
+            if use_stdin:
+                content = sys.stdin.read()
+            elif args.content:
+                content = args.content
+            else:
+                print("Error: No content provided. Use positional argument or --stdin.", file=sys.stderr)
+                sys.exit(1)
+            
+            ssh_key = read_ssh_key_file(ssh_key_path)
+            
+            # Build write command
+            escaped_path = args.path.replace("'", "'\\''")
+            content_b64 = base64.b64encode(content.encode()).decode()
+            
+            cmd_parts = []
+            if backup:
+                cmd_parts.append(f"[ -f '{escaped_path}' ] && cp '{escaped_path}' '{escaped_path}.bak'")
+            cmd_parts.append(f"echo '{content_b64}' | base64 -d > '{escaped_path}'")
+            if mode:
+                cmd_parts.append(f"chmod {mode} '{escaped_path}'")
+            cmd = "; ".join(cmd_parts)
+            
+            async with get_torque_client() as client:
+                result = await client.execute_remote_command(
+                    target_ip=target_ip,
+                    ssh_user=ssh_user,
+                    ssh_private_key=ssh_key,
+                    command=cmd,
+                    agent=agent,
+                    auto_cleanup=_config["auto_delete_environments"],
+                )
+            
+            if result.status == "completed" and result.exit_code == 0:
+                print(f"Written to {args.path}")
+                sys.exit(0)
+            else:
+                print(f"Error: {result.error or result.command_output}", file=sys.stderr)
+                sys.exit(1)
+    
+    except KeyboardInterrupt:
+        print("\nAborted.", file=sys.stderr)
+        sys.exit(130)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def main():
+    """Main entry point - supports both MCP server mode and CLI commands."""
+    
+    # Common arguments parser
+    common_parser = argparse.ArgumentParser(add_help=False)
+    common_parser.add_argument(
         "--torque-url",
         default=os.environ.get("TORQUE_URL"),
         help="Torque base URL (default: $TORQUE_URL)",
     )
-    parser.add_argument(
+    common_parser.add_argument(
         "--torque-token",
         default=os.environ.get("TORQUE_TOKEN"),
         help="Torque API token (default: $TORQUE_TOKEN)",
     )
-    parser.add_argument(
+    common_parser.add_argument(
         "--torque-space",
         default=os.environ.get("TORQUE_SPACE"),
         help="Torque space name (default: $TORQUE_SPACE)",
     )
-    parser.add_argument(
+    common_parser.add_argument(
         "--torque-agent",
         default=os.environ.get("TORQUE_AGENT"),
         help="Default Torque agent name (default: $TORQUE_AGENT)",
     )
-    parser.add_argument(
-        "--default-ssh-key",
-        default=os.environ.get("DEFAULT_SSH_KEY"),
-        help="Default SSH private key file path (default: $DEFAULT_SSH_KEY)",
+    common_parser.add_argument(
+        "--ssh-key",
+        default=os.environ.get("SSH_KEY"),
+        help="SSH private key file path (env: $SSH_KEY)",
     )
-    parser.add_argument(
-        "--default-target-ip",
-        default=os.environ.get("DEFAULT_TARGET_IP"),
-        help="Default target server IP/hostname (default: $DEFAULT_TARGET_IP)",
+    common_parser.add_argument(
+        "--target-host",
+        default=os.environ.get("TARGET_HOST"),
+        help="Target server IP/hostname (env: $TARGET_HOST)",
     )
-    parser.add_argument(
-        "--default-ssh-user",
-        default=os.environ.get("DEFAULT_SSH_USER"),
-        help="Default SSH username (default: $DEFAULT_SSH_USER)",
+    common_parser.add_argument(
+        "--ssh-user",
+        default=os.environ.get("SSH_USER"),
+        help="SSH username (env: $SSH_USER)",
     )
-    parser.add_argument(
+    common_parser.add_argument(
         "--init-commands",
         default=os.environ.get("INIT_COMMANDS"),
-        help="Commands to run before every SSH command (e.g., proxy setup). Use semicolons to separate multiple commands.",
+        help="Commands to run before every SSH command",
     )
-    parser.add_argument(
+    common_parser.add_argument(
         "--finally-commands",
         default=os.environ.get("FINALLY_COMMANDS"),
-        help="Commands to run after every SSH command (cleanup). Always runs even on failure.",
+        help="Commands to run after every SSH command",
     )
-    parser.add_argument(
+    common_parser.add_argument(
         "--auto-delete-environments",
         action="store_true",
         default=os.environ.get("AUTO_DELETE_ENVIRONMENTS", "").lower() in ("true", "1", "yes"),
-        help="Automatically delete Torque environments after command completion (default: keep environments)",
+        help="Automatically delete environments after completion",
     )
+    
+    # Main parser with subcommands - also inherits common args for when no subcommand is given
+    parser = argparse.ArgumentParser(
+        parents=[common_parser],
+        description="ShellAgent - Execute remote commands via Torque (MCP server or CLI)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Modes:
+  serve (default)  Run as MCP server (for VS Code Copilot)
+  run              Execute a command on a remote server
+  runner           Execute a command on the Torque runner
+  read             Read a file from a remote server
+  list             List a directory on a remote server
+  write            Write content to a file on a remote server
+
+Examples:
+  # Run as MCP server (for VS Code)
+  shellagent serve
+
+  # CLI mode - run a remote command
+  shellagent run "uname -a"
+  shellagent run --target 10.0.0.1 --user root "df -h"
+
+  # CLI mode - run on the Torque runner directly
+  shellagent runner "curl https://example.com"
+
+  # CLI mode - read/list/write files
+  shellagent read /etc/hostname
+  shellagent list /var/log
+  shellagent write /tmp/test.txt "Hello World"
+
+Environment Variables:
+  TORQUE_URL, TORQUE_TOKEN, TORQUE_SPACE, TORQUE_AGENT
+  SSH_KEY, TARGET_HOST, SSH_USER
+        """,
+    )
+    
+    subparsers = parser.add_subparsers(dest="command", help="Command to run")
+    
+    # serve subcommand (MCP server mode)
+    subparsers.add_parser("serve", parents=[common_parser], help="Run as MCP server")
+    
+    # run subcommand (remote command)
+    run_parser = subparsers.add_parser("run", parents=[common_parser], help="Execute a command on remote server")
+    run_parser.add_argument("cmd", help="The shell command to execute")
+    run_parser.add_argument("--user", "-u", help="SSH username (overrides --ssh-user)")
+    run_parser.add_argument("--key", "-k", help="SSH private key file (overrides --ssh-key)")
+    run_parser.add_argument("--agent", "-a", help="Torque agent name (overrides default)")
+    run_parser.add_argument("--timeout", type=int, help="Timeout in seconds")
+    run_parser.add_argument("--force", "-f", action="store_true", help="Force dangerous commands")
+    run_parser.add_argument("--json", "-j", action="store_true", help="Output as JSON")
+    
+    # runner subcommand (run on Torque runner)
+    runner_parser = subparsers.add_parser("runner", parents=[common_parser], help="Execute a command on Torque runner")
+    runner_parser.add_argument("cmd", help="The shell command to execute")
+    runner_parser.add_argument("--agent", "-a", help="Torque agent name (overrides default)")
+    runner_parser.add_argument("--timeout", type=int, help="Timeout in seconds")
+    runner_parser.add_argument("--json", "-j", action="store_true", help="Output as JSON")
+    
+    # read subcommand
+    read_parser = subparsers.add_parser("read", parents=[common_parser], help="Read a file from remote server")
+    read_parser.add_argument("path", help="Remote file path to read")
+    read_parser.add_argument("--user", "-u", help="SSH username")
+    read_parser.add_argument("--key", "-k", help="SSH private key file")
+    read_parser.add_argument("--agent", "-a", help="Torque agent name")
+    read_parser.add_argument("--max-size", type=int, default=102400, help="Max file size in bytes (default: 100KB)")
+    
+    # list subcommand
+    list_parser = subparsers.add_parser("list", parents=[common_parser], help="List a directory on remote server")
+    list_parser.add_argument("path", help="Remote directory path")
+    list_parser.add_argument("--user", "-u", help="SSH username")
+    list_parser.add_argument("--key", "-k", help="SSH private key file")
+    list_parser.add_argument("--agent", "-a", help="Torque agent name")
+    list_parser.add_argument("--all", "-A", action="store_true", help="Show hidden files")
+    list_parser.add_argument("--long", "-l", action="store_true", help="Long format with details")
+    
+    # write subcommand
+    write_parser = subparsers.add_parser("write", parents=[common_parser], help="Write content to a remote file")
+    write_parser.add_argument("path", help="Remote file path to write")
+    write_parser.add_argument("content", nargs="?", help="Content to write (or use --stdin)")
+    write_parser.add_argument("--stdin", action="store_true", help="Read content from stdin")
+    write_parser.add_argument("--user", "-u", help="SSH username")
+    write_parser.add_argument("--key", "-k", help="SSH private key file")
+    write_parser.add_argument("--agent", "-a", help="Torque agent name")
+    write_parser.add_argument("--mode", help="File permissions (e.g., 0644)")
+    write_parser.add_argument("--backup", action="store_true", help="Create backup before overwriting")
     
     args = parser.parse_args()
     
-    # Update global config
+    # Update global config from common args
     _config["torque_url"] = args.torque_url
     _config["torque_token"] = args.torque_token
     _config["torque_space"] = args.torque_space
     _config["default_agent"] = args.torque_agent
-    _config["default_ssh_key"] = args.default_ssh_key
-    _config["default_target_ip"] = args.default_target_ip
-    _config["default_ssh_user"] = args.default_ssh_user
+    _config["default_ssh_key"] = args.ssh_key
+    _config["default_target_ip"] = args.target_host
+    _config["default_ssh_user"] = args.ssh_user
     _config["init_commands"] = args.init_commands
     _config["finally_commands"] = args.finally_commands
     _config["auto_delete_environments"] = args.auto_delete_environments
@@ -917,16 +1228,20 @@ Example:
         print(f"Error: Missing required configuration: {', '.join(missing)}", file=sys.stderr)
         sys.exit(1)
     
-    # Run the MCP server
-    async def run():
-        async with stdio_server() as (read_stream, write_stream):
-            await server.run(
-                read_stream,
-                write_stream,
-                server.create_initialization_options(),
-            )
-    
-    asyncio.run(run())
+    # Default to serve mode if no subcommand
+    if args.command is None or args.command == "serve":
+        # Run as MCP server
+        async def run_server():
+            async with stdio_server() as (read_stream, write_stream):
+                await server.run(
+                    read_stream,
+                    write_stream,
+                    server.create_initialization_options(),
+                )
+        asyncio.run(run_server())
+    else:
+        # CLI mode - run the appropriate command
+        asyncio.run(cli_dispatch(args))
 
 
 if __name__ == "__main__":
