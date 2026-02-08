@@ -119,12 +119,16 @@ class TorqueClient:
         effective_init = init_commands if init_commands is not None else self.init_commands
         effective_finally = finally_commands if finally_commands is not None else self.finally_commands
         
+        # Calculate timeout in minutes (round up, minimum 5 minutes for Torque)
+        timeout_minutes = max(5, (self.timeout + 59) // 60)
+        
         inputs = {
             "agent": agent_name,
             "target_ip": target_ip,
             "ssh_user": ssh_user,
             "ssh_private_key": ssh_private_key,
             "command_b64": base64.b64encode(command.encode()).decode(),
+            "timeout_minutes": str(timeout_minutes),
         }
         # Only include optional inputs if they have values
         if effective_init:
@@ -135,7 +139,7 @@ class TorqueClient:
         payload = {
             "blueprint_name": self.BLUEPRINT_NAME,
             "environment_name": environment_name,
-            "duration": "PT8H",  # 8 hours
+            "duration": "PT8H",  # 8 hours (irrelevant for workflows, they auto-terminate)
             "inputs": inputs,
         }
         
@@ -184,9 +188,13 @@ class TorqueClient:
         elif self.init_commands:
             combined_init = self.init_commands
         
+        # Calculate timeout in minutes (round up, minimum 5 minutes for Torque)
+        timeout_minutes = max(5, (self.timeout + 59) // 60)
+        
         inputs = {
             "agent": agent_name,
             "command_b64": base64.b64encode(command.encode()).decode(),
+            "timeout_minutes": str(timeout_minutes),
         }
         # Only include optional inputs if they have values
         if combined_init:
@@ -197,7 +205,7 @@ class TorqueClient:
         payload = {
             "blueprint_name": self.LOCAL_BLUEPRINT_NAME,
             "environment_name": environment_name,
-            "duration": "PT8H",  # 8 hours
+            "duration": "PT8H",  # 8 hours (irrelevant for workflows, they auto-terminate)
             "inputs": inputs,
         }
         
@@ -404,9 +412,11 @@ class TorqueClient:
             # Debug: print status for troubleshooting
             # print(f"Environment {environment_id}: status={status}, current_state={current_state}")
             
-            # Check if environment has completed successfully (Active means deployment done)
-            if status == "active":
-                # Environment deployed - extract outputs
+            # Check if environment has completed successfully
+            # - "active" = blueprint completed deployment
+            # - "success" = workflow completed successfully (auto-terminated)
+            if status in ("active", "success"):
+                # Environment/workflow completed - extract outputs
                 outputs = self._extract_outputs(env_data)
                 command_output_b64 = outputs.get("command_output", "")
                 exit_code_str = outputs.get("exit_code", "0")
@@ -569,13 +579,16 @@ class TorqueClient:
             result = await self.wait_for_environment(environment_id, timeout=timeout, log_callback=log_callback)
             return result
         finally:
-            # Always end the environment (terminate it)
-            # Use force=True if we timed out (environment may still be in transitional state)
+            # Workflows auto-terminate on completion (status="success"), so we only need to
+            # explicitly end if it timed out or failed.
+            # For safety, we still call end_environment but it's mostly a no-op for completed workflows.
             force_terminate = result is not None and result.status == "timeout"
             try:
                 await self.end_environment(environment_id, force=force_terminate)
             except Exception as e:
-                print(f"[WARNING] Failed to end environment {environment_id}: {e}", file=sys.stderr)
+                # Ignore 404 errors - workflow may have already auto-terminated
+                if "404" not in str(e):
+                    print(f"[WARNING] Failed to end environment {environment_id}: {e}", file=sys.stderr)
             
             # Delete the environment only if auto_cleanup is enabled
             if auto_cleanup:
@@ -621,13 +634,16 @@ class TorqueClient:
             result = await self.wait_for_environment(environment_id, timeout=timeout, log_callback=log_callback)
             return result
         finally:
-            # Always end the environment (terminate it)
-            # Use force=True if we timed out (environment may still be in transitional state)
+            # Workflows auto-terminate on completion (status="success"), so we only need to
+            # explicitly end if it timed out or failed.
+            # For safety, we still call end_environment but it's mostly a no-op for completed workflows.
             force_terminate = result is not None and result.status == "timeout"
             try:
                 await self.end_environment(environment_id, force=force_terminate)
             except Exception as e:
-                print(f"[WARNING] Failed to end environment {environment_id}: {e}", file=sys.stderr)
+                # Ignore 404 errors - workflow may have already auto-terminated
+                if "404" not in str(e):
+                    print(f"[WARNING] Failed to end environment {environment_id}: {e}", file=sys.stderr)
             
             # Delete the environment only if auto_cleanup is enabled
             if auto_cleanup:
