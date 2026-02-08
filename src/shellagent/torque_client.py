@@ -153,6 +153,7 @@ class TorqueClient:
         command: str,
         agent: Optional[str] = None,
         environment_name: Optional[str] = None,
+        init_commands: Optional[str] = None,
     ) -> str:
         """
         Start a new environment to execute command locally on the agent container.
@@ -161,6 +162,7 @@ class TorqueClient:
             command: Command to execute
             agent: Agent name (uses default if not specified)
             environment_name: Optional name for the environment
+            init_commands: Optional commands to run before the main command (prepended to global init_commands)
             
         Returns:
             Environment ID
@@ -173,13 +175,22 @@ class TorqueClient:
         if not environment_name:
             environment_name = f"local-cmd-{int(time.time())}"
         
+        # Combine per-call init_commands with global init_commands
+        combined_init = None
+        if init_commands and self.init_commands:
+            combined_init = f"{init_commands}\n{self.init_commands}"
+        elif init_commands:
+            combined_init = init_commands
+        elif self.init_commands:
+            combined_init = self.init_commands
+        
         inputs = {
             "agent": agent_name,
             "command_b64": base64.b64encode(command.encode()).decode(),
         }
         # Only include optional inputs if they have values
-        if self.init_commands:
-            inputs["init_commands_b64"] = base64.b64encode(self.init_commands.encode()).decode()
+        if combined_init:
+            inputs["init_commands_b64"] = base64.b64encode(combined_init.encode()).decode()
         if self.finally_commands:
             inputs["finally_commands_b64"] = base64.b64encode(self.finally_commands.encode()).decode()
         
@@ -580,6 +591,7 @@ class TorqueClient:
         auto_cleanup: bool = True,
         timeout: Optional[int] = None,
         log_callback: Optional[Callable[[str], Awaitable[None]]] = None,
+        init_commands: Optional[str] = None,
     ) -> EnvironmentResult:
         """
         Execute a command locally on the Torque agent container.
@@ -593,6 +605,7 @@ class TorqueClient:
             auto_cleanup: Whether to automatically delete the environment after completion
             timeout: Optional timeout override in seconds
             log_callback: Optional async callback for streaming log updates
+            init_commands: Optional commands to run before the main command
             
         Returns:
             EnvironmentResult with command output
@@ -600,6 +613,7 @@ class TorqueClient:
         environment_id = await self.start_local_environment(
             command=command,
             agent=agent,
+            init_commands=init_commands,
         )
         
         result = None

@@ -110,6 +110,126 @@ def read_ssh_key_file(file_path: str) -> str:
         return f.read()
 
 
+def prepare_files_deployment(files: list[dict]) -> tuple[str, list[str]]:
+    """
+    Prepare shell commands to deploy files before command execution.
+    
+    Reads local files/directories and generates shell commands to write them
+    on the target system. Files are written BEFORE init_commands run.
+    
+    Args:
+        files: List of file specs, each with:
+            - local_path: Path to local file or directory to upload
+            - content: Direct content string (alternative to local_path)
+            - remote_path: Destination path on target
+            - mode: Optional file permissions (e.g., "755")
+    
+    Returns:
+        Tuple of (shell_commands_string, error_messages)
+        If errors exist, the shell_commands_string will be empty.
+    """
+    import tarfile
+    import io
+    
+    if not files:
+        return "", []
+    
+    errors = []
+    commands = []
+    commands.append("# === File Deployment ===")
+    
+    for i, file_spec in enumerate(files):
+        remote_path = file_spec.get("remote_path")
+        local_path = file_spec.get("local_path")
+        content = file_spec.get("content")
+        mode = file_spec.get("mode")
+        
+        if not remote_path:
+            errors.append(f"File {i+1}: missing 'remote_path'")
+            continue
+        
+        # Escape remote path for shell
+        escaped_remote = remote_path.replace("'", "'\\''")
+        remote_dir = os.path.dirname(remote_path)
+        escaped_dir = remote_dir.replace("'", "'\\''") if remote_dir else ""
+        
+        # Get content from local_path or direct content
+        if local_path and content:
+            errors.append(f"File {i+1}: provide either 'local_path' OR 'content', not both")
+            continue
+        elif not local_path and not content:
+            errors.append(f"File {i+1}: must provide either 'local_path' or 'content'")
+            continue
+        
+        if local_path:
+            expanded = os.path.expanduser(local_path)
+            if not os.path.exists(expanded):
+                errors.append(f"File {i+1}: local path not found: {local_path}")
+                continue
+            
+            if os.path.isdir(expanded):
+                # Directory - create tar archive
+                try:
+                    tar_buffer = io.BytesIO()
+                    with tarfile.open(fileobj=tar_buffer, mode='w:gz') as tar:
+                        # Add directory contents with relative paths
+                        for root, dirs, filenames in os.walk(expanded):
+                            for filename in filenames:
+                                full_path = os.path.join(root, filename)
+                                arcname = os.path.relpath(full_path, expanded)
+                                tar.add(full_path, arcname=arcname)
+                            for dirname in dirs:
+                                full_path = os.path.join(root, dirname)
+                                arcname = os.path.relpath(full_path, expanded)
+                                tar.add(full_path, arcname=arcname, recursive=False)
+                    tar_b64 = base64.b64encode(tar_buffer.getvalue()).decode('ascii')
+                    
+                    # Generate commands to create dir and extract tar
+                    commands.append(f"mkdir -p '{escaped_remote}'")
+                    commands.append(f"echo '{tar_b64}' | base64 -d | tar xzf - -C '{escaped_remote}'")
+                except Exception as e:
+                    errors.append(f"File {i+1}: error creating tar: {e}")
+                    continue
+            else:
+                # Regular file
+                try:
+                    with open(expanded, 'rb') as f:
+                        file_bytes = f.read()
+                    file_b64 = base64.b64encode(file_bytes).decode('ascii')
+                    
+                    if escaped_dir:
+                        commands.append(f"mkdir -p '{escaped_dir}'")
+                    commands.append(f"echo '{file_b64}' | base64 -d > '{escaped_remote}'")
+                    if mode:
+                        commands.append(f"chmod {mode} '{escaped_remote}'")
+                except Exception as e:
+                    errors.append(f"File {i+1}: error reading file: {e}")
+                    continue
+        else:
+            # Direct content
+            try:
+                if isinstance(content, bytes):
+                    content_b64 = base64.b64encode(content).decode('ascii')
+                else:
+                    content_b64 = base64.b64encode(content.encode('utf-8')).decode('ascii')
+                
+                if escaped_dir:
+                    commands.append(f"mkdir -p '{escaped_dir}'")
+                commands.append(f"echo '{content_b64}' | base64 -d > '{escaped_remote}'")
+                if mode:
+                    commands.append(f"chmod {mode} '{escaped_remote}'")
+            except Exception as e:
+                errors.append(f"File {i+1}: error encoding content: {e}")
+                continue
+    
+    commands.append("# === End File Deployment ===")
+    
+    if errors:
+        return "", errors
+    
+    return "\n".join(commands), []
+
+
 # Global configuration - set via command line args or environment variables
 _config = {
     "torque_url": None,
@@ -154,42 +274,38 @@ async def list_tools():
     return [
         Tool(
             name="run_remote_command",
-            description="""Execute a shell command on a remote server via SSH.
+            description="""Execute shell commands on a remote server via SSH, optionally uploading files first.
 
-This tool connects to a remote server using SSH credentials and executes the specified command.
-The command is executed through Torque's Shell Grain infrastructure (a Docker-based agent).
+This tool connects to a remote server using SSH credentials and can:
+1. Upload files/directories from your local machine to the remote server
+2. Execute shell commands on the remote server
+3. Both upload files AND run commands in a single operation (recommended for efficiency)
 
-Use this tool when you need to:
-- Troubleshoot a remote server
-- Check system status (disk space, memory, processes, etc.)
-- View log files
-- Run diagnostic commands
-- Execute administrative tasks
+Execution order: files are deployed FIRST, then init_commands, then main command, then finally_commands.
+
+**Use cases:**
+- Troubleshoot a remote server (run commands)
+- Upload a script and execute it (files + command)
+- Upload configuration files (files only)
+- Upload a project directory and run install scripts (files + command)
+- Upload a private key, use it for decryption, then clean up (files + command + finally_commands)
 
 **CRITICAL WARNING - DANGEROUS COMMANDS:**
 The following commands will KILL the Torque agent and cause the operation to fail:
 - `docker restart`, `docker stop`, `docker kill` (any container operations that affect the agent)
 - `systemctl restart docker` or any Docker daemon restart
 - `reboot`, `shutdown`, `init 6`, `init 0`
-- Any command that restarts/stops the Torque agent container
 
 These commands require MANUAL execution via direct SSH or console access.
-If you must run these commands, warn the user and DO NOT use this tool.
-
-The tool will return the command output and exit code.
-
-**LONG-RUNNING COMMANDS:**
-Default timeout is 30 minutes. For longer commands, use the `timeout` parameter.
-Note: Output is only available after command completes (no streaming).
-For very long operations, consider running in background: `nohup command > /tmp/output.log 2>&1 &`
-Then check status with: `cat /tmp/output.log`
 
 **PERFORMANCE TIP:**
-Each command invocation has significant roundtrip overhead (environment provisioning, SSH connection, etc.).
-Consolidate multiple commands into a single invocation when possible using shell operators:
-- Use `;` to run commands sequentially: `cmd1; cmd2; cmd3`
-- Use `&&` to stop on first failure: `cmd1 && cmd2 && cmd3`
-- Use subshells or scripts for complex logic""",
+Each invocation has significant roundtrip overhead. Consolidate operations:
+- Upload files AND run commands in one call
+- Chain commands: `cmd1 && cmd2 && cmd3`
+- Use the `files` parameter instead of multiple write operations
+
+**LONG-RUNNING COMMANDS:**
+Default timeout is 30 minutes. Use `timeout` parameter for longer operations.""",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -207,7 +323,33 @@ Consolidate multiple commands into a single invocation when possible using shell
                     },
                     "command": {
                         "type": "string",
-                        "description": "The shell command to execute on the remote server",
+                        "description": "The shell command to execute on the remote server. Optional if only uploading files.",
+                    },
+                    "files": {
+                        "type": "array",
+                        "description": "Files or directories to upload before running the command. Each item specifies local source and remote destination.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "local_path": {
+                                    "type": "string",
+                                    "description": "Path to local file or directory to upload. Use this OR content, not both.",
+                                },
+                                "content": {
+                                    "type": "string",
+                                    "description": "Direct content to write. Use this OR local_path, not both.",
+                                },
+                                "remote_path": {
+                                    "type": "string",
+                                    "description": "Destination path on the remote server.",
+                                },
+                                "mode": {
+                                    "type": "string",
+                                    "description": "Optional file permissions (e.g., '755' for executable).",
+                                },
+                            },
+                            "required": ["remote_path"],
+                        },
                     },
                     "agent": {
                         "type": "string",
@@ -219,19 +361,19 @@ Consolidate multiple commands into a single invocation when possible using shell
                     },
                     "timeout": {
                         "type": "integer",
-                        "description": "Optional: Maximum time to wait for command completion in seconds. Default is 1800 (30 minutes). For long operations, increase this or run command in background.",
+                        "description": "Optional: Maximum time in seconds. Default is 1800 (30 minutes).",
                     },
                     "init_commands": {
                         "type": "string",
-                        "description": "Optional: Commands to run before the main command. Any failure here will prevent main command execution but finally_commands will still run.",
+                        "description": "Optional: Commands to run after file deployment but before the main command.",
                     },
                     "finally_commands": {
                         "type": "string",
-                        "description": "Optional: Commands to run after the main command completes (cleanup). Runs even if main command fails.",
+                        "description": "Optional: Cleanup commands that run even if main command fails.",
                     },
                     "auto_delete": {
                         "type": "boolean",
-                        "description": "Optional: Whether to automatically delete the Torque environment after completion. Overrides global setting.",
+                        "description": "Optional: Whether to automatically delete the Torque environment after completion.",
                     },
                     "torque_token": {
                         "type": "string",
@@ -246,7 +388,7 @@ Consolidate multiple commands into a single invocation when possible using shell
                         "description": "Optional: Torque space name. Overrides global config.",
                     },
                 },
-                "required": ["command"],
+                "required": [],
             },
         ),
         Tool(
@@ -319,33 +461,69 @@ Returns a detailed listing of files and directories including permissions, size,
             },
         ),
         Tool(
-            name="run_on_runner",
-            description="""Execute a shell command on a Torque runner container (no SSH target needed).
+            name="run_on_agent",
+            description="""Execute shell commands on the Torque agent container, optionally uploading files first.
 
-This tool runs commands on a runner container that gets spawned by the Torque agent.
-No SSH credentials or target IP required - useful when you need to:
-- Run scripts or tools available in the runner environment
-- Execute commands that don't require a specific target machine
-- Test connectivity or run network diagnostics from the Torque infrastructure
-- Perform operations that only need the runner's capabilities
+This tool runs commands directly on the Torque agent container - NO SSH target needed.
+Unlike run_remote_command, this doesn't connect to a remote server.
 
-Note: Each command spawns a fresh runner container via the Torque agent.
+**Key difference from run_remote_command:**
+- run_remote_command: SSH to a remote server (needs target_ip, ssh credentials)
+- run_on_agent: Runs locally on the Torque agent container (no SSH needed)
 
-**LONG-RUNNING COMMANDS:**
-Default timeout is 30 minutes. For longer commands, use the `timeout` parameter.
+**Use cases:**
+- Run tools/scripts available in the agent environment
+- Test network connectivity from the Torque infrastructure
+- Upload scripts and run them on the agent
+- Build/compile projects in a clean container environment
+- Operations that don't require a specific target machine
+
+**Files parameter:**
+You can upload files/directories to the agent container and then run commands on them.
+This is powerful because files persist for the entire command execution - unlike
+separate invocations which would get different containers.
+
+Execution order: files deployed FIRST, then init_commands, then main command.
 
 **PERFORMANCE TIP:**
-Each command invocation has significant roundtrip overhead (environment provisioning, container startup, etc.).
-Consolidate multiple commands into a single invocation when possible using shell operators:
-- Use `;` to run commands sequentially: `cmd1; cmd2; cmd3`
-- Use `&&` to stop on first failure: `cmd1 && cmd2 && cmd3`
-- Use subshells or scripts for complex logic""",
+Each invocation spawns a fresh container. Consolidate operations:
+- Upload files AND run commands in one call
+- Chain commands: `cmd1 && cmd2 && cmd3`
+
+**LONG-RUNNING COMMANDS:**
+Default timeout is 30 minutes. Use `timeout` parameter for longer operations.""",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "command": {
                         "type": "string",
-                        "description": "The shell command to execute on the agent container",
+                        "description": "The shell command to execute on the agent container. Optional if only uploading files.",
+                    },
+                    "files": {
+                        "type": "array",
+                        "description": "Files or directories to upload before running the command.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "local_path": {
+                                    "type": "string",
+                                    "description": "Path to local file or directory to upload. Use this OR content, not both.",
+                                },
+                                "content": {
+                                    "type": "string",
+                                    "description": "Direct content to write. Use this OR local_path, not both.",
+                                },
+                                "remote_path": {
+                                    "type": "string",
+                                    "description": "Destination path on the agent container.",
+                                },
+                                "mode": {
+                                    "type": "string",
+                                    "description": "Optional file permissions (e.g., '755' for executable).",
+                                },
+                            },
+                            "required": ["remote_path"],
+                        },
                     },
                     "agent": {
                         "type": "string",
@@ -353,69 +531,10 @@ Consolidate multiple commands into a single invocation when possible using shell
                     },
                     "timeout": {
                         "type": "integer",
-                        "description": "Optional: Maximum time to wait for command completion in seconds. Default is 1800 (30 minutes).",
+                        "description": "Optional: Maximum time in seconds. Default is 1800 (30 minutes).",
                     },
                 },
-                "required": ["command"],
-            },
-        ),
-        Tool(
-            name="write_remote_file",
-            description="""Write content to a file on a remote server.
-
-This tool transfers file content to a remote server via SSH. It can:
-- Write content directly provided as a string
-- Copy a local file to the remote server
-
-The content is base64-encoded for transfer, so it works with both text and binary files.
-
-**Use cases:**
-- Upload configuration files
-- Transfer scripts to execute remotely
-- Copy any file from local machine to remote server
-
-**Note:** For very large files (>10MB), consider using other transfer methods like scp or rsync.""",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "target_ip": {
-                        "type": "string",
-                        "description": "The IP address or hostname of the remote server",
-                    },
-                    "ssh_user": {
-                        "type": "string",
-                        "description": "The SSH username for authentication",
-                    },
-                    "ssh_private_key": {
-                        "type": "string",
-                        "description": "The path to the SSH private key file for authentication (e.g., C:\\path\\to\\key.pem)",
-                    },
-                    "remote_path": {
-                        "type": "string",
-                        "description": "The destination path on the remote server where the file will be written",
-                    },
-                    "content": {
-                        "type": "string",
-                        "description": "The content to write to the file. Either provide this OR local_path, not both.",
-                    },
-                    "local_path": {
-                        "type": "string",
-                        "description": "Path to a local file to upload. Either provide this OR content, not both.",
-                    },
-                    "mode": {
-                        "type": "string",
-                        "description": "Optional: File permissions in octal (e.g., '755' for executable, '644' for regular file). Default is '644'.",
-                    },
-                    "create_dirs": {
-                        "type": "boolean",
-                        "description": "Optional: Create parent directories if they don't exist. Default is true.",
-                    },
-                    "agent": {
-                        "type": "string",
-                        "description": "Optional: The Torque agent name to use",
-                    },
-                },
-                "required": ["remote_path"],
+                "required": [],
             },
         ),
     ]
@@ -434,22 +553,20 @@ async def call_tool(name: str, arguments: dict):
     elif name == "list_remote_directory":
         return await handle_list_remote_directory(arguments)
     
-    elif name == "run_on_runner":
-        return await handle_run_on_runner(arguments)
-    
-    elif name == "write_remote_file":
-        return await handle_write_remote_file(arguments)
+    elif name == "run_on_agent":
+        return await handle_run_on_agent(arguments)
     
     else:
         return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
 
 async def handle_run_remote_command(arguments: dict):
-    """Execute a remote command."""
+    """Execute a remote command, optionally uploading files first."""
     target_ip = arguments.get("target_ip") or _config["default_target_ip"]
     ssh_user = arguments.get("ssh_user") or _config["default_ssh_user"]
     ssh_private_key_path = arguments.get("ssh_private_key") or _config["default_ssh_key"]
     command = arguments.get("command")
+    files = arguments.get("files", [])
     agent = arguments.get("agent")
     force = arguments.get("force", False)
     timeout = arguments.get("timeout")  # Optional timeout override
@@ -465,10 +582,17 @@ async def handle_run_remote_command(arguments: dict):
     torque_token = arguments.get("torque_token") or _config["torque_token"]
     torque_space = arguments.get("torque_space") or _config["torque_space"]
     
-    if not all([target_ip, ssh_user, ssh_private_key_path, command]):
+    # Must have at least command OR files
+    if not command and not files:
         return [TextContent(
             type="text",
-            text="Error: Missing required parameters. Need target_ip, ssh_user, ssh_private_key, and command (or configure defaults).",
+            text="Error: Must provide either 'command' or 'files' (or both).",
+        )]
+    
+    if not all([target_ip, ssh_user, ssh_private_key_path]):
+        return [TextContent(
+            type="text",
+            text="Error: Missing required parameters. Need target_ip, ssh_user, ssh_private_key (or configure defaults).",
         )]
     
     if not all([torque_url, torque_token, torque_space]):
@@ -478,7 +602,7 @@ async def handle_run_remote_command(arguments: dict):
         )]
     
     # Check for dangerous commands unless force=true
-    if not force:
+    if command and not force:
         warning = check_dangerous_command(command)
         if warning:
             return [TextContent(type="text", text=warning)]
@@ -487,6 +611,30 @@ async def handle_run_remote_command(arguments: dict):
         ssh_private_key = read_ssh_key_file(ssh_private_key_path)
     except FileNotFoundError as e:
         return [TextContent(type="text", text=f"Error: {str(e)}")]
+    
+    # Process files parameter - generate deployment commands
+    files_info = []
+    if files:
+        file_deploy_commands, file_errors = prepare_files_deployment(files)
+        if file_errors:
+            return [TextContent(
+                type="text",
+                text="Error preparing files:\n" + "\n".join(f"- {e}" for e in file_errors),
+            )]
+        # Prepend file deployment to init_commands (files run BEFORE init)
+        if file_deploy_commands:
+            if init_commands:
+                init_commands = file_deploy_commands + "\n" + init_commands
+            else:
+                init_commands = file_deploy_commands
+        # Track files for output reporting
+        for f in files:
+            local = f.get("local_path", "<content>")
+            remote = f.get("remote_path", "")
+            files_info.append(f"{local} -> {remote}")
+    
+    # If no command, use a simple echo
+    effective_command = command or "echo 'Files deployed successfully'"
     
     # Create log streamer for real-time output
     log_callback = None
@@ -511,7 +659,7 @@ async def handle_run_remote_command(arguments: dict):
                 target_ip=target_ip,
                 ssh_user=ssh_user,
                 ssh_private_key=ssh_private_key,
-                command=command,
+                command=effective_command,
                 agent=agent,
                 timeout=timeout,
                 auto_cleanup=auto_delete,
@@ -530,10 +678,15 @@ async def handle_run_remote_command(arguments: dict):
         # Build environment URL for reference
         env_url = f"{torque_url}/{torque_space}/environments/{result.environment_id}"
         
+        # Build files summary if any were uploaded
+        files_summary = ""
+        if files_info:
+            files_summary = "\n**Files Deployed:**\n" + "\n".join(f"- {f}" for f in files_info) + "\n"
+        
         if result.status == "completed":
             output_block = format_code_block(result.command_output)
             output_text = f"""Command executed successfully on {target_ip}
-
+{files_summary}
 **Exit Code:** {result.exit_code}
 
 **Output:**
@@ -542,7 +695,7 @@ async def handle_run_remote_command(arguments: dict):
 **Environment:** `{result.environment_id}` - {env_url}"""
         else:
             output_text = f"""Command execution failed on {target_ip}
-
+{files_summary}
 **Status:** {result.status}
 **Error:** {result.error}
 
@@ -698,17 +851,40 @@ async def handle_list_remote_directory(arguments: dict):
         return [TextContent(type="text", text=f"Error listing remote directory: {str(e)}")]
 
 
-async def handle_run_on_runner(arguments: dict):
-    """Execute a command on a Torque runner container."""
+async def handle_run_on_agent(arguments: dict):
+    """Execute a command on a Torque agent container, optionally uploading files first."""
     command = arguments.get("command")
+    files = arguments.get("files", [])
     agent = arguments.get("agent")
     timeout = arguments.get("timeout")  # Optional timeout override
     
-    if not command:
+    # Must have at least command OR files
+    if not command and not files:
         return [TextContent(
             type="text",
-            text="Error: Missing required parameter 'command'.",
+            text="Error: Must provide either 'command' or 'files' (or both).",
         )]
+    
+    # Process files parameter - generate deployment commands
+    files_info = []
+    init_commands = None
+    if files:
+        file_deploy_commands, file_errors = prepare_files_deployment(files)
+        if file_errors:
+            return [TextContent(
+                type="text",
+                text="Error preparing files:\n" + "\n".join(f"- {e}" for e in file_errors),
+            )]
+        if file_deploy_commands:
+            init_commands = file_deploy_commands
+        # Track files for output reporting
+        for f in files:
+            local = f.get("local_path", "<content>")
+            remote = f.get("remote_path", "")
+            files_info.append(f"{local} -> {remote}")
+    
+    # If no command, use a simple echo
+    effective_command = command or "echo 'Files deployed successfully'"
     
     # Create log streamer for real-time output
     log_callback = None
@@ -721,11 +897,12 @@ async def handle_run_on_runner(arguments: dict):
     try:
         async with get_torque_client() as client:
             result = await client.execute_local_command(
-                command=command,
+                command=effective_command,
                 agent=agent,
                 timeout=timeout,
                 auto_cleanup=_config["auto_delete_environments"],
                 log_callback=log_callback,
+                init_commands=init_commands,
             )
             
             # Try to get grain log for additional context (especially useful on failures)
@@ -739,10 +916,15 @@ async def handle_run_on_runner(arguments: dict):
         env_url = f"{_config['torque_url']}/{_config['torque_space']}/environments/{result.environment_id}"
         agent_name = agent or _config["default_agent"]
         
+        # Build files summary if any were uploaded
+        files_summary = ""
+        if files_info:
+            files_summary = "\n**Files Deployed:**\n" + "\n".join(f"- {f}" for f in files_info) + "\n"
+        
         if result.status == "completed":
             output_block = format_code_block(result.command_output)
-            output_text = f"""Command executed successfully on runner (via agent `{agent_name}`)
-
+            output_text = f"""Command executed successfully on agent `{agent_name}`
+{files_summary}
 **Exit Code:** {result.exit_code}
 
 **Output:**
@@ -750,8 +932,8 @@ async def handle_run_on_runner(arguments: dict):
 
 **Environment:** `{result.environment_id}` - {env_url}"""
         else:
-            output_text = f"""Command execution failed on runner (via agent `{agent_name}`)
-
+            output_text = f"""Command execution failed on agent `{agent_name}`
+{files_summary}
 **Status:** {result.status}
 **Error:** {result.error}
 
@@ -769,122 +951,6 @@ async def handle_run_on_runner(arguments: dict):
     
     except Exception as e:
         return [TextContent(type="text", text=f"Error executing command on agent: {str(e)}")]
-
-
-async def handle_write_remote_file(arguments: dict):
-    """Write content to a file on a remote server."""
-    target_ip = arguments.get("target_ip") or _config["default_target_ip"]
-    ssh_user = arguments.get("ssh_user") or _config["default_ssh_user"]
-    ssh_private_key_path = arguments.get("ssh_private_key") or _config["default_ssh_key"]
-    remote_path = arguments.get("remote_path")
-    content = arguments.get("content")
-    local_path = arguments.get("local_path")
-    mode = arguments.get("mode", "644")
-    create_dirs = arguments.get("create_dirs", True)
-    agent = arguments.get("agent")
-    
-    if not all([target_ip, ssh_user, ssh_private_key_path, remote_path]):
-        return [TextContent(
-            type="text",
-            text="Error: Missing required parameters. Need target_ip, ssh_user, ssh_private_key, and remote_path (or configure defaults).",
-        )]
-    
-    # Must have either content or local_path
-    if not content and not local_path:
-        return [TextContent(
-            type="text",
-            text="Error: Must provide either 'content' or 'local_path' parameter.",
-        )]
-    
-    if content and local_path:
-        return [TextContent(
-            type="text",
-            text="Error: Provide either 'content' OR 'local_path', not both.",
-        )]
-    
-    try:
-        ssh_private_key = read_ssh_key_file(ssh_private_key_path)
-    except FileNotFoundError as e:
-        return [TextContent(type="text", text=f"Error: {str(e)}")]
-    
-    # Get content from local file if local_path is provided
-    if local_path:
-        expanded_path = os.path.expanduser(local_path)
-        if not os.path.exists(expanded_path):
-            return [TextContent(type="text", text=f"Error: Local file not found: {local_path}")]
-        
-        try:
-            with open(expanded_path, 'rb') as f:
-                file_bytes = f.read()
-        except Exception as e:
-            return [TextContent(type="text", text=f"Error reading local file: {str(e)}")]
-    else:
-        # Content provided directly - encode as UTF-8
-        file_bytes = content.encode('utf-8')
-    
-    # Base64 encode the content
-    content_b64 = base64.b64encode(file_bytes).decode('ascii')
-    
-    # Build the command to write the file on the remote server
-    # Create parent directories if requested
-    dir_cmd = ""
-    if create_dirs:
-        remote_dir = os.path.dirname(remote_path)
-        if remote_dir:
-            dir_cmd = f"mkdir -p '{remote_dir}' && "
-    
-    # Use echo with base64 -d to write the file, then set permissions
-    command = f"{dir_cmd}echo '{content_b64}' | base64 -d > '{remote_path}' && chmod {mode} '{remote_path}' && echo 'File written successfully' && ls -la '{remote_path}'"
-    
-    try:
-        async with get_torque_client() as client:
-            result = await client.execute_remote_command(
-                target_ip=target_ip,
-                ssh_user=ssh_user,
-                ssh_private_key=ssh_private_key,
-                command=command,
-                agent=agent,
-                auto_cleanup=_config["auto_delete_environments"],
-            )
-        
-        # Build environment URL for reference
-        env_url = f"{_config['torque_url']}/{_config['torque_space']}/environments/{result.environment_id}"
-        
-        file_size = len(file_bytes)
-        source_info = f"local file `{local_path}`" if local_path else "provided content"
-        
-        if result.status == "completed" and result.exit_code == 0:
-            output_text = f"""File written successfully to {target_ip}
-
-**Remote Path:** `{remote_path}`
-**Source:** {source_info}
-**Size:** {file_size} bytes
-**Mode:** {mode}
-
-**Output:**
-{format_code_block(result.command_output)}
-
-**Environment:** `{result.environment_id}` - {env_url}"""
-        elif result.status == "completed":
-            output_text = f"""Failed to write file to {target_ip}
-
-**Remote Path:** `{remote_path}`
-**Exit Code:** {result.exit_code}
-**Output:** {result.command_output}
-
-**Environment:** `{result.environment_id}` - {env_url}"""
-        else:
-            output_text = f"""Failed to write file to {target_ip}
-
-**Status:** {result.status}
-**Error:** {result.error}
-
-**Environment:** `{result.environment_id}` - {env_url}"""
-        
-        return [TextContent(type="text", text=output_text)]
-    
-    except Exception as e:
-        return [TextContent(type="text", text=f"Error writing remote file: {str(e)}")]
 
 
 async def cli_dispatch(args):
@@ -916,9 +982,40 @@ async def cli_dispatch(args):
             print(data, file=sys.stderr, end='', flush=True)
         return _stream
     
+    # Helper to parse --upload arguments into files list
+    def parse_uploads(upload_args):
+        """Parse --upload arguments into files list for deployment.
+        
+        Format: LOCAL:REMOTE[:MODE]
+        Handles Windows paths with drive letters (e.g., C:\\path\\file.txt)
+        """
+        if not upload_args:
+            return []
+        files = []
+        for spec in upload_args:
+            parts = spec.split(':')
+            # Handle Windows drive letters (e.g., C:\path -> ['C', '\path', ...])
+            # If first part is single letter and second part starts with \ or /, rejoin them
+            if len(parts) >= 2 and len(parts[0]) == 1 and parts[0].isalpha():
+                if parts[1].startswith('\\') or parts[1].startswith('/'):
+                    # Rejoin drive letter with path
+                    parts = [parts[0] + ':' + parts[1]] + parts[2:]
+            
+            if len(parts) < 2:
+                print(f"Error: Invalid upload spec '{spec}'. Use LOCAL:REMOTE[:MODE]", file=sys.stderr)
+                sys.exit(1)
+            file_spec = {
+                'local_path': parts[0],
+                'remote_path': parts[1],
+            }
+            if len(parts) >= 3:
+                file_spec['mode'] = parts[2]
+            files.append(file_spec)
+        return files
+    
     try:
-        if args.command == "run":
-            # Remote command execution
+        if args.command == "remote":
+            # Remote command execution (with optional file uploads)
             target_ip = _config["default_target_ip"]
             ssh_user = getattr(args, 'user', None) or _config["default_ssh_user"]
             ssh_key_path = getattr(args, 'key', None) or _config["default_ssh_key"]
@@ -926,14 +1023,21 @@ async def cli_dispatch(args):
             timeout = getattr(args, 'timeout', None)
             force = getattr(args, 'force', False)
             output_json = getattr(args, 'json', False)
+            uploads = parse_uploads(getattr(args, 'upload', None))
+            cmd = getattr(args, 'cmd', None)
+            
+            # Must have command or uploads
+            if not cmd and not uploads:
+                print("Error: Must provide a command or --upload files (or both).", file=sys.stderr)
+                sys.exit(1)
             
             if not all([target_ip, ssh_user, ssh_key_path]):
                 print("Error: Missing target, user, or SSH key. Use --target, --user, --key or set defaults.", file=sys.stderr)
                 sys.exit(1)
             
             # Check dangerous commands
-            if not force:
-                warning = check_dangerous_command(args.cmd)
+            if cmd and not force:
+                warning = check_dangerous_command(cmd)
                 if warning:
                     print(warning, file=sys.stderr)
                     sys.exit(2)
@@ -944,16 +1048,31 @@ async def cli_dispatch(args):
                 print(f"Error: {e}", file=sys.stderr)
                 sys.exit(1)
             
+            # Process file uploads
+            init_commands = None
+            if uploads:
+                file_deploy_commands, file_errors = prepare_files_deployment(uploads)
+                if file_errors:
+                    print("Error preparing files:", file=sys.stderr)
+                    for e in file_errors:
+                        print(f"  - {e}", file=sys.stderr)
+                    sys.exit(1)
+                if file_deploy_commands:
+                    init_commands = file_deploy_commands
+            
+            effective_command = cmd or "echo 'Files deployed successfully'"
+            
             async with get_torque_client() as client:
                 result = await client.execute_remote_command(
                     target_ip=target_ip,
                     ssh_user=ssh_user,
                     ssh_private_key=ssh_key,
-                    command=args.cmd,
+                    command=effective_command,
                     agent=agent,
                     timeout=timeout,
                     auto_cleanup=_config["auto_delete_environments"],
                     log_callback=cli_log_callback(""),
+                    init_commands=init_commands,
                 )
             
             if output_json:
@@ -972,19 +1091,41 @@ async def cli_dispatch(args):
                     print(f"Error: {result.error}", file=sys.stderr)
                     sys.exit(1)
         
-        elif args.command == "runner":
-            # Runner command
+        elif args.command == "agent":
+            # Agent command (with optional file uploads)
             agent = getattr(args, 'agent', None)
             timeout = getattr(args, 'timeout', None)
             output_json = getattr(args, 'json', False)
+            uploads = parse_uploads(getattr(args, 'upload', None))
+            cmd = getattr(args, 'cmd', None)
+            
+            # Must have command or uploads
+            if not cmd and not uploads:
+                print("Error: Must provide a command or --upload files (or both).", file=sys.stderr)
+                sys.exit(1)
+            
+            # Process file uploads
+            init_commands = None
+            if uploads:
+                file_deploy_commands, file_errors = prepare_files_deployment(uploads)
+                if file_errors:
+                    print("Error preparing files:", file=sys.stderr)
+                    for e in file_errors:
+                        print(f"  - {e}", file=sys.stderr)
+                    sys.exit(1)
+                if file_deploy_commands:
+                    init_commands = file_deploy_commands
+            
+            effective_command = cmd or "echo 'Files deployed successfully'"
             
             async with get_torque_client() as client:
                 result = await client.execute_local_command(
-                    command=args.cmd,
+                    command=effective_command,
                     agent=agent,
                     timeout=timeout,
                     auto_cleanup=_config["auto_delete_environments"],
                     log_callback=cli_log_callback(""),
+                    init_commands=init_commands,
                 )
             
             if output_json:
@@ -1084,80 +1225,6 @@ async def cli_dispatch(args):
             else:
                 print(f"Error: {result.error}", file=sys.stderr)
                 sys.exit(1)
-        
-        elif args.command == "write":
-            # Write to remote file
-            target_ip = _config["default_target_ip"]
-            ssh_user = getattr(args, 'user', None) or _config["default_ssh_user"]
-            ssh_key_path = getattr(args, 'key', None) or _config["default_ssh_key"]
-            agent = getattr(args, 'agent', None)
-            timeout = getattr(args, 'timeout', None)
-            mode = getattr(args, 'mode', None)
-            backup = getattr(args, 'backup', False)
-            use_stdin = getattr(args, 'stdin', False)
-            local_file = getattr(args, 'file', None)
-            
-            if not all([target_ip, ssh_user, ssh_key_path]):
-                print("Error: Missing target, user, or SSH key.", file=sys.stderr)
-                sys.exit(1)
-            
-            # Get content from various sources
-            if use_stdin:
-                content = sys.stdin.read()
-            elif local_file:
-                expanded = os.path.expanduser(local_file)
-                if not os.path.exists(expanded):
-                    print(f"Error: Local file not found: {local_file}", file=sys.stderr)
-                    sys.exit(1)
-                with open(expanded, 'rb') as f:
-                    content = f.read()
-                # Handle binary files
-                try:
-                    content = content.decode('utf-8')
-                except UnicodeDecodeError:
-                    # Binary file - keep as bytes, base64 will handle it
-                    pass
-            elif args.content:
-                content = args.content
-            else:
-                print("Error: No content provided. Use positional argument, --stdin, or --file.", file=sys.stderr)
-                sys.exit(1)
-            
-            ssh_key = read_ssh_key_file(ssh_key_path)
-            
-            # Build write command
-            escaped_path = args.path.replace("'", "'\\''")
-            # Handle both string and bytes content
-            if isinstance(content, bytes):
-                content_b64 = base64.b64encode(content).decode()
-            else:
-                content_b64 = base64.b64encode(content.encode()).decode()
-            
-            cmd_parts = []
-            if backup:
-                cmd_parts.append(f"[ -f '{escaped_path}' ] && cp '{escaped_path}' '{escaped_path}.bak'")
-            cmd_parts.append(f"echo '{content_b64}' | base64 -d > '{escaped_path}'")
-            if mode:
-                cmd_parts.append(f"chmod {mode} '{escaped_path}'")
-            cmd = "; ".join(cmd_parts)
-            
-            async with get_torque_client() as client:
-                result = await client.execute_remote_command(
-                    target_ip=target_ip,
-                    ssh_user=ssh_user,
-                    ssh_private_key=ssh_key,
-                    command=cmd,
-                    agent=agent,
-                    timeout=timeout,
-                    auto_cleanup=_config["auto_delete_environments"],
-                )
-            
-            if result.status == "completed" and result.exit_code == 0:
-                print(f"Written to {args.path}")
-                sys.exit(0)
-            else:
-                print(f"Error: {result.error or result.command_output}", file=sys.stderr)
-                sys.exit(1)
     
     except KeyboardInterrupt:
         print("\nAborted.", file=sys.stderr)
@@ -1237,33 +1304,41 @@ def main():
         epilog="""
 Modes:
   serve (default)  Run as MCP server (for VS Code Copilot)
-  run              Execute a command on a remote server
-  runner           Execute a command on the Torque runner
+  remote           Execute a command on a remote target server via SSH
+  agent            Execute a command on the Torque agent container itself
   read             Read a file from a remote server
   list             List a directory on a remote server
-  write            Write content to a file on a remote server
 
 Examples:
   # Run as MCP server (for VS Code)
   shellagent serve
 
-  # CLI mode - run a remote command
-  shellagent run "uname -a"
-  shellagent run --target 10.0.0.1 --user root "df -h"
+  # CLI mode - run a command on a remote server
+  shellagent remote "uname -a"
+  shellagent remote --target 10.0.0.1 --user root "df -h"
 
-  # CLI mode - run on the Torque runner directly
-  shellagent runner "curl https://example.com"
+  # CLI mode - upload files and run a command on remote server
+  shellagent remote --upload ./script.sh:/tmp/script.sh:755 "bash /tmp/script.sh"
+  shellagent remote --upload ./config.yaml:/etc/app/config.yaml --upload ./data:/var/data "cat /etc/app/config.yaml"
 
-  # CLI mode - read/list/write files
+  # CLI mode - run on the Torque agent container directly
+  shellagent agent "curl https://example.com"
+  shellagent agent --upload ./test.py:/tmp/test.py "python /tmp/test.py"
+
+  # CLI mode - read/list files
   shellagent read /etc/hostname
   shellagent list /var/log
-  shellagent write /tmp/test.txt "Hello World"
-  shellagent write /tmp/config.yaml --file ./local-config.yaml
-  echo "content" | shellagent write /tmp/from-stdin.txt --stdin
 
 Environment Variables:
   TORQUE_URL, TORQUE_TOKEN, TORQUE_SPACE, TORQUE_AGENT
   SSH_KEY, TARGET_HOST, SSH_USER
+
+UPLOAD FORMAT:
+  --upload LOCAL:REMOTE[:MODE]
+  LOCAL  = path to local file or directory
+  REMOTE = destination path on target
+  MODE   = optional file permissions (e.g., 755) - default: 644 for files
+  Directories are transferred via tar archive.
 
 DANGEROUS COMMANDS (will kill the Torque agent):
   docker restart, docker stop, docker kill, docker rm
@@ -1275,16 +1350,16 @@ DANGEROUS COMMANDS (will kill the Torque agent):
 LONG-RUNNING COMMANDS:
   Default timeout is 30 minutes. Use --timeout to extend.
   For very long operations, run in background:
-    shellagent run "nohup command > /tmp/output.log 2>&1 &"
+    shellagent remote "nohup command > /tmp/output.log 2>&1 &"
   Then check status:
-    shellagent run "cat /tmp/output.log"
+    shellagent remote "cat /tmp/output.log"
 
 PERFORMANCE TIP:
   Each command invocation has significant roundtrip overhead
   (environment provisioning, SSH connection, etc.).
   Consolidate multiple commands into a single invocation:
-    shellagent run "cmd1; cmd2; cmd3"           # sequential
-    shellagent run "cmd1 && cmd2 && cmd3"       # stop on failure
+    shellagent remote "cmd1; cmd2; cmd3"           # sequential
+    shellagent remote "cmd1 && cmd2 && cmd3"       # stop on failure
         """,
     )
     
@@ -1293,22 +1368,26 @@ PERFORMANCE TIP:
     # serve subcommand (MCP server mode)
     subparsers.add_parser("serve", parents=[common_parser], help="Run as MCP server")
     
-    # run subcommand (remote command)
-    run_parser = subparsers.add_parser("run", parents=[common_parser], help="Execute a command on remote server")
-    run_parser.add_argument("cmd", help="The shell command to execute")
-    run_parser.add_argument("--user", "-u", help="SSH username (overrides --ssh-user)")
-    run_parser.add_argument("--key", "-k", help="SSH private key file (overrides --ssh-key)")
-    run_parser.add_argument("--agent", "-a", help="Torque agent name (overrides default)")
-    run_parser.add_argument("--timeout", type=int, help="Timeout in seconds")
-    run_parser.add_argument("--force", "-f", action="store_true", help="Force dangerous commands")
-    run_parser.add_argument("--json", "-j", action="store_true", help="Output as JSON")
+    # remote subcommand (remote command via SSH)
+    remote_parser = subparsers.add_parser("remote", parents=[common_parser], help="Execute a command on remote server via SSH")
+    remote_parser.add_argument("cmd", nargs='?', help="The shell command to execute (optional if --upload used)")
+    remote_parser.add_argument("--user", "-u", help="SSH username (overrides --ssh-user)")
+    remote_parser.add_argument("--key", "-k", help="SSH private key file (overrides --ssh-key)")
+    remote_parser.add_argument("--agent", "-a", help="Torque agent name (overrides default)")
+    remote_parser.add_argument("--timeout", type=int, help="Timeout in seconds")
+    remote_parser.add_argument("--force", "-f", action="store_true", help="Force dangerous commands")
+    remote_parser.add_argument("--json", "-j", action="store_true", help="Output as JSON")
+    remote_parser.add_argument("--upload", action="append", metavar="LOCAL:REMOTE[:MODE]",
+                              help="Upload local file/dir to remote path (can be repeated)")
     
-    # runner subcommand (run on Torque runner)
-    runner_parser = subparsers.add_parser("runner", parents=[common_parser], help="Execute a command on Torque runner")
-    runner_parser.add_argument("cmd", help="The shell command to execute")
-    runner_parser.add_argument("--agent", "-a", help="Torque agent name (overrides default)")
-    runner_parser.add_argument("--timeout", type=int, help="Timeout in seconds")
-    runner_parser.add_argument("--json", "-j", action="store_true", help="Output as JSON")
+    # agent subcommand (run on Torque agent container)
+    agent_parser = subparsers.add_parser("agent", parents=[common_parser], help="Execute a command on Torque agent container")
+    agent_parser.add_argument("cmd", nargs='?', help="The shell command to execute (optional if --upload used)")
+    agent_parser.add_argument("--agent", "-a", help="Torque agent name (overrides default)")
+    agent_parser.add_argument("--timeout", type=int, help="Timeout in seconds")
+    agent_parser.add_argument("--json", "-j", action="store_true", help="Output as JSON")
+    agent_parser.add_argument("--upload", action="append", metavar="LOCAL:REMOTE[:MODE]",
+                             help="Upload local file/dir to agent container (can be repeated)")
     
     # read subcommand
     read_parser = subparsers.add_parser("read", parents=[common_parser], help="Read a file from remote server")
@@ -1328,19 +1407,6 @@ PERFORMANCE TIP:
     list_parser.add_argument("--timeout", type=int, help="Timeout in seconds")
     list_parser.add_argument("--all", "-A", action="store_true", help="Show hidden files")
     list_parser.add_argument("--long", "-l", action="store_true", help="Long format with details")
-    
-    # write subcommand
-    write_parser = subparsers.add_parser("write", parents=[common_parser], help="Write content to a remote file")
-    write_parser.add_argument("path", help="Remote file path to write")
-    write_parser.add_argument("content", nargs="?", help="Content to write (or use --stdin/--file)")
-    write_parser.add_argument("--stdin", action="store_true", help="Read content from stdin")
-    write_parser.add_argument("--file", "-f", help="Read content from local file")
-    write_parser.add_argument("--user", "-u", help="SSH username")
-    write_parser.add_argument("--key", "-k", help="SSH private key file")
-    write_parser.add_argument("--agent", "-a", help="Torque agent name")
-    write_parser.add_argument("--timeout", type=int, help="Timeout in seconds")
-    write_parser.add_argument("--mode", help="File permissions (e.g., 0644)")
-    write_parser.add_argument("--backup", action="store_true", help="Create backup before overwriting")
     
     args = parser.parse_args()
     
