@@ -1,0 +1,53 @@
+spec_version: 2
+description: |
+  Workflow for executing shell commands on the agent container.
+  This is a space-scoped workflow that can run independently.
+
+workflow:
+  scope: space
+  triggers:
+    - type: manual
+  timeout: '30'  # 30 minutes max
+
+inputs:
+  agent:
+    type: agent
+    description: The Torque agent to use for execution
+  command_b64:
+    type: string
+    description: Base64-encoded shell command(s) to execute
+
+outputs:
+  command_output:
+    value: '{{ .grains.executor.activities.deploy.commands.run.outputs.command_output }}'
+  exit_code:
+    value: '{{ .grains.executor.activities.deploy.commands.run.outputs.exit_code }}'
+
+grains:
+  executor:
+    kind: shell
+    spec:
+      agent:
+        name: '{{ .inputs.agent }}'
+      activities:
+        deploy:
+          commands:
+            - name: run
+              command: |
+                set +e
+                OUTPUT_FILE=$(mktemp)
+                EXIT_CODE_FILE=$(mktemp)
+                echo "0" > "$EXIT_CODE_FILE"
+                
+                # Decode and run command
+                SCRIPT=$(echo '{{ .inputs.command_b64 }}' | base64 -d)
+                bash -c "$SCRIPT" 2>&1 | tee "$OUTPUT_FILE"
+                echo "${PIPESTATUS[0]}" > "$EXIT_CODE_FILE"
+                
+                # Export outputs
+                export command_output=$(base64 < "$OUTPUT_FILE" | tr -d '\n')
+                export exit_code=$(cat "$EXIT_CODE_FILE")
+                rm -f "$OUTPUT_FILE" "$EXIT_CODE_FILE"
+              outputs:
+                - command_output
+                - exit_code
