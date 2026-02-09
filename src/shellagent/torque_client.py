@@ -35,7 +35,7 @@ class TorqueClient:
         space: str,
         default_agent: Optional[str] = None,
         timeout: int = 1800,  # 30 minutes default
-        poll_interval: int = 5,
+        poll_interval: int = 2,
         init_commands: Optional[str] = None,
         finally_commands: Optional[str] = None,
     ):
@@ -251,6 +251,10 @@ class TorqueClient:
         
         # 404 is ok - environment may have already ended
         if response.status_code == 404:
+            return
+        
+        # 400 Bad Request - workflow already completed/terminated (can't end twice)
+        if response.status_code == 400:
             return
         
         # 409 Conflict - environment is in a transitional state (Launching/Deploying)
@@ -579,16 +583,14 @@ class TorqueClient:
             result = await self.wait_for_environment(environment_id, timeout=timeout, log_callback=log_callback)
             return result
         finally:
-            # Workflows auto-terminate on completion (status="success"), so we only need to
-            # explicitly end if it timed out or failed.
-            # For safety, we still call end_environment but it's mostly a no-op for completed workflows.
-            force_terminate = result is not None and result.status == "timeout"
-            try:
-                await self.end_environment(environment_id, force=force_terminate)
-            except Exception as e:
-                # Ignore 404 errors - workflow may have already auto-terminated
-                if "404" not in str(e):
-                    print(f"[WARNING] Failed to end environment {environment_id}: {e}", file=sys.stderr)
+            # Workflows auto-terminate on completion (status="success"), so only call
+            # end_environment if it timed out or failed (not completed)
+            if result is None or result.status != "completed":
+                force_terminate = result is not None and result.status == "timeout"
+                try:
+                    await self.end_environment(environment_id, force=force_terminate)
+                except Exception as e:
+                    pass  # Ignore errors - workflow may have already auto-terminated
             
             # Delete the environment only if auto_cleanup is enabled
             if auto_cleanup:
@@ -634,16 +636,14 @@ class TorqueClient:
             result = await self.wait_for_environment(environment_id, timeout=timeout, log_callback=log_callback)
             return result
         finally:
-            # Workflows auto-terminate on completion (status="success"), so we only need to
-            # explicitly end if it timed out or failed.
-            # For safety, we still call end_environment but it's mostly a no-op for completed workflows.
-            force_terminate = result is not None and result.status == "timeout"
-            try:
-                await self.end_environment(environment_id, force=force_terminate)
-            except Exception as e:
-                # Ignore 404 errors - workflow may have already auto-terminated
-                if "404" not in str(e):
-                    print(f"[WARNING] Failed to end environment {environment_id}: {e}", file=sys.stderr)
+            # Workflows auto-terminate on completion (status="success"), so only call
+            # end_environment if it timed out or failed (not completed)
+            if result is None or result.status != "completed":
+                force_terminate = result is not None and result.status == "timeout"
+                try:
+                    await self.end_environment(environment_id, force=force_terminate)
+                except Exception as e:
+                    pass  # Ignore errors - workflow may have already auto-terminated
             
             # Delete the environment only if auto_cleanup is enabled
             if auto_cleanup:

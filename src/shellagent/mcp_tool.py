@@ -273,7 +273,7 @@ async def list_tools():
     """List available tools."""
     return [
         Tool(
-            name="run_remote_command",
+            name="run_on_ssh",
             description="""Execute shell commands on a remote server via SSH, optionally uploading files first.
 
 This tool connects to a remote server using SSH credentials and can:
@@ -395,7 +395,7 @@ Default timeout is 30 minutes. Use `timeout` parameter for longer operations."""
             name="read_remote_file",
             description="""Read the contents of a file on a remote server.
 
-This is a convenience wrapper around run_remote_command that reads a file's content.
+This is a convenience wrapper around run_on_ssh that reads a file's content.
 Useful for viewing configuration files, logs, or any text file on the remote server.""",
             inputSchema={
                 "type": "object",
@@ -461,15 +461,15 @@ Returns a detailed listing of files and directories including permissions, size,
             },
         ),
         Tool(
-            name="run_on_agent",
+            name="run_on_container",
             description="""Execute shell commands on the Torque agent container, optionally uploading files first.
 
 This tool runs commands directly on the Torque agent container - NO SSH target needed.
-Unlike run_remote_command, this doesn't connect to a remote server.
+Unlike run_on_ssh, this doesn't connect to a remote server.
 
-**Key difference from run_remote_command:**
-- run_remote_command: SSH to a remote server (needs target_ip, ssh credentials)
-- run_on_agent: Runs locally on the Torque agent container (no SSH needed)
+**Key difference from run_on_ssh:**
+- run_on_ssh: SSH to a remote server (needs target_ip, ssh credentials)
+- run_on_container: Runs locally on the Torque agent container (no SSH needed)
 
 **Use cases:**
 - Run tools/scripts available in the agent environment
@@ -544,8 +544,8 @@ Default timeout is 30 minutes. Use `timeout` parameter for longer operations."""
 async def call_tool(name: str, arguments: dict):
     """Handle tool calls."""
     
-    if name == "run_remote_command":
-        return await handle_run_remote_command(arguments)
+    if name == "run_on_ssh":
+        return await handle_run_on_ssh(arguments)
     
     elif name == "read_remote_file":
         return await handle_read_remote_file(arguments)
@@ -553,15 +553,15 @@ async def call_tool(name: str, arguments: dict):
     elif name == "list_remote_directory":
         return await handle_list_remote_directory(arguments)
     
-    elif name == "run_on_agent":
-        return await handle_run_on_agent(arguments)
+    elif name == "run_on_container":
+        return await handle_run_on_container(arguments)
     
     else:
         return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
 
-async def handle_run_remote_command(arguments: dict):
-    """Execute a remote command, optionally uploading files first."""
+async def handle_run_on_ssh(arguments: dict):
+    """Execute a remote command via SSH, optionally uploading files first."""
     target_ip = arguments.get("target_ip") or _config["default_target_ip"]
     ssh_user = arguments.get("ssh_user") or _config["default_ssh_user"]
     ssh_private_key_path = arguments.get("ssh_private_key") or _config["default_ssh_key"]
@@ -851,7 +851,7 @@ async def handle_list_remote_directory(arguments: dict):
         return [TextContent(type="text", text=f"Error listing remote directory: {str(e)}")]
 
 
-async def handle_run_on_agent(arguments: dict):
+async def handle_run_on_container(arguments: dict):
     """Execute a command on a Torque agent container, optionally uploading files first."""
     command = arguments.get("command")
     files = arguments.get("files", [])
@@ -1014,8 +1014,8 @@ async def cli_dispatch(args):
         return files
     
     try:
-        if args.command == "remote":
-            # Remote command execution (with optional file uploads)
+        if args.command == "ssh":
+            # SSH command execution (with optional file uploads)
             target_ip = _config["default_target_ip"]
             ssh_user = getattr(args, 'user', None) or _config["default_ssh_user"]
             ssh_key_path = getattr(args, 'key', None) or _config["default_ssh_key"]
@@ -1091,8 +1091,8 @@ async def cli_dispatch(args):
                     print(f"Error: {result.error}", file=sys.stderr)
                     sys.exit(1)
         
-        elif args.command == "agent":
-            # Agent command (with optional file uploads)
+        elif args.command == "container":
+            # Container command (with optional file uploads)
             agent = getattr(args, 'agent', None)
             timeout = getattr(args, 'timeout', None)
             output_json = getattr(args, 'json', False)
@@ -1304,8 +1304,8 @@ def main():
         epilog="""
 Modes:
   serve (default)  Run as MCP server (for VS Code Copilot)
-  remote           Execute a command on a remote target server via SSH
-  agent            Execute a command on the Torque agent container itself
+  ssh              Execute a command on a remote target server via SSH
+  container        Execute a command on the Torque agent container itself
   read             Read a file from a remote server
   list             List a directory on a remote server
 
@@ -1314,16 +1314,16 @@ Examples:
   shellagent serve
 
   # CLI mode - run a command on a remote server
-  shellagent remote "uname -a"
-  shellagent remote --target 10.0.0.1 --user root "df -h"
+  shellagent ssh "uname -a"
+  shellagent ssh --target 10.0.0.1 --user root "df -h"
 
   # CLI mode - upload files and run a command on remote server
-  shellagent remote --upload ./script.sh:/tmp/script.sh:755 "bash /tmp/script.sh"
-  shellagent remote --upload ./config.yaml:/etc/app/config.yaml --upload ./data:/var/data "cat /etc/app/config.yaml"
+  shellagent ssh --upload ./script.sh:/tmp/script.sh:755 "bash /tmp/script.sh"
+  shellagent ssh --upload ./config.yaml:/etc/app/config.yaml --upload ./data:/var/data "cat /etc/app/config.yaml"
 
   # CLI mode - run on the Torque agent container directly
-  shellagent agent "curl https://example.com"
-  shellagent agent --upload ./test.py:/tmp/test.py "python /tmp/test.py"
+  shellagent container "curl https://example.com"
+  shellagent container --upload ./test.py:/tmp/test.py "python /tmp/test.py"
 
   # CLI mode - read/list files
   shellagent read /etc/hostname
@@ -1350,16 +1350,16 @@ DANGEROUS COMMANDS (will kill the Torque agent):
 LONG-RUNNING COMMANDS:
   Default timeout is 30 minutes. Use --timeout to extend.
   For very long operations, run in background:
-    shellagent remote "nohup command > /tmp/output.log 2>&1 &"
+    shellagent ssh "nohup command > /tmp/output.log 2>&1 &"
   Then check status:
-    shellagent remote "cat /tmp/output.log"
+    shellagent ssh "cat /tmp/output.log"
 
 PERFORMANCE TIP:
   Each command invocation has significant roundtrip overhead
   (environment provisioning, SSH connection, etc.).
   Consolidate multiple commands into a single invocation:
-    shellagent remote "cmd1; cmd2; cmd3"           # sequential
-    shellagent remote "cmd1 && cmd2 && cmd3"       # stop on failure
+    shellagent ssh "cmd1; cmd2; cmd3"           # sequential
+    shellagent ssh "cmd1 && cmd2 && cmd3"       # stop on failure
         """,
     )
     
@@ -1368,26 +1368,26 @@ PERFORMANCE TIP:
     # serve subcommand (MCP server mode)
     subparsers.add_parser("serve", parents=[common_parser], help="Run as MCP server")
     
-    # remote subcommand (remote command via SSH)
-    remote_parser = subparsers.add_parser("remote", parents=[common_parser], help="Execute a command on remote server via SSH")
-    remote_parser.add_argument("cmd", nargs='?', help="The shell command to execute (optional if --upload used)")
-    remote_parser.add_argument("--user", "-u", help="SSH username (overrides --ssh-user)")
-    remote_parser.add_argument("--key", "-k", help="SSH private key file (overrides --ssh-key)")
-    remote_parser.add_argument("--agent", "-a", help="Torque agent name (overrides default)")
-    remote_parser.add_argument("--timeout", type=int, help="Timeout in seconds")
-    remote_parser.add_argument("--force", "-f", action="store_true", help="Force dangerous commands")
-    remote_parser.add_argument("--json", "-j", action="store_true", help="Output as JSON")
-    remote_parser.add_argument("--upload", action="append", metavar="LOCAL:REMOTE[:MODE]",
+    # ssh subcommand (remote command via SSH)
+    ssh_parser = subparsers.add_parser("ssh", parents=[common_parser], help="Execute a command on remote server via SSH")
+    ssh_parser.add_argument("cmd", nargs='?', help="The shell command to execute (optional if --upload used)")
+    ssh_parser.add_argument("--user", "-u", help="SSH username (overrides --ssh-user)")
+    ssh_parser.add_argument("--key", "-k", help="SSH private key file (overrides --ssh-key)")
+    ssh_parser.add_argument("--agent", "-a", help="Torque agent name (overrides default)")
+    ssh_parser.add_argument("--timeout", type=int, help="Timeout in seconds")
+    ssh_parser.add_argument("--force", "-f", action="store_true", help="Force dangerous commands")
+    ssh_parser.add_argument("--json", "-j", action="store_true", help="Output as JSON")
+    ssh_parser.add_argument("--upload", action="append", metavar="LOCAL:REMOTE[:MODE]",
                               help="Upload local file/dir to remote path (can be repeated)")
     
-    # agent subcommand (run on Torque agent container)
-    agent_parser = subparsers.add_parser("agent", parents=[common_parser], help="Execute a command on Torque agent container")
-    agent_parser.add_argument("cmd", nargs='?', help="The shell command to execute (optional if --upload used)")
-    agent_parser.add_argument("--agent", "-a", help="Torque agent name (overrides default)")
-    agent_parser.add_argument("--timeout", type=int, help="Timeout in seconds")
-    agent_parser.add_argument("--json", "-j", action="store_true", help="Output as JSON")
-    agent_parser.add_argument("--upload", action="append", metavar="LOCAL:REMOTE[:MODE]",
-                             help="Upload local file/dir to agent container (can be repeated)")
+    # container subcommand (run on Torque agent container)
+    container_parser = subparsers.add_parser("container", parents=[common_parser], help="Execute a command on Torque agent container")
+    container_parser.add_argument("cmd", nargs='?', help="The shell command to execute (optional if --upload used)")
+    container_parser.add_argument("--agent", "-a", help="Torque agent name (overrides default)")
+    container_parser.add_argument("--timeout", type=int, help="Timeout in seconds")
+    container_parser.add_argument("--json", "-j", action="store_true", help="Output as JSON")
+    container_parser.add_argument("--upload", action="append", metavar="LOCAL:REMOTE[:MODE]",
+                             help="Upload local file/dir to container (can be repeated)")
     
     # read subcommand
     read_parser = subparsers.add_parser("read", parents=[common_parser], help="Read a file from remote server")
