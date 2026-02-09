@@ -6,6 +6,7 @@ by leveraging Torque's Shell Grain infrastructure.
 """
 
 import base64
+import gzip
 import os
 import re
 import sys
@@ -191,31 +192,34 @@ def prepare_files_deployment(files: list[dict]) -> tuple[str, list[str]]:
                     errors.append(f"File {i+1}: error creating tar: {e}")
                     continue
             else:
-                # Regular file
+                # Regular file - use gzip compression like directories
                 try:
                     with open(expanded, 'rb') as f:
                         file_bytes = f.read()
-                    file_b64 = base64.b64encode(file_bytes).decode('ascii')
+                    compressed = gzip.compress(file_bytes)
+                    file_b64 = base64.b64encode(compressed).decode('ascii')
                     
                     if escaped_dir:
                         commands.append(f"mkdir -p '{escaped_dir}'")
-                    commands.append(f"echo '{file_b64}' | base64 -d > '{escaped_remote}'")
+                    commands.append(f"echo '{file_b64}' | base64 -d | gzip -d > '{escaped_remote}'")
                     if mode:
                         commands.append(f"chmod {mode} '{escaped_remote}'")
                 except Exception as e:
                     errors.append(f"File {i+1}: error reading file: {e}")
                     continue
         else:
-            # Direct content
+            # Direct content - use gzip compression
             try:
                 if isinstance(content, bytes):
-                    content_b64 = base64.b64encode(content).decode('ascii')
+                    content_bytes = content
                 else:
-                    content_b64 = base64.b64encode(content.encode('utf-8')).decode('ascii')
+                    content_bytes = content.encode('utf-8')
+                compressed = gzip.compress(content_bytes)
+                content_b64 = base64.b64encode(compressed).decode('ascii')
                 
                 if escaped_dir:
                     commands.append(f"mkdir -p '{escaped_dir}'")
-                commands.append(f"echo '{content_b64}' | base64 -d > '{escaped_remote}'")
+                commands.append(f"echo '{content_b64}' | base64 -d | gzip -d > '{escaped_remote}'")
                 if mode:
                     commands.append(f"chmod {mode} '{escaped_remote}'")
             except Exception as e:
@@ -309,17 +313,17 @@ Default timeout is 30 minutes. Use `timeout` parameter for longer operations."""
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "target_ip": {
+                    "host": {
                         "type": "string",
                         "description": "The IP address or hostname of the remote server to connect to",
                     },
-                    "ssh_user": {
+                    "user": {
                         "type": "string",
-                        "description": "The SSH username for authentication",
+                        "description": "The username for authentication",
                     },
-                    "ssh_private_key": {
+                    "private_key_file_path": {
                         "type": "string",
-                        "description": "The path to the SSH private key file for authentication (e.g., C:\\path\\to\\key.pem)",
+                        "description": "The path to the private key file for authentication (e.g., C:\\path\\to\\key.pem)",
                     },
                     "command": {
                         "type": "string",
@@ -400,17 +404,17 @@ Useful for viewing configuration files, logs, or any text file on the remote ser
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "target_ip": {
+                    "host": {
                         "type": "string",
                         "description": "The IP address or hostname of the remote server",
                     },
-                    "ssh_user": {
+                    "user": {
                         "type": "string",
-                        "description": "The SSH username for authentication",
+                        "description": "The username for authentication",
                     },
-                    "ssh_private_key": {
+                    "private_key_file_path": {
                         "type": "string",
-                        "description": "The path to the SSH private key file for authentication (e.g., C:\\path\\to\\key.pem)",
+                        "description": "The path to the private key file for authentication (e.g., C:\\path\\to\\key.pem)",
                     },
                     "file_path": {
                         "type": "string",
@@ -436,17 +440,17 @@ Returns a detailed listing of files and directories including permissions, size,
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "target_ip": {
+                    "host": {
                         "type": "string",
                         "description": "The IP address or hostname of the remote server",
                     },
-                    "ssh_user": {
+                    "user": {
                         "type": "string",
-                        "description": "The SSH username for authentication",
+                        "description": "The username for authentication",
                     },
-                    "ssh_private_key": {
+                    "private_key_file_path": {
                         "type": "string",
-                        "description": "The path to the SSH private key file for authentication (e.g., C:\\path\\to\\key.pem)",
+                        "description": "The path to the private key file for authentication (e.g., C:\\path\\to\\key.pem)",
                     },
                     "directory_path": {
                         "type": "string",
@@ -468,7 +472,7 @@ This tool runs commands directly on the Torque agent container - NO SSH target n
 Unlike run_on_ssh, this doesn't connect to a remote server.
 
 **Key difference from run_on_ssh:**
-- run_on_ssh: SSH to a remote server (needs target_ip, ssh credentials)
+- run_on_ssh: SSH to a remote server (needs host, user, private_key_file_path)
 - run_on_container: Runs locally on the Torque agent container (no SSH needed)
 
 **Use cases:**
@@ -562,9 +566,9 @@ async def call_tool(name: str, arguments: dict):
 
 async def handle_run_on_ssh(arguments: dict):
     """Execute a remote command via SSH, optionally uploading files first."""
-    target_ip = arguments.get("target_ip") or _config["default_target_ip"]
-    ssh_user = arguments.get("ssh_user") or _config["default_ssh_user"]
-    ssh_private_key_path = arguments.get("ssh_private_key") or _config["default_ssh_key"]
+    target_ip = arguments.get("host") or _config["default_target_ip"]
+    ssh_user = arguments.get("user") or _config["default_ssh_user"]
+    ssh_private_key_path = arguments.get("private_key_file_path") or _config["default_ssh_key"]
     command = arguments.get("command")
     files = arguments.get("files", [])
     agent = arguments.get("agent")
@@ -592,7 +596,7 @@ async def handle_run_on_ssh(arguments: dict):
     if not all([target_ip, ssh_user, ssh_private_key_path]):
         return [TextContent(
             type="text",
-            text="Error: Missing required parameters. Need target_ip, ssh_user, ssh_private_key (or configure defaults).",
+            text="Error: Missing required parameters. Need host, user, private_key_file_path (or configure defaults).",
         )]
     
     if not all([torque_url, torque_token, torque_space]):
@@ -717,9 +721,9 @@ async def handle_run_on_ssh(arguments: dict):
 
 async def handle_read_remote_file(arguments: dict):
     """Read a remote file."""
-    target_ip = arguments.get("target_ip") or _config["default_target_ip"]
-    ssh_user = arguments.get("ssh_user") or _config["default_ssh_user"]
-    ssh_private_key_path = arguments.get("ssh_private_key") or _config["default_ssh_key"]
+    target_ip = arguments.get("host") or _config["default_target_ip"]
+    ssh_user = arguments.get("user") or _config["default_ssh_user"]
+    ssh_private_key_path = arguments.get("private_key_file_path") or _config["default_ssh_key"]
     file_path = arguments.get("file_path")
     tail_lines = arguments.get("tail_lines")
     agent = arguments.get("agent")
@@ -727,7 +731,7 @@ async def handle_read_remote_file(arguments: dict):
     if not all([target_ip, ssh_user, ssh_private_key_path, file_path]):
         return [TextContent(
             type="text",
-            text="Error: Missing required parameters. Need target_ip, ssh_user, ssh_private_key, and file_path (or configure defaults).",
+            text="Error: Missing required parameters. Need host, user, private_key_file_path, and file_path (or configure defaults).",
         )]
     
     try:
@@ -792,16 +796,16 @@ async def handle_read_remote_file(arguments: dict):
 
 async def handle_list_remote_directory(arguments: dict):
     """List a remote directory."""
-    target_ip = arguments.get("target_ip") or _config["default_target_ip"]
-    ssh_user = arguments.get("ssh_user") or _config["default_ssh_user"]
-    ssh_private_key_path = arguments.get("ssh_private_key") or _config["default_ssh_key"]
+    target_ip = arguments.get("host") or _config["default_target_ip"]
+    ssh_user = arguments.get("user") or _config["default_ssh_user"]
+    ssh_private_key_path = arguments.get("private_key_file_path") or _config["default_ssh_key"]
     directory_path = arguments.get("directory_path", "~")
     agent = arguments.get("agent")
     
     if not all([target_ip, ssh_user, ssh_private_key_path]):
         return [TextContent(
             type="text",
-            text="Error: Missing required parameters. Need target_ip, ssh_user, and ssh_private_key (or configure defaults).",
+            text="Error: Missing required parameters. Need host, user, and private_key_file_path (or configure defaults).",
         )]
     
     try:
@@ -1032,7 +1036,7 @@ async def cli_dispatch(args):
                 sys.exit(1)
             
             if not all([target_ip, ssh_user, ssh_key_path]):
-                print("Error: Missing target, user, or SSH key. Use --target, --user, --key or set defaults.", file=sys.stderr)
+                print("Error: Missing host, user, or SSH key. Use --host, --user, --key or set defaults.", file=sys.stderr)
                 sys.exit(1)
             
             # Check dangerous commands
@@ -1265,7 +1269,7 @@ def main():
         help="SSH private key file path (env: $SSH_KEY)",
     )
     common_parser.add_argument(
-        "--target-host",
+        "--host",
         default=os.environ.get("TARGET_HOST"),
         help="Target server IP/hostname (env: $TARGET_HOST)",
     )
@@ -1315,7 +1319,7 @@ Examples:
 
   # CLI mode - run a command on a remote server
   shellagent ssh "uname -a"
-  shellagent ssh --target 10.0.0.1 --user root "df -h"
+  shellagent ssh --host 10.0.0.1 --user root "df -h"
 
   # CLI mode - upload files and run a command on remote server
   shellagent ssh --upload ./script.sh:/tmp/script.sh:755 "bash /tmp/script.sh"
@@ -1416,7 +1420,7 @@ PERFORMANCE TIP:
     _config["torque_space"] = args.torque_space
     _config["default_agent"] = args.torque_agent
     _config["default_ssh_key"] = args.ssh_key
-    _config["default_target_ip"] = args.target_host
+    _config["default_target_ip"] = args.host
     _config["default_ssh_user"] = args.ssh_user
     _config["init_commands"] = args.init_commands
     _config["finally_commands"] = args.finally_commands
