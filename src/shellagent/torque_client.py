@@ -21,6 +21,7 @@ class EnvironmentResult:
     command_output: Optional[str] = None
     exit_code: Optional[int] = None
     error: Optional[str] = None
+    execution_duration: Optional[float] = None  # Time in seconds for main command execution
 
 
 class TorqueClient:
@@ -484,6 +485,7 @@ class TorqueClient:
                 outputs = self._extract_outputs(env_data)
                 command_output_b64 = outputs.get("command_output", "")
                 exit_code_str = outputs.get("exit_code", "0")
+                execution_duration_ms_str = outputs.get("execution_duration_ms", "")
                 
                 # Decode base64 output
                 try:
@@ -496,11 +498,18 @@ class TorqueClient:
                 except (ValueError, TypeError):
                     exit_code = 0
                 
+                # Convert ms to seconds
+                try:
+                    exec_duration = int(execution_duration_ms_str) / 1000.0 if execution_duration_ms_str else None
+                except (ValueError, TypeError):
+                    exec_duration = None
+                
                 return EnvironmentResult(
                     environment_id=environment_id,
                     status="completed",
                     command_output=command_output,
                     exit_code=exit_code,
+                    execution_duration=exec_duration,
                 )
             
             # Environment ended - could be success or failure, check outputs
@@ -508,6 +517,7 @@ class TorqueClient:
                 outputs = self._extract_outputs(env_data)
                 command_output_b64 = outputs.get("command_output", "")
                 exit_code_str = outputs.get("exit_code", "")
+                execution_duration_ms_str = outputs.get("execution_duration_ms", "")
                 
                 # Decode base64 output
                 try:
@@ -522,11 +532,18 @@ class TorqueClient:
                     except (ValueError, TypeError):
                         exit_code = 0
                     
+                    # Convert ms to seconds
+                    try:
+                        exec_duration = int(execution_duration_ms_str) / 1000.0 if execution_duration_ms_str else None
+                    except (ValueError, TypeError):
+                        exec_duration = None
+                    
                     return EnvironmentResult(
                         environment_id=environment_id,
                         status="completed",
                         command_output=command_output,
                         exit_code=exit_code,
+                        execution_duration=exec_duration,
                     )
                 else:
                     return EnvironmentResult(

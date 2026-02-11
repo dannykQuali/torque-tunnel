@@ -722,6 +722,13 @@ async def handle_run_on_ssh(arguments: dict):
             except Exception:
                 pass
         
+        # Format execution duration
+        if result.execution_duration is not None:
+            duration = result.execution_duration
+            duration_str = f"{int(duration // 60)}m {duration % 60:.1f}s" if duration >= 60 else f"{duration:.1f}s"
+        else:
+            duration_str = "N/A"
+        
         # Build environment URL for reference
         env_url = f"{torque_url}/{torque_space}/environments/{result.environment_id}"
         
@@ -739,14 +746,16 @@ async def handle_run_on_ssh(arguments: dict):
 **Output:**
 {output_block}
 
-**Environment:** {env_url}"""
+**Environment:** {env_url}
+**Duration:** {duration_str}"""
         else:
             output_text = f"""Command execution failed on {target_ip}
 {files_summary}
 **Status:** {result.status}
 **Error:** {result.error}
 
-**Environment:** {env_url}"""
+**Environment:** {env_url}
+**Duration:** {duration_str}"""
             
             # Include partial output if available (e.g., on timeout)
             if result.command_output:
@@ -966,6 +975,13 @@ async def handle_run_on_container(arguments: dict):
             except Exception:
                 pass
         
+        # Format execution duration
+        if result.execution_duration is not None:
+            duration = result.execution_duration
+            duration_str = f"{int(duration // 60)}m {duration % 60:.1f}s" if duration >= 60 else f"{duration:.1f}s"
+        else:
+            duration_str = "N/A"
+        
         # Build environment URL for reference
         env_url = f"{_config['torque_url']}/{_config['torque_space']}/environments/{result.environment_id}"
         agent_name = agent or _config["default_agent"]
@@ -984,14 +1000,16 @@ async def handle_run_on_container(arguments: dict):
 **Output:**
 {output_block}
 
-**Environment:** {env_url}"""
+**Environment:** {env_url}
+**Duration:** {duration_str}"""
         else:
             output_text = f"""Command execution failed on agent `{agent_name}`
 {files_summary}
 **Status:** {result.status}
 **Error:** {result.error}
 
-**Environment:** {env_url}"""
+**Environment:** {env_url}
+**Duration:** {duration_str}"""
             
             # Include partial output if available (e.g., on timeout)
             if result.command_output:
