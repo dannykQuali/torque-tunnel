@@ -153,6 +153,97 @@ def read_ssh_key_file(file_path: str) -> str:
         return f.read()
 
 
+def _normalize_pem_content(pem_content: str) -> str:
+    """
+    Normalize PEM content from single-line to proper multi-line format.
+    
+    PEM content is often passed as command-line arguments or environment variables
+    where newlines are converted to spaces. This reconstructs the proper format.
+    
+    From: C:/ZeroTouch/Compute2/blueprints/ai-ready-cluster/common.py
+    """
+    pem_content = pem_content.strip()
+    # Strip Windows CRLF line endings to prevent libcrypto errors
+    pem_content = pem_content.replace('\r', '')
+    
+    # Find BEGIN and END markers and reconstruct proper format
+    if '-----BEGIN' in pem_content and '-----END' in pem_content:
+        begin_start = pem_content.find('-----BEGIN')
+        begin_end = pem_content.find('-----', begin_start + 10) + 5
+        header = pem_content[begin_start:begin_end].strip()
+        
+        end_start = pem_content.find('-----END')
+        end_end = pem_content.find('-----', end_start + 8) + 5
+        footer = pem_content[end_start:end_end].strip()
+        
+        # Extract key content between header and footer
+        content_start = begin_end
+        content_end = end_start
+        content = pem_content[content_start:content_end].strip()
+        
+        # Reconstruct: header, content, footer, each on its own line
+        return f"{header}\n{content}\n{footer}\n"
+    else:
+        # Key doesn't match expected format, use as-is (ensure trailing newline)
+        if not pem_content.endswith('\n'):
+            pem_content += '\n'
+        return pem_content
+
+
+def normalize_ssh_key(ssh_key_content: str) -> str:
+    """Normalize SSH private key content from single-line to proper multi-line format."""
+    return _normalize_pem_content(ssh_key_content)
+
+
+def is_valid_ssh_private_key(content: str) -> bool:
+    """Check if content looks like a valid SSH private key."""
+    content = content.strip()
+    # Check for common private key headers
+    valid_headers = [
+        '-----BEGIN OPENSSH PRIVATE KEY-----',
+        '-----BEGIN RSA PRIVATE KEY-----',
+        '-----BEGIN DSA PRIVATE KEY-----',
+        '-----BEGIN EC PRIVATE KEY-----',
+        '-----BEGIN PRIVATE KEY-----',
+    ]
+    return any(content.startswith(header) for header in valid_headers)
+
+
+def resolve_ssh_private_key(value: str) -> str:
+    """
+    Resolve SSH private key from either a file path or key content.
+    
+    Args:
+        value: Either a file path or the key content directly
+        
+    Returns:
+        Normalized SSH private key content
+        
+    Raises:
+        ValueError: If the value is neither a valid file path nor valid key content
+    """
+    if not value:
+        raise ValueError("SSH private key is required")
+    
+    # First, try to read as a file path
+    expanded_path = os.path.expanduser(value)
+    if os.path.exists(expanded_path):
+        with open(expanded_path, 'r') as f:
+            key_content = f.read()
+        return normalize_ssh_key(key_content)
+    
+    # Not a file - check if it's valid key content
+    if is_valid_ssh_private_key(value):
+        return normalize_ssh_key(value)
+    
+    # Neither a valid file nor valid key content
+    raise ValueError(
+        f"Invalid private_key: '{value[:50]}{'...' if len(value) > 50 else ''}' "
+        f"is not a valid file path and doesn't look like SSH private key content. "
+        f"Provide either a path to an existing key file or the key content starting with '-----BEGIN'"
+    )
+
+
 def prepare_files_deployment(files: list[dict]) -> tuple[str, list[str]]:
     """
     Prepare shell commands to deploy files before command execution.
@@ -364,9 +455,9 @@ Default timeout is 30 minutes. Use `timeout` parameter for longer operations."""
                         "type": "string",
                         "description": "The username for authentication",
                     },
-                    "private_key_file_path": {
+                    "private_key": {
                         "type": "string",
-                        "description": "The path to the private key file for authentication (e.g., C:\\path\\to\\key.pem)",
+                        "description": "SSH private key - either a LOCAL file path (e.g., C:\\Users\\you\\.ssh\\id_rsa) OR the key content directly (starting with '-----BEGIN').",
                     },
                     "command": {
                         "type": "string",
@@ -374,21 +465,21 @@ Default timeout is 30 minutes. Use `timeout` parameter for longer operations."""
                     },
                     "files": {
                         "type": "array",
-                        "description": "Files or directories to upload before running the command. Each item specifies local source and remote destination.",
+                        "description": "Files to upload TO THE REMOTE SERVER before running the command. These are transferred from your local machine to the target server.",
                         "items": {
                             "type": "object",
                             "properties": {
                                 "local_path": {
                                     "type": "string",
-                                    "description": "Path to local file or directory to upload. Use this OR content, not both.",
+                                    "description": "Path on YOUR LOCAL MACHINE to a file/directory to upload. Use this OR content, not both.",
                                 },
                                 "content": {
                                     "type": "string",
-                                    "description": "Direct content to write. Use this OR local_path, not both.",
+                                    "description": "Direct content to write TO THE REMOTE SERVER. Use this OR local_path, not both.",
                                 },
                                 "remote_path": {
                                     "type": "string",
-                                    "description": "Destination path on the remote server.",
+                                    "description": "Destination path ON THE REMOTE SERVER where the file will be written.",
                                 },
                                 "mode": {
                                     "type": "string",
@@ -455,9 +546,9 @@ Useful for viewing configuration files, logs, or any text file on the remote ser
                         "type": "string",
                         "description": "The username for authentication",
                     },
-                    "private_key_file_path": {
+                    "private_key": {
                         "type": "string",
-                        "description": "The path to the private key file for authentication (e.g., C:\\path\\to\\key.pem)",
+                        "description": "SSH private key - either a LOCAL file path OR the key content directly (starting with '-----BEGIN').",
                     },
                     "file_path": {
                         "type": "string",
@@ -491,9 +582,9 @@ Returns a detailed listing of files and directories including permissions, size,
                         "type": "string",
                         "description": "The username for authentication",
                     },
-                    "private_key_file_path": {
+                    "private_key": {
                         "type": "string",
-                        "description": "The path to the private key file for authentication (e.g., C:\\path\\to\\key.pem)",
+                        "description": "SSH private key - either a LOCAL file path OR the key content directly (starting with '-----BEGIN').",
                     },
                     "directory_path": {
                         "type": "string",
@@ -515,7 +606,7 @@ This tool runs commands directly on the Torque agent container - NO SSH target n
 Unlike run_on_ssh, this doesn't connect to a remote server.
 
 **Key difference from run_on_ssh:**
-- run_on_ssh: SSH to a remote server (needs host, user, private_key_file_path)
+- run_on_ssh: SSH to a remote server (needs host, user, private_key)
 - run_on_container: Runs locally on the Torque agent container (no SSH needed)
 
 **Use cases:**
@@ -548,21 +639,21 @@ Default timeout is 30 minutes. Use `timeout` parameter for longer operations."""
                     },
                     "files": {
                         "type": "array",
-                        "description": "Files or directories to upload before running the command.",
+                        "description": "Files to upload TO THE CONTAINER before running the command. These are transferred from your local machine to the target container.",
                         "items": {
                             "type": "object",
                             "properties": {
                                 "local_path": {
                                     "type": "string",
-                                    "description": "Path to local file or directory to upload. Use this OR content, not both.",
+                                    "description": "Path on YOUR LOCAL MACHINE to a file/directory to upload. Use this OR content, not both.",
                                 },
                                 "content": {
                                     "type": "string",
-                                    "description": "Direct content to write. Use this OR local_path, not both.",
+                                    "description": "Direct content to write TO THE CONTAINER. Use this OR local_path, not both.",
                                 },
                                 "remote_path": {
                                     "type": "string",
-                                    "description": "Destination path on the agent container.",
+                                    "description": "Destination path ON THE CONTAINER where the file will be written.",
                                 },
                                 "mode": {
                                     "type": "string",
@@ -611,7 +702,7 @@ async def handle_run_on_ssh(arguments: dict):
     """Execute a remote command via SSH, optionally uploading files first."""
     target_ip = arguments.get("host") or _config["default_target_ip"]
     ssh_user = arguments.get("user") or _config["default_ssh_user"]
-    ssh_private_key_path = arguments.get("private_key_file_path") or _config["default_ssh_key"]
+    private_key_value = arguments.get("private_key") or _config["default_ssh_key"]
     command = arguments.get("command")
     files = arguments.get("files", [])
     agent = arguments.get("agent")
@@ -636,10 +727,10 @@ async def handle_run_on_ssh(arguments: dict):
             text="Error: Must provide either 'command' or 'files' (or both).",
         )]
     
-    if not all([target_ip, ssh_user, ssh_private_key_path]):
+    if not all([target_ip, ssh_user, private_key_value]):
         return [TextContent(
             type="text",
-            text="Error: Missing required parameters. Need host, user, private_key_file_path (or configure defaults).",
+            text="Error: Missing required parameters. Need host, user, private_key (or configure defaults).",
         )]
     
     if not all([torque_url, torque_token, torque_space]):
@@ -655,8 +746,8 @@ async def handle_run_on_ssh(arguments: dict):
             return [TextContent(type="text", text=warning)]
     
     try:
-        ssh_private_key = read_ssh_key_file(ssh_private_key_path)
-    except FileNotFoundError as e:
+        ssh_private_key = resolve_ssh_private_key(private_key_value)
+    except ValueError as e:
         return [TextContent(type="text", text=f"Error: {str(e)}")]
     
     # Process files parameter - generate deployment commands
@@ -784,20 +875,20 @@ async def handle_read_remote_file(arguments: dict):
     """Read a remote file."""
     target_ip = arguments.get("host") or _config["default_target_ip"]
     ssh_user = arguments.get("user") or _config["default_ssh_user"]
-    ssh_private_key_path = arguments.get("private_key_file_path") or _config["default_ssh_key"]
+    private_key_value = arguments.get("private_key") or _config["default_ssh_key"]
     file_path = arguments.get("file_path")
     tail_lines = arguments.get("tail_lines")
     agent = arguments.get("agent")
     
-    if not all([target_ip, ssh_user, ssh_private_key_path, file_path]):
+    if not all([target_ip, ssh_user, private_key_value, file_path]):
         return [TextContent(
             type="text",
-            text="Error: Missing required parameters. Need host, user, private_key_file_path, and file_path (or configure defaults).",
+            text="Error: Missing required parameters. Need host, user, private_key, and file_path (or configure defaults).",
         )]
     
     try:
-        ssh_private_key = read_ssh_key_file(ssh_private_key_path)
-    except FileNotFoundError as e:
+        ssh_private_key = resolve_ssh_private_key(private_key_value)
+    except ValueError as e:
         return [TextContent(type="text", text=f"Error: {str(e)}")]
     
     # Build the command - use base64 encoding to handle special characters and binary files
@@ -859,19 +950,19 @@ async def handle_list_remote_directory(arguments: dict):
     """List a remote directory."""
     target_ip = arguments.get("host") or _config["default_target_ip"]
     ssh_user = arguments.get("user") or _config["default_ssh_user"]
-    ssh_private_key_path = arguments.get("private_key_file_path") or _config["default_ssh_key"]
+    private_key_value = arguments.get("private_key") or _config["default_ssh_key"]
     directory_path = arguments.get("directory_path", "~")
     agent = arguments.get("agent")
     
-    if not all([target_ip, ssh_user, ssh_private_key_path]):
+    if not all([target_ip, ssh_user, private_key_value]):
         return [TextContent(
             type="text",
-            text="Error: Missing required parameters. Need host, user, and private_key_file_path (or configure defaults).",
+            text="Error: Missing required parameters. Need host, user, and private_key (or configure defaults).",
         )]
     
     try:
-        ssh_private_key = read_ssh_key_file(ssh_private_key_path)
-    except FileNotFoundError as e:
+        ssh_private_key = resolve_ssh_private_key(private_key_value)
+    except ValueError as e:
         return [TextContent(type="text", text=f"Error: {str(e)}")]
     
     command = f"ls -la {directory_path}"
@@ -1148,8 +1239,8 @@ async def cli_dispatch(args):
                     sys.exit(2)
             
             try:
-                ssh_key = read_ssh_key_file(ssh_key_path)
-            except FileNotFoundError as e:
+                ssh_key = resolve_ssh_private_key(ssh_key_path)
+            except ValueError as e:
                 print(f"Error: {e}", file=sys.stderr)
                 sys.exit(1)
             
@@ -1262,7 +1353,11 @@ async def cli_dispatch(args):
                 print("Error: Missing target, user, or SSH key.", file=sys.stderr)
                 sys.exit(1)
             
-            ssh_key = read_ssh_key_file(ssh_key_path)
+            try:
+                ssh_key = resolve_ssh_private_key(ssh_key_path)
+            except ValueError as e:
+                print(f"Error: {e}", file=sys.stderr)
+                sys.exit(1)
             
             # Build safe read command
             escaped_path = args.path.replace("'", "'\\''")
@@ -1300,7 +1395,11 @@ async def cli_dispatch(args):
                 print("Error: Missing target, user, or SSH key.", file=sys.stderr)
                 sys.exit(1)
             
-            ssh_key = read_ssh_key_file(ssh_key_path)
+            try:
+                ssh_key = resolve_ssh_private_key(ssh_key_path)
+            except ValueError as e:
+                print(f"Error: {e}", file=sys.stderr)
+                sys.exit(1)
             
             # Build ls command
             flags = "-"
@@ -1367,7 +1466,7 @@ def main():
     common_parser.add_argument(
         "--ssh-key",
         default=os.environ.get("SSH_KEY"),
-        help="SSH private key file path (env: $SSH_KEY)",
+        help="SSH private key - file path or key content (env: $SSH_KEY)",
     )
     common_parser.add_argument(
         "--host",
@@ -1477,7 +1576,7 @@ PERFORMANCE TIP:
     ssh_parser = subparsers.add_parser("ssh", parents=[common_parser], help="Execute a command on remote server via SSH")
     ssh_parser.add_argument("cmd", nargs='?', help="The shell command to execute (optional if --upload used)")
     ssh_parser.add_argument("--user", "-u", help="SSH username (overrides --ssh-user)")
-    ssh_parser.add_argument("--key", "-k", help="SSH private key file (overrides --ssh-key)")
+    ssh_parser.add_argument("--key", "-k", help="SSH private key - file path or key content (overrides --ssh-key)")
     ssh_parser.add_argument("--agent", "-a", help="Torque agent name (overrides default)")
     ssh_parser.add_argument("--timeout", type=int, help="Timeout in seconds")
     ssh_parser.add_argument("--allow-dangerous-commands", action="store_true", help="Bypass dangerous command warnings (use with extreme caution)")
@@ -1498,7 +1597,7 @@ PERFORMANCE TIP:
     read_parser = subparsers.add_parser("read", parents=[common_parser], help="Read a file from remote server")
     read_parser.add_argument("path", help="Remote file path to read")
     read_parser.add_argument("--user", "-u", help="SSH username")
-    read_parser.add_argument("--key", "-k", help="SSH private key file")
+    read_parser.add_argument("--key", "-k", help="SSH private key - file path or key content")
     read_parser.add_argument("--agent", "-a", help="Torque agent name")
     read_parser.add_argument("--timeout", type=int, help="Timeout in seconds")
     read_parser.add_argument("--max-size", type=int, default=102400, help="Max file size in bytes (default: 100KB)")
@@ -1507,7 +1606,7 @@ PERFORMANCE TIP:
     list_parser = subparsers.add_parser("list", parents=[common_parser], help="List a directory on remote server")
     list_parser.add_argument("path", help="Remote directory path")
     list_parser.add_argument("--user", "-u", help="SSH username")
-    list_parser.add_argument("--key", "-k", help="SSH private key file")
+    list_parser.add_argument("--key", "-k", help="SSH private key - file path or key content")
     list_parser.add_argument("--agent", "-a", help="Torque agent name")
     list_parser.add_argument("--timeout", type=int, help="Timeout in seconds")
     list_parser.add_argument("--all", "-A", action="store_true", help="Show hidden files")
