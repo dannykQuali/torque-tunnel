@@ -1,14 +1,8 @@
 spec_version: 2
 description: |
   Execute shell commands on a remote host via SSH.
-  This workflow is designed to be called programmatically by the ShellAgent MCP tool
+  This blueprint is designed to be called programmatically by the ShellAgent MCP tool
   to enable Copilot to run commands on remote servers for troubleshooting.
-
-workflow:
-  scope: space
-  triggers:
-    - type: manual
-  timeout: '{{ .inputs.timeout_minutes }}'
 
 inputs:
   agent:

@@ -625,14 +625,12 @@ class TorqueClient:
             result = await self.wait_for_environment(environment_id, timeout=timeout, log_callback=log_callback)
             return result
         finally:
-            # Workflows auto-terminate on completion (status="success"), so only call
-            # end_environment if it timed out or failed (not completed)
-            if result is None or result.status != "completed":
-                force_terminate = result is not None and result.status == "timeout"
-                try:
-                    await self.end_environment(environment_id, force=force_terminate)
-                except Exception as e:
-                    pass  # Ignore errors - workflow may have already auto-terminated
+            # Blueprints don't auto-terminate, so always call end_environment
+            force_terminate = result is not None and result.status == "timeout"
+            try:
+                await self.end_environment(environment_id, force=force_terminate)
+            except Exception as e:
+                pass  # Ignore errors - environment may have already been terminated
             
             # Delete the environment only if auto_cleanup is enabled
             if auto_cleanup:
@@ -678,14 +676,12 @@ class TorqueClient:
             result = await self.wait_for_environment(environment_id, timeout=timeout, log_callback=log_callback)
             return result
         finally:
-            # Workflows auto-terminate on completion (status="success"), so only call
-            # end_environment if it timed out or failed (not completed)
-            if result is None or result.status != "completed":
-                force_terminate = result is not None and result.status == "timeout"
-                try:
-                    await self.end_environment(environment_id, force=force_terminate)
-                except Exception as e:
-                    pass  # Ignore errors - workflow may have already auto-terminated
+            # Blueprints don't auto-terminate, so always call end_environment
+            force_terminate = result is not None and result.status == "timeout"
+            try:
+                await self.end_environment(environment_id, force=force_terminate)
+            except Exception as e:
+                pass  # Ignore errors - environment may have already been terminated
             
             # Delete the environment only if auto_cleanup is enabled
             if auto_cleanup:

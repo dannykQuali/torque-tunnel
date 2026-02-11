@@ -1,14 +1,8 @@
 spec_version: 2
 description: |
   Execute shell commands directly on the Torque agent container.
-  This workflow runs commands locally on the agent without SSH to any remote host.
+  This blueprint runs commands locally on the agent without SSH to any remote host.
   Useful for running scripts, tools, or commands that don't require a target machine.
-
-workflow:
-  scope: space
-  triggers:
-    - type: manual
-  timeout: '{{ .inputs.timeout_minutes }}'
 
 inputs:
   agent:
