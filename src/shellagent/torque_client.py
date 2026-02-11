@@ -354,6 +354,8 @@ class TorqueClient:
         timeout = timeout or self.timeout
         start_time = time.time()
         last_log_content = ""  # Track actual content to detect rotation
+        consecutive_errors = 0  # Track consecutive errors to avoid infinite loops
+        max_consecutive_errors = 10  # Give up after this many consecutive errors
         
         while True:
             elapsed = time.time() - start_time
@@ -364,7 +366,47 @@ class TorqueClient:
                     error=f"Environment did not complete within {timeout} seconds",
                 )
             
-            env_data = await self.get_environment_status(environment_id)
+            try:
+                env_data = await self.get_environment_status(environment_id)
+                consecutive_errors = 0  # Reset on success
+            except httpx.HTTPStatusError as e:
+                status_code = e.response.status_code
+                # 4xx client errors - return immediately (won't be fixed by retrying)
+                if 400 <= status_code < 500:
+                    if status_code == 404:
+                        return EnvironmentResult(
+                            environment_id=environment_id,
+                            status="deleted",
+                            error=f"Environment {environment_id} was deleted or not found. It may have been auto-cleaned by Torque.",
+                        )
+                    return EnvironmentResult(
+                        environment_id=environment_id,
+                        status="error",
+                        error=f"HTTP {status_code} error: {e}",
+                    )
+                # 5xx server errors - log and retry
+                consecutive_errors += 1
+                print(f"[WARNING] HTTP {status_code} error polling environment {environment_id} ({consecutive_errors}/{max_consecutive_errors}): {e}", file=sys.stderr)
+                if consecutive_errors >= max_consecutive_errors:
+                    return EnvironmentResult(
+                        environment_id=environment_id,
+                        status="error",
+                        error=f"Too many consecutive errors while polling environment: {e}",
+                    )
+                await asyncio.sleep(self.poll_interval)
+                continue
+            except Exception as e:
+                # Network errors, connection issues, etc.
+                consecutive_errors += 1
+                print(f"[WARNING] Error polling environment {environment_id} ({consecutive_errors}/{max_consecutive_errors}): {e}", file=sys.stderr)
+                if consecutive_errors >= max_consecutive_errors:
+                    return EnvironmentResult(
+                        environment_id=environment_id,
+                        status="error",
+                        error=f"Too many consecutive errors while polling environment: {e}",
+                    )
+                await asyncio.sleep(self.poll_interval)
+                continue
             
             # If we have a log callback, fetch and stream the log
             if log_callback:
