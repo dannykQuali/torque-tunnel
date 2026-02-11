@@ -746,16 +746,18 @@ async def handle_run_on_ssh(arguments: dict):
 **Output:**
 {output_block}
 
-**Environment:** {env_url}
-**Duration:** {duration_str}"""
+**Duration:** {duration_str}
+
+**Environment:** {env_url}"""
         else:
             output_text = f"""Command execution failed on {target_ip}
 {files_summary}
 **Status:** {result.status}
 **Error:** {result.error}
 
-**Environment:** {env_url}
-**Duration:** {duration_str}"""
+**Duration:** {duration_str}
+
+**Environment:** {env_url}"""
             
             # Include partial output if available (e.g., on timeout)
             if result.command_output:
@@ -1000,16 +1002,18 @@ async def handle_run_on_container(arguments: dict):
 **Output:**
 {output_block}
 
-**Environment:** {env_url}
-**Duration:** {duration_str}"""
+**Duration:** {duration_str}
+
+**Environment:** {env_url}"""
         else:
             output_text = f"""Command execution failed on agent `{agent_name}`
 {files_summary}
 **Status:** {result.status}
 **Error:** {result.error}
 
-**Environment:** {env_url}
-**Duration:** {duration_str}"""
+**Duration:** {duration_str}
+
+**Environment:** {env_url}"""
             
             # Include partial output if available (e.g., on timeout)
             if result.command_output:
