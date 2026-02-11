@@ -39,6 +39,8 @@ outputs:
     value: '{{ .grains.remote_executor.activities.deploy.commands.run_ssh.outputs.command_output }}'
   exit_code:
     value: '{{ .grains.remote_executor.activities.deploy.commands.run_ssh.outputs.exit_code }}'
+  execution_duration_ms:
+    value: '{{ .grains.remote_executor.activities.deploy.commands.run_ssh.outputs.execution_duration_ms }}'
 
 grains:
   remote_executor:
@@ -125,6 +127,7 @@ grains:
                   echo "=== Connecting to {{ .inputs.ssh_user }}@{{ .inputs.target_ip }} ==="
                   echo "=== Output (streaming) ========================================================================================================================="
                   
+                  START_TIME=$(date +%s%3N 2>/dev/null || date +%s)000
                   ssh -o StrictHostKeyChecking=no \
                       -o UserKnownHostsFile=/dev/null \
                       -o LogLevel=ERROR \
@@ -132,6 +135,8 @@ grains:
                       "{{ .inputs.ssh_user }}@{{ .inputs.target_ip }}" \
                       "bash -s" < "$REMOTE_SCRIPT" 2>&1 | tee "$OUTPUT_FILE"
                   echo "${PIPESTATUS[0]}" > "$EXIT_CODE_FILE"
+                  END_TIME=$(date +%s%3N 2>/dev/null || date +%s)000
+                  EXEC_DURATION_MS=$((END_TIME - START_TIME))
                 }
                 
                 # Run main logic - errors go to output file, stdout is already captured inside
@@ -144,9 +149,11 @@ grains:
                 
                 export command_output="$COMMAND_OUTPUT_B64"
                 export exit_code="$SSH_EXIT_CODE"
+                export execution_duration_ms="${EXEC_DURATION_MS:-0}"
                 
                 echo ""
                 echo "=== Command completed with exit code: $SSH_EXIT_CODE ==="
               outputs:
                 - command_output
                 - exit_code
+                - execution_duration_ms
