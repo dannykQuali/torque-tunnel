@@ -1,0 +1,68 @@
+spec_version: 2
+description: |
+  Launch a persistent container with SSH access on the Torque agent.
+  The container runs sshd in foreground and stays alive until the environment is terminated.
+  Used by the ShellAgent MCP tool to provide persistent container sessions.
+  
+  Connection details (IP and private key) are output via the deploy log.
+  The container is based on the same Ubuntu 22.04 image used by Torque shell grains.
+
+inputs:
+  agent:
+    type: agent
+    description: The Torque agent to use for the persistent container
+
+outputs:
+  container_ready:
+    value: '{{ .grains.persistent_sshd.activities.deploy.commands.setup_sshd.outputs.container_ready }}'
+
+grains:
+  persistent_sshd:
+    kind: shell
+    spec:
+      agent:
+        name: '{{ .inputs.agent }}'
+      activities:
+        deploy:
+          commands:
+            - name: setup_sshd
+              command: |
+                set -e
+                
+                # Install openssh-server (minimal output)
+                apt-get update -qq > /dev/null 2>&1
+                apt-get install -y -qq openssh-server > /dev/null 2>&1
+                
+                # Generate host keys
+                ssh-keygen -A > /dev/null 2>&1
+                
+                # Generate an ed25519 keypair for authentication
+                mkdir -p /root/.ssh
+                ssh-keygen -t ed25519 -f /root/.ssh/container_key -N "" -q
+                cat /root/.ssh/container_key.pub >> /root/.ssh/authorized_keys
+                chmod 600 /root/.ssh/authorized_keys
+                
+                # Configure sshd
+                mkdir -p /run/sshd
+                sed -i 's/#PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
+                sed -i 's/#PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_config
+                
+                # Output connection details in a parseable format
+                CONTAINER_IP=$(hostname -I | awk '{print $1}')
+                CONTAINER_ID=$(hostname)
+                PRIVATE_KEY=$(cat /root/.ssh/container_key)
+                
+                echo "=== PERSISTENT_CONTAINER_INFO ==="
+                echo "CONTAINER_IP=${CONTAINER_IP}"
+                echo "CONTAINER_ID=${CONTAINER_ID}"
+                echo "=== PRIVATE_KEY_START ==="
+                echo "${PRIVATE_KEY}"
+                echo "=== PRIVATE_KEY_END ==="
+                echo "=== PERSISTENT_CONTAINER_READY ==="
+                
+                export container_ready="true"
+                
+                # Start sshd in foreground - this keeps the container alive
+                exec /usr/sbin/sshd -D -e
+              outputs:
+                - container_ready
