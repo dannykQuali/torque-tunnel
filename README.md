@@ -111,29 +111,6 @@ Execute any shell command on a remote server.
 - `command` (required): Shell command to execute
 - `agent` (optional): Torque agent name (uses default if not specified)
 
-### `read_remote_file`
-
-Read contents of a file on the remote server.
-
-**Parameters:**
-- `target_ip` (required): IP address or hostname
-- `ssh_user` (required): SSH username
-- `ssh_private_key` (required): SSH private key content
-- `file_path` (required): Path to the file to read
-- `tail_lines` (optional): Only read the last N lines
-- `agent` (optional): Torque agent name
-
-### `list_remote_directory`
-
-List contents of a directory on the remote server.
-
-**Parameters:**
-- `target_ip` (required): IP address or hostname
-- `ssh_user` (required): SSH username
-- `ssh_private_key` (required): SSH private key content
-- `directory_path` (optional): Directory path (defaults to home)
-- `agent` (optional): Torque agent name
-
 ## Usage Example
 
 Once configured, you can ask Copilot things like:
