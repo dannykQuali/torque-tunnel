@@ -14,6 +14,8 @@ import asyncio
 import argparse
 from typing import Optional, Callable, Awaitable
 
+import httpx
+
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import (
@@ -40,8 +42,9 @@ def create_log_streamer(session) -> Callable[[str, str], Awaitable[None]]:
     
     # State for tracking streaming progress
     state = {'found': verbose, 'first_line_shown': verbose, 'buffer': ''}
-    # Full marker line - must be at end of line
-    marker = '=== Beginning of execution =====================================================================================================================\n'
+    # Marker pattern - matches both "=== Beginning of execution ===" and "=== Beginning of local execution ==="
+    # Requires 50+ trailing = chars to avoid false positives from user output
+    marker_pattern = re.compile(r'=== Beginning of (?:local )?execution ={50,}\n')
     # Pattern for first line: [HH:MM:SS.mmm] >> Running on container. Storage: . Task Id: XXX
     first_line_pattern = re.compile(r'^(\[\d{2}:\d{2}:\d{2}\.\d{3}\] >> Running on .+)$', re.MULTILINE)
     
@@ -70,11 +73,11 @@ def create_log_streamer(session) -> Callable[[str, str], Awaitable[None]]:
                     state['first_line_shown'] = True
             
             # Look for execution marker
-            idx = state['buffer'].find(marker)
-            if idx != -1:
+            match = marker_pattern.search(state['buffer'])
+            if match:
                 state['found'] = True
                 # Print from after the marker line
-                after_marker = state['buffer'][idx + len(marker):]
+                after_marker = state['buffer'][match.end():]
                 if after_marker:
                     print(after_marker, file=sys.stderr, end='', flush=True)
                     session.send_log_message(level="info", data=after_marker, logger="shellagent.grain_log")
@@ -412,7 +415,11 @@ async def list_tools():
     return [
         Tool(
             name="run_on_ssh",
-            description="""Execute shell commands on a remote server via SSH, optionally uploading files first.
+            description="""Execute a short shell command on a remote server via SSH. This tool BLOCKS until completion.
+Use only for commands expected to finish within ~60 seconds (simple checks, echo, cat, ls, short scripts).
+
+For installations, builds, downloads, service restarts, or ANY command that might take more than a minute,
+use run_on_ssh_async instead - it returns immediately and lets you poll for progress with get_execution_status.
 
 This tool connects to a remote server using SSH credentials and can:
 1. Upload files/directories from your local machine to the remote server
@@ -420,13 +427,6 @@ This tool connects to a remote server using SSH credentials and can:
 3. Both upload files AND run commands in a single operation (recommended for efficiency)
 
 Execution order: files are deployed FIRST, then init_commands, then main command, then finally_commands.
-
-**Use cases:**
-- Troubleshoot a remote server (run commands)
-- Upload a script and execute it (files + command)
-- Upload configuration files (files only)
-- Upload a project directory and run install scripts (files + command)
-- Upload a private key, use it for decryption, then clean up (files + command + finally_commands)
 
 **CRITICAL WARNING - DANGEROUS COMMANDS:**
 The following commands may KILL the Torque agent and cause the operation to fail:
@@ -440,10 +440,7 @@ These commands require MANUAL execution via direct SSH or console access.
 Each invocation has significant roundtrip overhead. Consolidate operations:
 - Upload files AND run commands in one call
 - Chain commands: `cmd1 && cmd2 && cmd3`
-- Use the `files` parameter instead of multiple write operations
-
-**LONG-RUNNING COMMANDS:**
-Default timeout is 30 minutes. Use `timeout` parameter for longer operations.""",
+- Use the `files` parameter instead of multiple write operations""",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -600,7 +597,11 @@ Returns a detailed listing of files and directories including permissions, size,
         ),
         Tool(
             name="run_on_container",
-            description="""Execute shell commands on the Torque agent container, optionally uploading files first.
+            description="""Execute a short command on the Torque agent container. This tool BLOCKS until completion.
+Use only for commands expected to finish within ~60 seconds.
+
+For long-running commands, use run_on_container_async instead - it returns immediately
+and lets you poll for progress with get_execution_status.
 
 This tool runs commands directly on the Torque agent container - NO SSH target needed.
 Unlike run_on_ssh, this doesn't connect to a remote server.
@@ -626,10 +627,7 @@ Execution order: files deployed FIRST, then init_commands, then main command.
 **PERFORMANCE TIP:**
 Each invocation spawns a fresh container. Consolidate operations:
 - Upload files AND run commands in one call
-- Chain commands: `cmd1 && cmd2 && cmd3`
-
-**LONG-RUNNING COMMANDS:**
-Default timeout is 30 minutes. Use `timeout` parameter for longer operations.""",
+- Chain commands: `cmd1 && cmd2 && cmd3`""",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -675,6 +673,184 @@ Default timeout is 30 minutes. Use `timeout` parameter for longer operations."""
                 "required": [],
             },
         ),
+        Tool(
+            name="run_on_ssh_async",
+            description="""Execute a command on a remote server via SSH WITHOUT waiting for completion.
+Returns immediately with an environment ID. Use get_execution_status to poll for output and progress.
+
+Use this for: package installs (apt/yum/pip), builds, downloads, database migrations,
+config management runs, service deployments, or any command where duration is uncertain.
+This gives you the ability to provide progress updates to the user while waiting.
+
+Same parameters as run_on_ssh. The command starts executing immediately and you get
+the environment ID back to track progress.
+
+**CRITICAL WARNING - DANGEROUS COMMANDS:**
+The following commands may KILL the Torque agent and cause the operation to fail:
+- `docker restart`, `docker stop`, `docker kill` (any container operations that affect the agent)
+- `systemctl restart docker` or any Docker daemon restart
+- `reboot`, `shutdown`, `init 6`, `init 0`""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "host": {
+                        "type": "string",
+                        "description": "The IP address or hostname of the remote server to connect to",
+                    },
+                    "user": {
+                        "type": "string",
+                        "description": "The username for authentication",
+                    },
+                    "private_key": {
+                        "type": "string",
+                        "description": "SSH private key - either a LOCAL file path OR the key content directly (starting with '-----BEGIN').",
+                    },
+                    "command": {
+                        "type": "string",
+                        "description": "The shell command to execute on the remote server.",
+                    },
+                    "files": {
+                        "type": "array",
+                        "description": "Files to upload TO THE REMOTE SERVER before running the command.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "local_path": {
+                                    "type": "string",
+                                    "description": "Path on YOUR LOCAL MACHINE to a file/directory to upload. Use this OR content, not both.",
+                                },
+                                "content": {
+                                    "type": "string",
+                                    "description": "Direct content to write TO THE REMOTE SERVER. Use this OR local_path, not both.",
+                                },
+                                "remote_path": {
+                                    "type": "string",
+                                    "description": "Destination path ON THE REMOTE SERVER where the file will be written.",
+                                },
+                                "mode": {
+                                    "type": "string",
+                                    "description": "Optional file permissions (e.g., '755' for executable).",
+                                },
+                            },
+                            "required": ["remote_path"],
+                        },
+                    },
+                    "agent": {
+                        "type": "string",
+                        "description": "Optional: The Torque agent name to use.",
+                    },
+                    "allow_dangerous_commands": {
+                        "type": "boolean",
+                        "description": "Optional: Set to true to bypass dangerous command warnings.",
+                    },
+                    "init_commands": {
+                        "type": "string",
+                        "description": "Optional: Commands to run after file deployment but before the main command.",
+                    },
+                    "finally_commands": {
+                        "type": "string",
+                        "description": "Optional: Cleanup commands that run even if main command fails.",
+                    },
+                },
+                "required": ["command"],
+            },
+        ),
+        Tool(
+            name="run_on_container_async",
+            description="""Execute a command on the Torque agent container WITHOUT waiting for completion.
+Returns immediately with an environment ID. Use get_execution_status to poll for output and progress.
+
+Use this for long-running operations on the agent container. Same as run_on_container
+but non-blocking. Track progress with get_execution_status.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "The shell command to execute on the agent container.",
+                    },
+                    "files": {
+                        "type": "array",
+                        "description": "Files to upload TO THE CONTAINER before running the command.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "local_path": {
+                                    "type": "string",
+                                    "description": "Path on YOUR LOCAL MACHINE to a file/directory to upload. Use this OR content, not both.",
+                                },
+                                "content": {
+                                    "type": "string",
+                                    "description": "Direct content to write TO THE CONTAINER. Use this OR local_path, not both.",
+                                },
+                                "remote_path": {
+                                    "type": "string",
+                                    "description": "Destination path ON THE CONTAINER where the file will be written.",
+                                },
+                                "mode": {
+                                    "type": "string",
+                                    "description": "Optional file permissions (e.g., '755' for executable).",
+                                },
+                            },
+                            "required": ["remote_path"],
+                        },
+                    },
+                    "agent": {
+                        "type": "string",
+                        "description": "Optional: The Torque agent name to use.",
+                    },
+                },
+                "required": ["command"],
+            },
+        ),
+        Tool(
+            name="get_execution_status",
+            description="""Check the status and output of an async command started with run_on_ssh_async or run_on_container_async.
+
+Returns the current status (running/completed/failed), partial output if still running,
+or full output if completed. Use the `wait` parameter to avoid tight polling loops.
+
+Typical usage pattern:
+1. Call run_on_ssh_async or run_on_container_async to start a command
+2. Call get_execution_status with wait=10 to check after 10 seconds
+3. If still running, call again with wait=10-15
+4. When completed, get the full output""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "environment_id": {
+                        "type": "string",
+                        "description": "The environment ID returned by run_on_ssh_async or run_on_container_async.",
+                    },
+                    "wait": {
+                        "type": "integer",
+                        "description": "Seconds to wait before checking status. Use this to avoid tight polling loops. Suggested: 5-10 for short commands, 15-30 for installs/builds. Default: 5.",
+                    },
+                },
+                "required": ["environment_id"],
+            },
+        ),
+        Tool(
+            name="cancel_execution",
+            description="""Cancel a running async command started with run_on_ssh_async or run_on_container_async.
+
+Terminates the Torque environment, stopping the command. Use this when:
+- A command is taking too long and you want to abort
+- You started the wrong command
+- The partial output shows the command is failing and there's no point waiting
+
+The environment will be terminated and cleaned up.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "environment_id": {
+                        "type": "string",
+                        "description": "The environment ID returned by run_on_ssh_async or run_on_container_async.",
+                    },
+                },
+                "required": ["environment_id"],
+            },
+        ),
     ]
 
 
@@ -693,6 +869,18 @@ async def call_tool(name: str, arguments: dict):
     
     elif name == "run_on_container":
         return await handle_run_on_container(arguments)
+    
+    elif name == "run_on_ssh_async":
+        return await handle_run_on_ssh_async(arguments)
+    
+    elif name == "run_on_container_async":
+        return await handle_run_on_container_async(arguments)
+    
+    elif name == "get_execution_status":
+        return await handle_get_execution_status(arguments)
+    
+    elif name == "cancel_execution":
+        return await handle_cancel_execution(arguments)
     
     else:
         return [TextContent(type="text", text=f"Unknown tool: {name}")]
@@ -864,6 +1052,10 @@ async def handle_run_on_ssh(arguments: dict):
 
 **Grain Execution Log:**
 {log_block}"""
+        
+        # Add tip if command took >60s
+        if result.execution_duration is not None and result.execution_duration > 60:
+            output_text += "\n\n**TIP:** This command took over 60 seconds. Consider using `run_on_ssh_async` for similar long-running commands to get progress updates while waiting."
         
         return [TextContent(type="text", text=output_text)]
     
@@ -1121,10 +1313,468 @@ async def handle_run_on_container(arguments: dict):
 **Grain Execution Log:**
 {log_block}"""
         
+        # Add tip if command took >60s
+        if result.execution_duration is not None and result.execution_duration > 60:
+            output_text += "\n\n**TIP:** This command took over 60 seconds. Consider using `run_on_container_async` for similar long-running commands to get progress updates while waiting."
+        
         return [TextContent(type="text", text=output_text)]
     
     except Exception as e:
         return [TextContent(type="text", text=f"Error executing command on agent: {str(e)}")]
+
+
+async def handle_run_on_ssh_async(arguments: dict):
+    """Start a remote SSH command without waiting for completion."""
+    target_ip = arguments.get("host") or _config["default_target_ip"]
+    ssh_user = arguments.get("user") or _config["default_ssh_user"]
+    private_key_value = arguments.get("private_key") or _config["default_ssh_key"]
+    command = arguments.get("command")
+    files = arguments.get("files", [])
+    agent = arguments.get("agent")
+    allow_dangerous_commands = arguments.get("allow_dangerous_commands", False)
+    init_commands = arguments.get("init_commands")
+    finally_commands = arguments.get("finally_commands")
+    
+    if not command and not files:
+        return [TextContent(type="text", text="Error: Must provide either 'command' or 'files' (or both).")]
+    
+    if not all([target_ip, ssh_user, private_key_value]):
+        return [TextContent(type="text", text="Error: Missing required parameters. Need host, user, private_key (or configure defaults).")]
+    
+    # Check for dangerous commands
+    if command and not allow_dangerous_commands:
+        warning = check_dangerous_command(command)
+        if warning:
+            return [TextContent(type="text", text=warning)]
+    
+    try:
+        ssh_private_key = resolve_ssh_private_key(private_key_value)
+    except ValueError as e:
+        return [TextContent(type="text", text=f"Error: {str(e)}")]
+    
+    # Process files
+    files_info = []
+    if files:
+        file_deploy_commands, file_errors = prepare_files_deployment(files)
+        if file_errors:
+            return [TextContent(type="text", text="Error preparing files:\n" + "\n".join(f"- {e}" for e in file_errors))]
+        if file_deploy_commands:
+            init_commands = (file_deploy_commands + "\n" + init_commands) if init_commands else file_deploy_commands
+        for f in files:
+            files_info.append(f"{f.get('local_path', '<content>')} -> {f.get('remote_path', '')}")
+    
+    effective_command = command or "echo 'Files deployed successfully'"
+    
+    try:
+        async with get_torque_client() as client:
+            environment_id = await client.start_environment(
+                target_ip=target_ip,
+                ssh_user=ssh_user,
+                ssh_private_key=ssh_private_key,
+                command=effective_command,
+                agent=agent,
+                init_commands=init_commands,
+                finally_commands=finally_commands,
+            )
+        
+        env_url = f"{_config['torque_url']}/{_config['torque_space']}/environments/{environment_id}"
+        
+        files_summary = ""
+        if files_info:
+            files_summary = "\n**Files Queued:**\n" + "\n".join(f"- {f}" for f in files_info) + "\n"
+        
+        # Suggest appropriate wait time based on command content
+        suggested_wait = _suggest_wait_time(effective_command)
+        
+        output_text = f"""Command started on {target_ip} (async)
+{files_summary}
+**Environment ID:** {environment_id}
+**Environment:** {env_url}
+
+Use `get_execution_status` with environment_id="{environment_id}" to check progress (suggested initial wait={suggested_wait}, adjust as needed)."""
+        
+        return [TextContent(type="text", text=output_text)]
+    
+    except Exception as e:
+        return [TextContent(type="text", text=f"Error starting async command: {str(e)}")]
+
+
+async def handle_run_on_container_async(arguments: dict):
+    """Start a container command without waiting for completion."""
+    command = arguments.get("command")
+    files = arguments.get("files", [])
+    agent = arguments.get("agent")
+    
+    if not command and not files:
+        return [TextContent(type="text", text="Error: Must provide either 'command' or 'files' (or both).")]
+    
+    # Process files
+    files_info = []
+    init_commands = None
+    if files:
+        file_deploy_commands, file_errors = prepare_files_deployment(files)
+        if file_errors:
+            return [TextContent(type="text", text="Error preparing files:\n" + "\n".join(f"- {e}" for e in file_errors))]
+        if file_deploy_commands:
+            init_commands = file_deploy_commands
+        for f in files:
+            files_info.append(f"{f.get('local_path', '<content>')} -> {f.get('remote_path', '')}")
+    
+    effective_command = command or "echo 'Files deployed successfully'"
+    
+    try:
+        async with get_torque_client() as client:
+            environment_id = await client.start_local_environment(
+                command=effective_command,
+                agent=agent,
+                init_commands=init_commands,
+            )
+        
+        env_url = f"{_config['torque_url']}/{_config['torque_space']}/environments/{environment_id}"
+        agent_name = agent or _config["default_agent"]
+        
+        files_summary = ""
+        if files_info:
+            files_summary = "\n**Files Queued:**\n" + "\n".join(f"- {f}" for f in files_info) + "\n"
+        
+        suggested_wait = _suggest_wait_time(effective_command)
+        
+        output_text = f"""Command started on agent `{agent_name}` (async)
+{files_summary}
+**Environment ID:** {environment_id}
+**Environment:** {env_url}
+
+Use `get_execution_status` with environment_id="{environment_id}" to check progress (suggested initial wait={suggested_wait}, adjust as needed)."""
+        
+        return [TextContent(type="text", text=output_text)]
+    
+    except Exception as e:
+        return [TextContent(type="text", text=f"Error starting async command: {str(e)}")]
+
+
+async def handle_get_execution_status(arguments: dict):
+    """Check status of an async execution."""
+    environment_id = arguments.get("environment_id")
+    wait_seconds = arguments.get("wait", 5)
+    
+    if not environment_id:
+        return [TextContent(type="text", text="Error: environment_id is required.")]
+    
+    # Wait before checking
+    if wait_seconds > 0:
+        await asyncio.sleep(wait_seconds)
+    
+    try:
+        async with get_torque_client() as client:
+            env_data = await client.get_environment_status(environment_id)
+            
+            details = env_data.get("details", {})
+            raw_status = details.get("computed_status") or env_data.get("computed_status") or env_data.get("status", "unknown")
+            status = raw_status.lower().replace(" ", "_")
+            
+            env_url = f"{_config['torque_url']}/{_config['torque_space']}/environments/{environment_id}"
+            
+            # Completed successfully
+            if status in ("active", "success"):
+                outputs = client._extract_outputs(env_data)
+                command_output_b64 = outputs.get("command_output", "")
+                exit_code_str = outputs.get("exit_code", "0")
+                execution_duration_ms_str = outputs.get("execution_duration_ms", "")
+                
+                try:
+                    command_output = base64.b64decode(command_output_b64).decode('utf-8') if command_output_b64 else ""
+                except Exception:
+                    command_output = command_output_b64
+                
+                try:
+                    exit_code = int(exit_code_str)
+                except (ValueError, TypeError):
+                    exit_code = 0
+                
+                # Duration
+                try:
+                    duration = int(execution_duration_ms_str) / 1000.0 if execution_duration_ms_str else None
+                except (ValueError, TypeError):
+                    duration = None
+                duration_str = f"{int(duration // 60)}m {duration % 60:.1f}s" if duration and duration >= 60 else f"{duration:.1f}s" if duration else "N/A"
+                
+                output_block = format_code_block(command_output)
+                output_text = f"""Command completed.
+
+**Status:** COMPLETED
+**Exit Code:** {exit_code}
+
+**Output:**
+{output_block}
+
+**Duration:** {duration_str}
+
+**Environment:** {env_url}"""
+                
+                # Tip for fast commands
+                if duration is not None and duration < 10:
+                    output_text += "\n\n**TIP:** This command completed in under 10 seconds. For quick commands like this, `run_on_ssh` or `run_on_container` provides simpler one-shot execution without polling."
+                
+                # Auto-cleanup
+                try:
+                    await client.end_environment(environment_id)
+                    if _config["auto_delete_environments"]:
+                        await client.delete_environment(environment_id)
+                except Exception:
+                    pass
+                
+                return [TextContent(type="text", text=output_text)]
+            
+            # Ended with outputs (may be success or failure)
+            elif status in ("ended", "inactive"):
+                outputs = client._extract_outputs(env_data)
+                command_output_b64 = outputs.get("command_output", "")
+                exit_code_str = outputs.get("exit_code", "")
+                execution_duration_ms_str = outputs.get("execution_duration_ms", "")
+                
+                if command_output_b64 or exit_code_str:
+                    try:
+                        command_output = base64.b64decode(command_output_b64).decode('utf-8') if command_output_b64 else ""
+                    except Exception:
+                        command_output = command_output_b64
+                    
+                    try:
+                        exit_code = int(exit_code_str) if exit_code_str else 0
+                    except (ValueError, TypeError):
+                        exit_code = 0
+                    
+                    try:
+                        duration = int(execution_duration_ms_str) / 1000.0 if execution_duration_ms_str else None
+                    except (ValueError, TypeError):
+                        duration = None
+                    duration_str = f"{int(duration // 60)}m {duration % 60:.1f}s" if duration and duration >= 60 else f"{duration:.1f}s" if duration else "N/A"
+                    
+                    output_block = format_code_block(command_output)
+                    output_text = f"""Command completed.
+
+**Status:** COMPLETED
+**Exit Code:** {exit_code}
+
+**Output:**
+{output_block}
+
+**Duration:** {duration_str}
+
+**Environment:** {env_url}"""
+                    
+                    # Auto-cleanup
+                    if _config["auto_delete_environments"]:
+                        try:
+                            await client.delete_environment(environment_id)
+                        except Exception:
+                            pass
+                    
+                    return [TextContent(type="text", text=output_text)]
+                else:
+                    output_text = f"""Command ended without output.
+
+**Status:** ENDED
+**Environment:** {env_url}
+
+This may indicate a deployment failure. Check the environment URL for details."""
+                    return [TextContent(type="text", text=output_text)]
+            
+            # Error states
+            elif status in ("active_with_error", "ended_with_error", "error", "failed", "terminating_failed"):
+                state_errors = details.get("state", {}).get("errors", [])
+                error_messages = []
+                for err in state_errors:
+                    if isinstance(err, dict) and err.get("message"):
+                        error_messages.append(err["message"])
+                    elif isinstance(err, str):
+                        error_messages.append(err)
+                
+                if not error_messages:
+                    root_errors = env_data.get("errors", [])
+                    error_messages = [str(e) for e in root_errors if e]
+                
+                error_msg = "; ".join(error_messages) if error_messages else f"Environment failed with status: {raw_status}"
+                
+                output_text = f"""Command failed.
+
+**Status:** FAILED
+**Error:** {error_msg}
+
+**Environment:** {env_url}"""
+                
+                # Try to get partial output
+                try:
+                    grain_log = await client.get_grain_log(environment_id)
+                    if grain_log:
+                        log_block = format_code_block(grain_log[-2000:])  # Last 2000 chars
+                        output_text += f"""
+
+**Grain Execution Log (tail):**
+{log_block}"""
+                except Exception:
+                    pass
+                
+                return [TextContent(type="text", text=output_text)]
+            
+            # Cancelled/released
+            elif status in ("released", "cancelled", "terminating", "force_terminated"):
+                partial_output = ""
+                try:
+                    grain_log = await client.get_grain_log(environment_id) or ""
+                    output_marker_pattern = re.compile(r'=== Beginning of (?:local )?execution ={50,}\n')
+                    timestamp_pattern = re.compile(r'^\[\d{2}:\d{2}:\d{2}\.\d{3}\] ', re.MULTILINE)
+                    marker_match = output_marker_pattern.search(grain_log)
+                    if marker_match:
+                        partial_output = grain_log[marker_match.end():]
+                    else:
+                        partial_output = grain_log[-1000:] if len(grain_log) > 1000 else grain_log
+                    partial_output = timestamp_pattern.sub('', partial_output)
+                except Exception:
+                    pass
+                
+                output_text = f"""Execution was cancelled.
+
+**Status:** CANCELLED
+**Environment:** {env_url}"""
+                
+                if partial_output.strip():
+                    partial_block = format_code_block(partial_output)
+                    output_text += f"""
+
+**Output before cancellation:**
+{partial_block}"""
+                
+                # Auto-cleanup
+                if _config["auto_delete_environments"]:
+                    try:
+                        await client.delete_environment(environment_id)
+                    except Exception:
+                        pass
+                
+                return [TextContent(type="text", text=output_text)]
+            
+            # Still running - get partial output
+            else:
+                partial_output = ""
+                try:
+                    grain_log = await client.get_grain_log(environment_id) or ""
+                    output_marker_pattern = re.compile(r'=== Beginning of (?:local )?execution ={50,}\n')
+                    timestamp_pattern = re.compile(r'^\[\d{2}:\d{2}:\d{2}\.\d{3}\] ', re.MULTILINE)
+                    marker_match = output_marker_pattern.search(grain_log)
+                    if marker_match:
+                        partial_output = grain_log[marker_match.end():]
+                    else:
+                        partial_output = grain_log[-1000:] if len(grain_log) > 1000 else grain_log
+                    partial_output = timestamp_pattern.sub('', partial_output)
+                except Exception:
+                    pass
+                
+                output_text = f"""Command is still running.
+
+**Status:** RUNNING
+**Environment:** {env_url}"""
+                
+                if partial_output.strip():
+                    partial_block = format_code_block(partial_output)
+                    output_text += f"""
+
+**Partial Output (so far):**
+{partial_block}"""
+                
+                output_text += f"""
+
+Call `get_execution_status` again with environment_id="{environment_id}" and wait=10 to check progress."""
+                
+                return [TextContent(type="text", text=output_text)]
+    
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
+            return [TextContent(type="text", text=f"Error: Environment {environment_id} not found. It may have been deleted or the ID is incorrect.")]
+        return [TextContent(type="text", text=f"Error checking execution status: {str(e)}")]
+    except Exception as e:
+        return [TextContent(type="text", text=f"Error checking execution status: {str(e)}")]
+
+
+async def handle_cancel_execution(arguments: dict):
+    """Cancel a running async execution."""
+    environment_id = arguments.get("environment_id")
+    
+    if not environment_id:
+        return [TextContent(type="text", text="Error: environment_id is required.")]
+    
+    try:
+        async with get_torque_client() as client:
+            # First check current status
+            try:
+                env_data = await client.get_environment_status(environment_id)
+                details = env_data.get("details", {})
+                raw_status = details.get("computed_status") or env_data.get("computed_status") or env_data.get("status", "unknown")
+                status = raw_status.lower().replace(" ", "_")
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 404:
+                    return [TextContent(type="text", text=f"Environment {environment_id} not found. It may have already completed or been deleted.")]
+                raise
+            
+            env_url = f"{_config['torque_url']}/{_config['torque_space']}/environments/{environment_id}"
+            
+            # Already fully terminated - nothing to cancel
+            if status in ("ended", "inactive", "terminated", "released", "cancelled"):
+                # Still respect auto-delete
+                if _config["auto_delete_environments"]:
+                    try:
+                        await client.delete_environment(environment_id)
+                    except Exception:
+                        pass
+                return [TextContent(type="text", text=f"""Environment {environment_id} has already ended (status: {raw_status}). Nothing to cancel.
+
+**Environment:** {env_url}""")]
+            
+            # Transitional states (Launching, Deploying, etc.) - use release endpoint
+            # since end_environment returns 409 on these states
+            transitional_states = ("launching", "deploying", "preparing", "provisioning")
+            if status in transitional_states:
+                await client.release_environment(environment_id, force=True)
+                action_msg = "Execution cancelled (environment was still deploying)."
+            else:
+                # Active, running, error states, etc. - use regular end
+                await client.end_environment(environment_id, force=True)
+                action_msg = "Execution cancelled."
+            
+            # Auto-delete if configured
+            if _config["auto_delete_environments"]:
+                try:
+                    await client.delete_environment(environment_id)
+                    action_msg += " Environment deleted."
+                except Exception:
+                    pass
+            
+            return [TextContent(type="text", text=f"""{action_msg}
+
+**Environment ID:** {environment_id}
+**Previous Status:** {raw_status}
+**Environment:** {env_url}""")]
+    
+    except Exception as e:
+        return [TextContent(type="text", text=f"Error cancelling execution: {str(e)}")]
+
+
+def _suggest_wait_time(command: str) -> int:
+    """Suggest a wait time based on command content."""
+    command_lower = command.lower()
+    # Long-running patterns
+    long_patterns = ['install', 'upgrade', 'update', 'build', 'make', 'compile', 'download',
+                     'pip install', 'apt', 'yum', 'dnf', 'npm install', 'cargo build',
+                     'docker pull', 'docker build', 'git clone', 'wget', 'curl.*-o',
+                     'ansible', 'terraform', 'kubectl apply']
+    for pattern in long_patterns:
+        if pattern in command_lower:
+            return 30
+    # Medium patterns
+    medium_patterns = ['sleep', 'test', 'pytest', 'mvn', 'gradle']
+    for pattern in medium_patterns:
+        if pattern in command_lower:
+            return 15
+    return 10
 
 
 async def cli_dispatch(args):
@@ -1142,8 +1792,9 @@ async def cli_dispatch(args):
         # - first_line_shown: whether we've printed the "Running on" header line
         # - buffer: accumulated data for finding markers
         state = {'found': verbose, 'first_line_shown': verbose, 'buffer': ''}
-        # Full marker line (117 chars of '=' after the text) - must be at end of line (no trailing ")
-        marker = '=== Beginning of execution =====================================================================================================================\n'
+        # Marker pattern - matches both "=== Beginning of execution ===" and "=== Beginning of local execution ==="
+        # Requires 50+ trailing = chars to avoid false positives from user output
+        marker_pattern = re.compile(r'=== Beginning of (?:local )?execution ={50,}\n')
         # Pattern for first line: [HH:MM:SS.mmm] >> Running on container. Storage: . Task Id: XXX
         first_line_pattern = re.compile(r'^(\[\d{2}:\d{2}:\d{2}\.\d{3}\] >> Running on .+)$', re.MULTILINE)
         
@@ -1168,11 +1819,11 @@ async def cli_dispatch(args):
                     state['first_line_shown'] = True
             
             # Look for execution marker
-            idx = state['buffer'].find(marker)
-            if idx != -1:
+            match = marker_pattern.search(state['buffer'])
+            if match:
                 state['found'] = True
                 # Print from after the marker line
-                after_marker = state['buffer'][idx + len(marker):]
+                after_marker = state['buffer'][match.end():]
                 if after_marker:
                     print(after_marker, file=sys.stderr, end='', flush=True)
                 state['buffer'] = ''

@@ -267,6 +267,32 @@ class TorqueClient:
         
         response.raise_for_status()
     
+    async def release_environment(self, environment_id: str, force: bool = False) -> None:
+        """
+        Release an environment without termination/destroy phase.
+        Works on environments in ANY state including transitional states (Launching, Deploying)
+        where end_environment would return 409.
+        
+        Args:
+            environment_id: Environment ID
+            force: Whether to release even if it conflicts with current running operation
+        """
+        url = f"/spaces/{self.space}/environments/{environment_id}/release"
+        if force:
+            url += "?force=true"
+        
+        response = await self._client.delete(url)
+        
+        # 404 is ok - environment may have already been released/ended
+        if response.status_code == 404:
+            return
+        
+        # 400 Bad Request - already completed
+        if response.status_code == 400:
+            return
+        
+        response.raise_for_status()
+    
     async def delete_environment(self, environment_id: str) -> None:
         """
         Delete an environment from the system (remove from history/DB).
