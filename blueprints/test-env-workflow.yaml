@@ -11,7 +11,7 @@ workflow:
 inputs:
   agent:
     type: agent
-    default: intersight-provisioning-agent
+    default: cisco-management-server-torque-agent
 
 outputs:
   result:
