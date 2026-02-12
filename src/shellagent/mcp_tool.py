@@ -1180,7 +1180,8 @@ async def handle_run_on_ssh_async(arguments: dict):
 **Environment ID:** {environment_id}
 **Environment:** {env_url}
 
-Use `get_execution_status` with environment_id="{environment_id}" to check progress (suggested initial wait={suggested_wait}, adjust as needed)."""
+Use `get_execution_status` with environment_id="{environment_id}" to check progress (suggested initial wait={suggested_wait}, adjust as needed).
+Use `cancel_execution` with the same environment_id to abort if needed."""
         
         return [TextContent(type="text", text=output_text)]
     
@@ -1233,7 +1234,8 @@ async def handle_run_on_container_async(arguments: dict):
 **Environment ID:** {environment_id}
 **Environment:** {env_url}
 
-Use `get_execution_status` with environment_id="{environment_id}" to check progress (suggested initial wait={suggested_wait}, adjust as needed)."""
+Use `get_execution_status` with environment_id="{environment_id}" to check progress (suggested initial wait={suggested_wait}, adjust as needed).
+Use `cancel_execution` with the same environment_id to abort if needed."""
         
         return [TextContent(type="text", text=output_text)]
     
