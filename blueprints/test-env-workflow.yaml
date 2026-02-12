@@ -1,0 +1,36 @@
+spec_version: 2
+description: |
+  Test workflow for environment-level operations.
+  This is an env-scoped workflow that can be triggered on Active environments.
+
+workflow:
+  scope: env
+  triggers:
+    - type: manual
+
+inputs:
+  agent:
+    type: agent
+    default: intersight-provisioning-agent
+
+outputs:
+  result:
+    value: '{{ .grains.test_grain.activities.deploy.commands.test_cmd.outputs.result }}'
+
+grains:
+  test_grain:
+    kind: shell
+    spec:
+      agent:
+        name: '{{ .inputs.agent }}'
+      activities:
+        deploy:
+          commands:
+            - name: test_cmd
+              command: |
+                echo "Workflow executed successfully at $(date)"
+                echo "Hostname: $(hostname)"
+                echo "IP: $(hostname -I 2>/dev/null || echo 'N/A')"
+                export result="success"
+              outputs:
+                - result
