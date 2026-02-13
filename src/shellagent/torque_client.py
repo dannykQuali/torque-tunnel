@@ -29,6 +29,7 @@ class TorqueClient:
     
     BLUEPRINT_NAME = "remote-shell-executor"
     LOCAL_BLUEPRINT_NAME = "local-shell-executor"
+    PERSISTENT_CONTAINER_BLUEPRINT = "persistent-container"
     
     def __init__(
         self,
@@ -117,8 +118,16 @@ class TorqueClient:
         if not environment_name:
             environment_name = f"shell-cmd-{int(time.time())}"
         
-        # Use per-call values if provided, otherwise fall back to instance defaults
-        effective_init = init_commands if init_commands is not None else self.init_commands
+        # Combine instance defaults with per-call overrides:
+        # Global init (e.g. proxy vars) runs FIRST, then per-call init (e.g. file deployment)
+        if init_commands is not None and self.init_commands:
+            effective_init = self.init_commands + "\n" + init_commands
+        elif init_commands is not None:
+            effective_init = init_commands
+        else:
+            effective_init = self.init_commands
+        
+        # Finally commands: per-call replaces instance default (cleanup is context-specific)
         effective_finally = finally_commands if finally_commands is not None else self.finally_commands
         
         # Calculate timeout in minutes (round up, minimum 5 minutes for Torque)
@@ -182,9 +191,10 @@ class TorqueClient:
             environment_name = f"local-cmd-{int(time.time())}"
         
         # Combine per-call init_commands with global init_commands
+        # Global init (e.g. proxy vars) runs FIRST, then per-call init (e.g. file deployment)
         combined_init = None
         if init_commands and self.init_commands:
-            combined_init = f"{init_commands}\n{self.init_commands}"
+            combined_init = f"{self.init_commands}\n{init_commands}"
         elif init_commands:
             combined_init = init_commands
         elif self.init_commands:
@@ -750,3 +760,171 @@ class TorqueClient:
                     await self.delete_environment(environment_id)
                 except Exception as e:
                     print(f"[WARNING] Failed to delete environment {environment_id}: {e}", file=sys.stderr)
+
+    async def start_persistent_container(
+        self,
+        agent: Optional[str] = None,
+        environment_name: Optional[str] = None,
+    ) -> str:
+        """
+        Start a persistent container with SSH access on the Torque agent.
+        
+        The container runs sshd in foreground and stays alive until terminated.
+        Returns the environment ID. Use get_persistent_container_info() to get
+        connection details (IP, private key) from the deploy log.
+        
+        Args:
+            agent: Agent name (uses default if not specified)
+            environment_name: Optional name for the environment
+            
+        Returns:
+            Environment ID
+        """
+        agent_name = agent or self.default_agent
+        if not agent_name:
+            raise ValueError("Agent name must be provided either as argument or default")
+        
+        if not environment_name:
+            environment_name = f"persistent-container-{int(time.time())}"
+        
+        payload = {
+            "blueprint_name": self.PERSISTENT_CONTAINER_BLUEPRINT,
+            "environment_name": environment_name,
+            "duration": "PT24H",
+            "inputs": {
+                "agent": agent_name,
+            },
+        }
+        
+        response = await self._client.post(
+            f"/spaces/{self.space}/environments",
+            json=payload,
+        )
+        response.raise_for_status()
+        
+        data = response.json()
+        return data["id"]
+    
+    async def get_persistent_container_info(
+        self,
+        environment_id: str,
+        timeout: int = 600,
+    ) -> dict:
+        """
+        Wait for a persistent container to be ready and extract connection details.
+        
+        Polls the deploy log for the SHELLAGENT::READY marker and extracts
+        the container IP and SSH private key.
+        
+        Args:
+            environment_id: Environment ID of the persistent container
+            timeout: Maximum time to wait in seconds (default 10 minutes)
+            
+        Returns:
+            Dict with 'container_ip', 'container_id', 'private_key'
+            
+        Raises:
+            TimeoutError: If the container doesn't become ready within timeout
+            RuntimeError: If the container fails to start
+        """
+        start_time = time.time()
+        log_url = None
+        
+        while time.time() - start_time < timeout:
+            env_data = await self.get_environment_status(environment_id)
+            state = env_data.get("details", {}).get("state", {})
+            current_state = state.get("current_state", "")
+            
+            # Check for errors
+            errors = state.get("errors", [])
+            if errors:
+                error_msgs = []
+                for err in errors:
+                    if isinstance(err, dict) and err.get("message"):
+                        error_msgs.append(err["message"])
+                    elif isinstance(err, str):
+                        error_msgs.append(err)
+                raise RuntimeError(f"Persistent container failed: {'; '.join(error_msgs)}")
+            
+            # Check for terminal failure states
+            raw_status = env_data.get("details", {}).get("computed_status", "")
+            if raw_status and raw_status.lower().replace(" ", "_") in ("ended", "failed", "error", "terminated"):
+                raise RuntimeError(f"Persistent container terminated unexpectedly: {raw_status}")
+            
+            # Find the Deploy activity log URL
+            grains = state.get("grains", [])
+            for g in grains:
+                for s in g.get("state", {}).get("stages", []):
+                    for a in s.get("activities", []):
+                        if a.get("name") == "Deploy" and a.get("log"):
+                            log_url = a["log"]
+            
+            if log_url:
+                # Strip /api prefix if present
+                fetch_url = log_url[4:] if log_url.startswith("/api/") else log_url
+                response = await self._client.get(fetch_url)
+                if response.status_code == 200:
+                    log_text = response.text
+                    # Handle JSON-encoded string responses
+                    if log_text.startswith('"') and log_text.endswith('"'):
+                        import json
+                        try:
+                            log_text = json.loads(log_text)
+                        except Exception:
+                            pass
+                    
+                    # Strip timestamps for parsing: [HH:MM:SS.mmm] 
+                    clean_log = re.sub(r'\[\d{2}:\d{2}:\d{2}\.\d{3}\]\s*', '', log_text)
+                    
+                    # Check for READY marker as a line-start (not inside printf echo)
+                    # Torque echoes the script source before running it, so
+                    # "printf 'SHELLAGENT::READY\n'" appears in the echo section.
+                    # Actual output lines start with SHELLAGENT:: directly.
+                    if re.search(r'^SHELLAGENT::READY', clean_log, re.MULTILINE):
+                        # Parse connection details from actual output lines
+                        info = {}
+                        
+                        ip_match = re.search(r'^SHELLAGENT::CONTAINER_IP=(\S+)', clean_log, re.MULTILINE)
+                        if ip_match:
+                            info['container_ip'] = ip_match.group(1)
+                        
+                        id_match = re.search(r'^SHELLAGENT::CONTAINER_ID=(\S+)', clean_log, re.MULTILINE)
+                        if id_match:
+                            info['container_id'] = id_match.group(1)
+                        
+                        key_match = re.search(r'^SHELLAGENT::KEY_START\s*\n(.*?)^SHELLAGENT::KEY_END', clean_log, re.MULTILINE | re.DOTALL)
+                        if key_match:
+                            info['private_key'] = key_match.group(1).strip()
+                        
+                        if not info.get('container_ip') or not info.get('private_key'):
+                            raise RuntimeError(
+                                f"Could not parse container connection details from log. "
+                                f"Got IP={info.get('container_ip')}, key={'present' if info.get('private_key') else 'missing'}"
+                            )
+                        
+                        return info
+            
+            await asyncio.sleep(2)
+        
+        raise TimeoutError(f"Persistent container did not become ready within {timeout} seconds")
+    
+    async def extend_environment(
+        self,
+        environment_id: str,
+        duration: str = "PT2H",
+    ) -> None:
+        """
+        Extend an environment's lifetime.
+        
+        Args:
+            environment_id: Environment ID
+            duration: ISO 8601 duration string (e.g., "PT2H" for 2 hours)
+        """
+        response = await self._client.put(
+            f"/spaces/{self.space}/environments/{environment_id}/extend",
+            json={"duration": duration},
+        )
+        # Ignore 404 (already gone) and 400 (can't extend in current state)
+        if response.status_code in (404, 400):
+            return
+        response.raise_for_status()
