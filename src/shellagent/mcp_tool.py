@@ -394,6 +394,61 @@ _persistent_containers: dict[str, dict] = {}
 _default_persistent_container_id: Optional[str] = None
 
 
+# --- Persistent container state file (CLI mode) ---
+
+def _state_file_path() -> str:
+    """Get the path to the persistent container state file."""
+    from pathlib import Path
+    state_dir = Path.home() / ".shellagent"
+    state_dir.mkdir(exist_ok=True)
+    return str(state_dir / "containers.json")
+
+
+def _read_state() -> dict:
+    """Read persistent container state from disk."""
+    import json
+    path = _state_file_path()
+    if os.path.exists(path):
+        try:
+            with open(path, 'r') as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError):
+            return {"default": None, "containers": {}}
+    return {"default": None, "containers": {}}
+
+
+def _write_state(state: dict):
+    """Write persistent container state to disk."""
+    import json
+    path = _state_file_path()
+    with open(path, 'w') as f:
+        json.dump(state, f, indent=2)
+
+
+def _save_container_to_state(env_id: str, agent: str, set_default: bool = True):
+    """Save a container entry to the state file."""
+    from datetime import datetime, timezone
+    state = _read_state()
+    state["containers"][env_id] = {
+        "created": datetime.now(timezone.utc).isoformat(),
+        "agent": agent,
+    }
+    if set_default:
+        state["default"] = env_id
+    _write_state(state)
+
+
+def _remove_container_from_state(env_id: str):
+    """Remove a container from the state file."""
+    state = _read_state()
+    state["containers"].pop(env_id, None)
+    if state["default"] == env_id:
+        # Set default to another container if available, else None
+        remaining = list(state["containers"].keys())
+        state["default"] = remaining[-1] if remaining else None
+    _write_state(state)
+
+
 def get_torque_client() -> TorqueClient:
     """Create a Torque client with current configuration."""
     if not _config["torque_url"]:
@@ -541,8 +596,8 @@ Unlike run_on_ssh, this doesn't connect to a remote server.
 - run_on_ssh: SSH to a remote server (needs host, user, private_key)
 - run_on_disposable_container: Runs locally on the Torque agent container (no SSH needed)
 
-**Key difference from run_on_container:**
-- run_on_container: Persistent container - state persists across calls
+**Key difference from run_on_persistent_container:**
+- run_on_persistent_container: Persistent container - state persists across calls
 - run_on_disposable_container: Fresh container every time - nothing persists
 
 **Use cases:**
@@ -609,7 +664,7 @@ Each invocation spawns a fresh container. Consolidate operations:
             },
         ),
         Tool(
-            name="run_on_container",
+            name="run_on_persistent_container",
             description="""Execute a command on a persistent Torque agent container. This tool BLOCKS until completion.
 The container persists across calls - files, installed packages, and environment variables are preserved.
 
@@ -634,7 +689,7 @@ Unlike run_on_ssh, this doesn't connect to a remote server.
 
 **Key difference from run_on_ssh:**
 - run_on_ssh: SSH to a remote server (needs host, user, private_key)
-- run_on_container: Runs locally on the Torque agent container (no SSH needed)
+- run_on_persistent_container: Runs locally on the Torque agent container (no SSH needed)
 
 **Use cases:**
 - Run tools/scripts available in the agent environment
@@ -782,7 +837,7 @@ The following commands may KILL the Torque agent and cause the operation to fail
             },
         ),
         Tool(
-            name="run_on_container_async",
+            name="run_on_persistent_container_async",
             description="""Execute a command on a persistent Torque agent container WITHOUT waiting for completion.
 Returns immediately with an environment ID. Use get_execution_status to poll for output and progress.
 
@@ -807,10 +862,10 @@ Unlike run_on_ssh_async, this doesn't connect to a remote server.
 
 **Key difference from run_on_ssh_async:**
 - run_on_ssh_async: SSH to a remote server (needs host, user, private_key)
-- run_on_container_async: Runs locally on the Torque agent container (no SSH needed)
+- run_on_persistent_container_async: Runs locally on the Torque agent container (no SSH needed)
 
 **Key difference from run_on_disposable_container_async:**
-- run_on_container_async: Persistent container - state persists across calls
+- run_on_persistent_container_async: Persistent container - state persists across calls
 - run_on_disposable_container_async: Fresh container every time - nothing persists""",
             inputSchema={
                 "type": "object",
@@ -911,13 +966,13 @@ but non-blocking. Track progress with get_execution_status.""",
         ),
         Tool(
             name="get_execution_status",
-            description="""Check the status and output of an async command started with run_on_ssh_async or run_on_container_async.
+            description="""Check the status and output of an async command started with run_on_ssh_async or run_on_persistent_container_async.
 
 Returns the current status (running/completed/failed), partial output if still running,
 or full output if completed. Use the `wait` parameter to avoid tight polling loops.
 
 Typical usage pattern:
-1. Call run_on_ssh_async or run_on_container_async to start a command
+1. Call run_on_ssh_async or run_on_persistent_container_async to start a command
 2. Call get_execution_status with wait=10 to check after 10 seconds
 3. If still running, call again with wait=10-15
 4. When completed, get the full output""",
@@ -926,7 +981,7 @@ Typical usage pattern:
                 "properties": {
                     "environment_id": {
                         "type": "string",
-                        "description": "The environment ID returned by run_on_ssh_async or run_on_container_async.",
+                        "description": "The environment ID returned by run_on_ssh_async or run_on_persistent_container_async.",
                     },
                     "wait": {
                         "type": "integer",
@@ -938,7 +993,7 @@ Typical usage pattern:
         ),
         Tool(
             name="cancel_execution",
-            description="""Cancel a running async command started with run_on_ssh_async or run_on_container_async.
+            description="""Cancel a running async command started with run_on_ssh_async or run_on_persistent_container_async.
 
 Terminates the Torque environment, stopping the command. Use this when:
 - A command is taking too long and you want to abort
@@ -951,7 +1006,7 @@ The environment will be terminated and cleaned up.""",
                 "properties": {
                     "environment_id": {
                         "type": "string",
-                        "description": "The environment ID returned by run_on_ssh_async or run_on_container_async.",
+                        "description": "The environment ID returned by run_on_ssh_async or run_on_persistent_container_async.",
                     },
                 },
                 "required": ["environment_id"],
@@ -967,8 +1022,8 @@ async def call_tool(name: str, arguments: dict):
     if name == "run_on_ssh":
         return await handle_run_on_ssh(arguments)
     
-    elif name == "run_on_container":
-        return await handle_run_on_container(arguments)
+    elif name == "run_on_persistent_container":
+        return await handle_run_on_persistent_container(arguments)
     
     elif name == "run_on_disposable_container":
         return await handle_run_on_disposable_container(arguments)
@@ -976,8 +1031,8 @@ async def call_tool(name: str, arguments: dict):
     elif name == "run_on_ssh_async":
         return await handle_run_on_ssh_async(arguments)
     
-    elif name == "run_on_container_async":
-        return await handle_run_on_container_async(arguments)
+    elif name == "run_on_persistent_container_async":
+        return await handle_run_on_persistent_container_async(arguments)
     
     elif name == "run_on_disposable_container_async":
         return await handle_run_on_disposable_container_async(arguments)
@@ -1269,7 +1324,7 @@ async def _ensure_persistent_container(
         return dict(container_entry)
 
 
-async def handle_run_on_container(arguments: dict):
+async def handle_run_on_persistent_container(arguments: dict):
     """Execute a command on a persistent Torque agent container via SSH.
     
     On first call, launches a persistent container with dropbear (SSH server). Subsequent calls
@@ -1419,7 +1474,7 @@ async def handle_run_on_container(arguments: dict):
 {log_block}"""
         
         if result.execution_duration is not None and result.execution_duration > 60:
-            output_text += "\n\n**TIP:** This command took over 60 seconds. Consider using `run_on_container_async` for similar long-running commands to get progress updates while waiting."
+            output_text += "\n\n**TIP:** This command took over 60 seconds. Consider using `run_on_persistent_container_async` for similar long-running commands to get progress updates while waiting."
         
         return [TextContent(type="text", text=output_text)]
     
@@ -1626,7 +1681,7 @@ Use `cancel_execution` with the same environment_id to abort if needed."""
         return [TextContent(type="text", text=f"Error starting async command: {str(e)}")]
 
 
-async def handle_run_on_container_async(arguments: dict):
+async def handle_run_on_persistent_container_async(arguments: dict):
     """Start a command on the persistent container without waiting for completion.
     
     Blocks until the persistent container is up, then launches the command
@@ -1832,7 +1887,7 @@ async def handle_get_execution_status(arguments: dict):
                 
                 # Tip for fast commands
                 if duration is not None and duration < 10:
-                    output_text += "\n\n**TIP:** This command completed in under 10 seconds. For quick commands like this, `run_on_ssh` or `run_on_container` provides simpler one-shot execution without polling."
+                    output_text += "\n\n**TIP:** This command completed in under 10 seconds. For quick commands like this, `run_on_ssh` or `run_on_persistent_container` provides simpler one-shot execution without polling."
                 
                 # Auto-cleanup
                 try:
@@ -2257,8 +2312,208 @@ async def cli_dispatch(args):
                     print(f"Error: {result.error}", file=sys.stderr)
                     sys.exit(1)
         
-        elif args.command == "container":
-            # Container command (with optional file uploads)
+        elif args.command in ("persistent-container", "container"):
+            # Persistent container command
+            agent = getattr(args, 'agent', None)
+            timeout = getattr(args, 'timeout', None)
+            output_json = getattr(args, 'json', False)
+            uploads = parse_uploads(getattr(args, 'upload', None))
+            cmd = getattr(args, 'cmd', None)
+            env_id = getattr(args, 'env_id', None)
+            new_container = getattr(args, 'new', False)
+            release_all = getattr(args, 'all', False)
+            
+            # Handle sub-actions: create, list, release
+            if cmd == "create":
+                # Create a new persistent container and output its env_id
+                try:
+                    container_info = await _ensure_persistent_container(agent=agent, new_container=True)
+                    cid = container_info["environment_id"]
+                    agent_name = container_info.get("agent", agent or _config["default_agent"])
+                    _save_container_to_state(cid, agent_name)
+                    if output_json:
+                        print(json_module.dumps({
+                            "environment_id": cid,
+                            "container_id": container_info.get("container_id"),
+                            "container_ip": container_info.get("container_ip"),
+                            "agent": agent_name,
+                        }))
+                    else:
+                        print(cid)  # stdout: just the env_id for easy capture
+                        print(f"Created persistent container {cid} on {agent_name}", file=sys.stderr)
+                except Exception as e:
+                    print(f"Error creating persistent container: {e}", file=sys.stderr)
+                    sys.exit(1)
+                    
+            elif cmd == "list":
+                # List known persistent containers and check their status
+                state = _read_state()
+                containers = state.get("containers", {})
+                default_id = state.get("default")
+                
+                if not containers:
+                    print("No persistent containers in state file.", file=sys.stderr)
+                    sys.exit(0)
+                
+                results = []
+                async with get_torque_client() as client:
+                    for cid, info in containers.items():
+                        try:
+                            env_data = await client.get_environment_status(cid)
+                            current_state = env_data.get("details", {}).get("state", {}).get("current_state", "unknown")
+                            status = "active" if current_state in ("deploying", "launching") else current_state
+                        except Exception:
+                            status = "expired"
+                        marker = "*" if cid == default_id else " "
+                        results.append({
+                            "environment_id": cid,
+                            "status": status,
+                            "agent": info.get("agent", ""),
+                            "created": info.get("created", ""),
+                            "default": cid == default_id,
+                        })
+                
+                if output_json:
+                    print(json_module.dumps(results, indent=2))
+                else:
+                    for r in results:
+                        marker = "*" if r["default"] else " "
+                        print(f"  {marker} {r['environment_id']}  {r['status']:<10}  {r['agent']}  {r['created']}")
+                
+            elif cmd == "release":
+                # Release persistent container(s)
+                if release_all:
+                    state = _read_state()
+                    containers = list(state.get("containers", {}).keys())
+                    if not containers:
+                        print("No persistent containers to release.", file=sys.stderr)
+                        sys.exit(0)
+                    async with get_torque_client() as client:
+                        for cid in containers:
+                            try:
+                                await client.end_environment(cid, force=True)
+                                _remove_container_from_state(cid)
+                                print(f"Released {cid}", file=sys.stderr)
+                            except Exception as e:
+                                print(f"Failed to release {cid}: {e}", file=sys.stderr)
+                elif env_id:
+                    async with get_torque_client() as client:
+                        try:
+                            await client.end_environment(env_id, force=True)
+                            _remove_container_from_state(env_id)
+                            print(f"Released {env_id}", file=sys.stderr)
+                        except Exception as e:
+                            print(f"Failed to release {env_id}: {e}", file=sys.stderr)
+                            sys.exit(1)
+                else:
+                    # Release default
+                    state = _read_state()
+                    default_id = state.get("default")
+                    if not default_id:
+                        print("Error: No default persistent container. Use --env-id or --all.", file=sys.stderr)
+                        sys.exit(1)
+                    async with get_torque_client() as client:
+                        try:
+                            await client.end_environment(default_id, force=True)
+                            _remove_container_from_state(default_id)
+                            print(f"Released {default_id}", file=sys.stderr)
+                        except Exception as e:
+                            print(f"Failed to release {default_id}: {e}", file=sys.stderr)
+                            sys.exit(1)
+                
+            else:
+                # Execute a command on persistent container
+                # Must have command or uploads
+                if not cmd and not uploads:
+                    print("Error: Must provide a command, --upload files, or a sub-action (create, list, release).", file=sys.stderr)
+                    sys.exit(1)
+                
+                # Determine which container to use
+                target_env_id = env_id
+                if not target_env_id and not new_container:
+                    # Try state file default
+                    state = _read_state()
+                    target_env_id = state.get("default")
+                
+                try:
+                    container_info = await _ensure_persistent_container(
+                        agent=agent, new_container=new_container, environment_id=target_env_id
+                    )
+                    container_ip = container_info["container_ip"]
+                    private_key = container_info["private_key"]
+                    used_env_id = container_info["environment_id"]
+                    agent_name = container_info.get("agent", agent or _config["default_agent"])
+                    
+                    # Save to state file
+                    _save_container_to_state(used_env_id, agent_name)
+                except Exception as e:
+                    print(f"Error setting up persistent container: {e}", file=sys.stderr)
+                    sys.exit(1)
+                
+                # Process file uploads
+                init_commands = None
+                if uploads:
+                    file_deploy_commands, file_errors = prepare_files_deployment(uploads)
+                    if file_errors:
+                        print("Error preparing files:", file=sys.stderr)
+                        for e in file_errors:
+                            print(f"  - {e}", file=sys.stderr)
+                        sys.exit(1)
+                    if file_deploy_commands:
+                        global_init = _config.get("init_commands") or ""
+                        init_commands = (file_deploy_commands + "\n" + global_init) if global_init else file_deploy_commands
+                
+                effective_command = cmd or "echo 'Files deployed successfully'"
+                
+                print(f"Persistent Container: {used_env_id}", file=sys.stderr)
+                
+                async with get_torque_client() as client:
+                    result = await client.execute_remote_command(
+                        target_ip=container_ip,
+                        ssh_user="root",
+                        ssh_private_key=private_key,
+                        command=effective_command,
+                        agent=agent,
+                        timeout=timeout,
+                        auto_cleanup=_config["auto_delete_environments"],
+                        log_callback=cli_log_callback(""),
+                        init_commands=init_commands,
+                    )
+                    
+                    # Extend idle timeout
+                    try:
+                        idle_seconds = _config["container_idle_timeout"]
+                        hours = idle_seconds / 3600
+                        if hours == int(hours):
+                            duration_str = f"PT{int(hours)}H"
+                        else:
+                            total_minutes = int(idle_seconds / 60)
+                            h = total_minutes // 60
+                            m = total_minutes % 60
+                            duration_str = f"PT{h}H{m}M" if h else f"PT{m}M"
+                        await client.extend_environment(used_env_id, duration=duration_str)
+                    except Exception:
+                        pass
+                
+                if output_json:
+                    print(json_module.dumps({
+                        "status": result.status,
+                        "exit_code": result.exit_code,
+                        "output": result.command_output,
+                        "error": result.error,
+                        "environment_id": result.environment_id,
+                        "persistent_container_id": used_env_id,
+                    }))
+                else:
+                    if result.status == "completed":
+                        print(result.command_output or "", end='')
+                        sys.exit(result.exit_code or 0)
+                    else:
+                        print(f"Error: {result.error}", file=sys.stderr)
+                        sys.exit(1)
+        
+        elif args.command == "disposable-container":
+            # Disposable container command (with optional file uploads)
             agent = getattr(args, 'agent', None)
             timeout = getattr(args, 'timeout', None)
             output_json = getattr(args, 'json', False)
@@ -2560,13 +2815,40 @@ PERFORMANCE TIP:
     ssh_parser.add_argument("--upload", action="append", metavar="LOCAL:REMOTE[:MODE]",
                               help="Upload local file/dir to remote path (can be repeated)")
     
-    # container subcommand (run on Torque agent container)
-    container_parser = subparsers.add_parser("container", parents=[common_parser], help="Execute a command on Torque agent container")
-    container_parser.add_argument("cmd", nargs='?', help="The shell command to execute (optional if --upload used)")
-    container_parser.add_argument("--agent", "-a", help="Torque agent name (overrides default)")
-    container_parser.add_argument("--timeout", type=int, help="Timeout in seconds")
-    container_parser.add_argument("--json", "-j", action="store_true", help="Output as JSON")
-    container_parser.add_argument("--upload", action="append", metavar="LOCAL:REMOTE[:MODE]",
+    # persistent-container subcommand (run on persistent Torque agent container)
+    pc_parser = subparsers.add_parser("persistent-container", parents=[common_parser],
+                                       help="Execute a command on a persistent Torque agent container (state preserved across calls)")
+    pc_parser.add_argument("cmd", nargs='?', help="The shell command to execute, or a sub-action: create, list, release")
+    pc_parser.add_argument("--env-id", help="Target a specific persistent container by environment ID")
+    pc_parser.add_argument("--new", action="store_true", help="Create a new container (keeps existing ones alive)")
+    pc_parser.add_argument("--agent", "-a", help="Torque agent name (overrides default)")
+    pc_parser.add_argument("--timeout", type=int, help="Timeout in seconds")
+    pc_parser.add_argument("--json", "-j", action="store_true", help="Output as JSON")
+    pc_parser.add_argument("--upload", action="append", metavar="LOCAL:REMOTE[:MODE]",
+                             help="Upload local file/dir to container (can be repeated)")
+    pc_parser.add_argument("--all", action="store_true", help="Release all containers (used with 'release' action)")
+
+    # container is an alias for persistent-container
+    c_parser = subparsers.add_parser("container", parents=[common_parser],
+                                      help="Alias for persistent-container")
+    c_parser.add_argument("cmd", nargs='?', help="The shell command to execute, or a sub-action: create, list, release")
+    c_parser.add_argument("--env-id", help="Target a specific persistent container by environment ID")
+    c_parser.add_argument("--new", action="store_true", help="Create a new container (keeps existing ones alive)")
+    c_parser.add_argument("--agent", "-a", help="Torque agent name (overrides default)")
+    c_parser.add_argument("--timeout", type=int, help="Timeout in seconds")
+    c_parser.add_argument("--json", "-j", action="store_true", help="Output as JSON")
+    c_parser.add_argument("--upload", action="append", metavar="LOCAL:REMOTE[:MODE]",
+                             help="Upload local file/dir to container (can be repeated)")
+    c_parser.add_argument("--all", action="store_true", help="Release all containers (used with 'release' action)")
+
+    # disposable-container subcommand (run on fresh Torque agent container)
+    dc_parser = subparsers.add_parser("disposable-container", parents=[common_parser],
+                                       help="Execute a command on a fresh disposable Torque agent container (nothing persists)")
+    dc_parser.add_argument("cmd", nargs='?', help="The shell command to execute (optional if --upload used)")
+    dc_parser.add_argument("--agent", "-a", help="Torque agent name (overrides default)")
+    dc_parser.add_argument("--timeout", type=int, help="Timeout in seconds")
+    dc_parser.add_argument("--json", "-j", action="store_true", help="Output as JSON")
+    dc_parser.add_argument("--upload", action="append", metavar="LOCAL:REMOTE[:MODE]",
                              help="Upload local file/dir to container (can be repeated)")
     
     # read subcommand
