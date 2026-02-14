@@ -161,7 +161,10 @@ class TorqueClient:
             f"/spaces/{self.space}/environments",
             json=payload,
         )
-        response.raise_for_status()
+        if response.status_code >= 400:
+            raise RuntimeError(
+                f"Torque API error {response.status_code} creating environment: {response.text}"
+            )
         
         data = response.json()
         return data["id"]
@@ -231,7 +234,10 @@ class TorqueClient:
             f"/spaces/{self.space}/environments",
             json=payload,
         )
-        response.raise_for_status()
+        if response.status_code >= 400:
+            raise RuntimeError(
+                f"Torque API error {response.status_code} creating environment: {response.text}"
+            )
         
         data = response.json()
         return data["id"]
@@ -806,7 +812,10 @@ class TorqueClient:
             f"/spaces/{self.space}/environments",
             json=payload,
         )
-        response.raise_for_status()
+        if response.status_code >= 400:
+            raise RuntimeError(
+                f"Torque API error {response.status_code} creating persistent container: {response.text}"
+            )
         
         data = response.json()
         return data["id"]
