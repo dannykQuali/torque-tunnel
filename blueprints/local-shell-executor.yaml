@@ -111,10 +111,20 @@ grains:
                   echo "=== Executing on agent container ==="
                   echo "=== Output (streaming) ========================================================================================================================="
                   
+                  # Calculate timeout in seconds from minutes input
+                  TIMEOUT_SECONDS=$(( {{ .inputs.timeout_minutes }} * 60 ))
+                  
                   START_TIME=$(date +%s%3N 2>/dev/null || echo "$(date +%s)000")
                   # Run the script (commands inside already have </dev/null protection)
+                  timeout "${TIMEOUT_SECONDS}" \
                   bash "$COMBINED" 2>&1 | tee "$OUTPUT_FILE"
-                  echo "${PIPESTATUS[0]}" > "$EXIT_CODE_FILE"
+                  CMD_STATUS=${PIPESTATUS[0]}
+                  # timeout returns 124 when the command times out
+                  if [ $CMD_STATUS -eq 124 ]; then
+                    echo "" >> "$OUTPUT_FILE"
+                    echo "=== COMMAND TIMED OUT after {{ .inputs.timeout_minutes }} minutes ===" | tee -a "$OUTPUT_FILE"
+                  fi
+                  echo "$CMD_STATUS" > "$EXIT_CODE_FILE"
                   END_TIME=$(date +%s%3N 2>/dev/null || echo "$(date +%s)000")
                   EXEC_DURATION_MS=$((END_TIME - START_TIME))
                 }

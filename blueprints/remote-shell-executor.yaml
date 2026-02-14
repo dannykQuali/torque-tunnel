@@ -127,14 +127,24 @@ grains:
                   echo "=== Connecting to {{ .inputs.ssh_user }}@{{ .inputs.target_ip }} ==="
                   echo "=== Output (streaming) ========================================================================================================================="
                   
+                  # Calculate timeout in seconds from minutes input
+                  TIMEOUT_SECONDS=$(( {{ .inputs.timeout_minutes }} * 60 ))
+                  
                   START_TIME=$(date +%s%3N 2>/dev/null || echo "$(date +%s)000")
+                  timeout "${TIMEOUT_SECONDS}" \
                   ssh -o StrictHostKeyChecking=no \
                       -o UserKnownHostsFile=/dev/null \
                       -o LogLevel=ERROR \
                       -i "$KEY_FILE" \
                       "{{ .inputs.ssh_user }}@{{ .inputs.target_ip }}" \
                       "bash -s" < "$REMOTE_SCRIPT" 2>&1 | tee "$OUTPUT_FILE"
-                  echo "${PIPESTATUS[0]}" > "$EXIT_CODE_FILE"
+                  SSH_STATUS=${PIPESTATUS[0]}
+                  # timeout returns 124 when the command times out
+                  if [ $SSH_STATUS -eq 124 ]; then
+                    echo "" >> "$OUTPUT_FILE"
+                    echo "=== COMMAND TIMED OUT after {{ .inputs.timeout_minutes }} minutes ===" | tee -a "$OUTPUT_FILE"
+                  fi
+                  echo "$SSH_STATUS" > "$EXIT_CODE_FILE"
                   END_TIME=$(date +%s%3N 2>/dev/null || echo "$(date +%s)000")
                   EXEC_DURATION_MS=$((END_TIME - START_TIME))
                 }
