@@ -413,6 +413,88 @@ _config = {
 # Keyed by environment_id. The "_default" key tracks the most recently used container's env_id.
 _persistent_containers: dict[str, dict] = {}
 _default_persistent_container_id: Optional[str] = None
+_background_streamers: dict[str, asyncio.Task] = {}  # env_id -> background streaming task
+_streamer_cache: dict[str, dict] = {}  # env_id -> {'env_data': ..., 'status': ..., 'raw_status': ...}
+
+# Terminal statuses that indicate the environment has finished
+_TERMINAL_STATUSES = {
+    "active", "success",  # Completed successfully
+    "ended", "inactive",  # Ended (may have outputs)
+    "active_with_error", "ended_with_error", "error", "failed", "terminating_failed",  # Errors
+    "released", "cancelled", "terminated", "force_terminated",  # Cancelled
+}
+
+
+async def _background_stream_grain_log(environment_id: str) -> None:
+    """Background task that streams grain log output to stderr for an async environment.
+    
+    Polls the grain log every 3 seconds and prints new filtered content.
+    Caches latest env_data/status in _streamer_cache for get_execution_status to read.
+    Stops when a terminal status is detected.
+    """
+    last_log_len = 0
+    filter_state = {'found': _config.get('verbose', False), 'buffer': ''}
+    
+    try:
+        while True:
+            await asyncio.sleep(2)
+            
+            try:
+                async with get_torque_client() as client:
+                    # Check status and cache it
+                    env_data = await client.get_environment_status(environment_id)
+                    details = env_data.get("details", {})
+                    raw_status = details.get("computed_status") or env_data.get("computed_status") or env_data.get("status", "unknown")
+                    status = raw_status.lower().replace(" ", "_")
+                    _streamer_cache[environment_id] = {
+                        'env_data': env_data,
+                        'status': status,
+                        'raw_status': raw_status,
+                    }
+                    
+                    # Stream new grain log content
+                    grain_log = await client.get_grain_log(environment_id) or ""
+                    if len(grain_log) > last_log_len:
+                        new_content = grain_log[last_log_len:]
+                        last_log_len = len(grain_log)
+                        if filter_state['found']:
+                            print(new_content, file=sys.stderr, end='', flush=True)
+                        else:
+                            filter_state['buffer'] += new_content
+                            match = _EXECUTION_MARKER.search(filter_state['buffer'])
+                            if match:
+                                filter_state['found'] = True
+                                after_marker = filter_state['buffer'][match.end():]
+                                if after_marker:
+                                    print(after_marker, file=sys.stderr, end='', flush=True)
+                                filter_state['buffer'] = ''
+                    
+                    if status in _TERMINAL_STATUSES:
+                        break
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass  # Ignore transient errors, keep polling
+    except asyncio.CancelledError:
+        pass
+    finally:
+        _background_streamers.pop(environment_id, None)
+
+
+def _start_background_streamer(environment_id: str) -> None:
+    """Start a background task to stream grain log output to stderr."""
+    # Don't start if one already exists for this environment
+    if environment_id in _background_streamers:
+        return
+    task = asyncio.create_task(_background_stream_grain_log(environment_id))
+    _background_streamers[environment_id] = task
+
+
+def _stop_background_streamer(environment_id: str) -> None:
+    """Stop the background streamer for an environment (if running)."""
+    task = _background_streamers.pop(environment_id, None)
+    if task and not task.done():
+        task.cancel()
 
 
 # --- Persistent container state file (CLI mode) ---
@@ -1316,7 +1398,7 @@ async def _ensure_persistent_container(
         # Check if we have it cached
         if environment_id in _persistent_containers:
             info = _persistent_containers[environment_id]
-            # Verify it's still alive
+            # Verify it's still alive (deploying/launching = SSH daemon still running)
             try:
                 async with get_torque_client() as client:
                     env_data = await client.get_environment_status(environment_id)
@@ -1326,35 +1408,35 @@ async def _ensure_persistent_container(
                         return dict(info)
             except Exception:
                 pass
-            # Container is gone - remove from cache
+            # Container is gone - remove from cache and fall through to create a new one
             del _persistent_containers[environment_id]
             if _default_persistent_container_id == environment_id:
                 _default_persistent_container_id = None
-            raise RuntimeError(f"Persistent container {environment_id} is no longer active")
-        
-        # Not cached - try to fetch details from Torque
-        try:
-            async with get_torque_client() as client:
-                env_data = await client.get_environment_status(environment_id)
-                current_state = env_data.get("details", {}).get("state", {}).get("current_state", "")
-                if current_state not in ("deploying", "launching"):
-                    raise RuntimeError(f"Environment {environment_id} is in state '{current_state}', not a running persistent container")
-                
-                # Fetch connection details from the deploy log
-                info = await client.get_persistent_container_info(environment_id)
-                container_entry = {
-                    "environment_id": environment_id,
-                    "container_ip": info["container_ip"],
-                    "container_id": info["container_id"],
-                    "private_key": info["private_key"],
-                    "agent": agent_name,
-                }
-                _persistent_containers[environment_id] = container_entry
-                _default_persistent_container_id = environment_id
-                print(f"[shellagent] Attached to persistent container: {info['container_id']} @ {info['container_ip']} (env: {environment_id})", file=sys.stderr, flush=True)
-                return dict(container_entry)
-        except Exception as e:
-            raise RuntimeError(f"Could not connect to persistent container {environment_id}: {e}")
+            print(f"[shellagent] Persistent container {environment_id} is no longer usable, creating a new one...", file=sys.stderr, flush=True)
+        else:
+            # Not cached - try to fetch details from Torque
+            try:
+                async with get_torque_client() as client:
+                    env_data = await client.get_environment_status(environment_id)
+                    current_state = env_data.get("details", {}).get("state", {}).get("current_state", "")
+                    if current_state not in ("deploying", "launching"):
+                        print(f"[shellagent] Environment {environment_id} is in state '{current_state}', creating a new container...", file=sys.stderr, flush=True)
+                    else:
+                        # Fetch connection details from the deploy log
+                        info = await client.get_persistent_container_info(environment_id)
+                        container_entry = {
+                            "environment_id": environment_id,
+                            "container_ip": info["container_ip"],
+                            "container_id": info["container_id"],
+                            "private_key": info["private_key"],
+                            "agent": agent_name,
+                        }
+                        _persistent_containers[environment_id] = container_entry
+                        _default_persistent_container_id = environment_id
+                        print(f"[shellagent] Attached to persistent container: {info['container_id']} @ {info['container_ip']} (env: {environment_id})", file=sys.stderr, flush=True)
+                        return dict(container_entry)
+            except Exception as e:
+                print(f"[shellagent] Could not connect to persistent container {environment_id}: {e}. Creating a new one...", file=sys.stderr, flush=True)
     
     # If new_container requested, always create a new one (don't release old ones)
     if not new_container:
@@ -1733,6 +1815,9 @@ async def handle_run_on_ssh_async(arguments: dict):
                 timeout=timeout,
             )
         
+        # Start background streaming of grain log to stderr
+        _start_background_streamer(environment_id)
+        
         env_url = f"{_config['torque_url']}/{_config['torque_space']}/environments/{environment_id}"
         
         files_summary = ""
@@ -1823,6 +1908,9 @@ async def handle_run_on_persistent_container_async(arguments: dict):
             except Exception:
                 pass
         
+        # Start background streaming of grain log to stderr
+        _start_background_streamer(environment_id)
+        
         env_url = f"{_config['torque_url']}/{_config['torque_space']}/environments/{environment_id}"
         agent_name = agent or _config["default_agent"]
         
@@ -1880,6 +1968,9 @@ async def handle_run_on_disposable_container_async(arguments: dict):
                 timeout=timeout,
             )
         
+        # Start background streaming of grain log to stderr
+        _start_background_streamer(environment_id)
+        
         env_url = f"{_config['torque_url']}/{_config['torque_space']}/environments/{environment_id}"
         agent_name = agent or _config["default_agent"]
         
@@ -1911,20 +2002,44 @@ async def handle_get_execution_status(arguments: dict):
     if not environment_id:
         return [TextContent(type="text", text="Error: environment_id is required.")]
     
-    # Wait before checking
-    if wait_seconds > 0:
-        await asyncio.sleep(wait_seconds)
+    # Wait with early exit — check the background streamer's cached status every second.
+    # The background streamer (started by the async handler) already polls the API and
+    # streams grain log to stderr, so we just piggyback on its cached results.
+    elapsed = 0.0
+    while elapsed < wait_seconds:
+        cached = _streamer_cache.get(environment_id)
+        if cached and cached['status'] in _TERMINAL_STATUSES:
+            break
+        sleep_time = min(1.0, wait_seconds - elapsed)
+        await asyncio.sleep(sleep_time)
+        elapsed += sleep_time
+    
+    # Use cached env_data if available, otherwise fall back to a direct API call
+    # (handles cases like server restart where no background streamer exists)
+    cached = _streamer_cache.get(environment_id)
     
     try:
-        async with get_torque_client() as client:
-            env_data = await client.get_environment_status(environment_id)
-            
+        if cached:
+            env_data = cached['env_data']
+            status = cached['status']
+            raw_status = cached['raw_status']
+        else:
+            async with get_torque_client() as client:
+                env_data = await client.get_environment_status(environment_id)
             details = env_data.get("details", {})
             raw_status = details.get("computed_status") or env_data.get("computed_status") or env_data.get("status", "unknown")
             status = raw_status.lower().replace(" ", "_")
-            
-            env_url = f"{_config['torque_url']}/{_config['torque_space']}/environments/{environment_id}"
-            
+        
+        details = env_data.get("details", {})
+        env_url = f"{_config['torque_url']}/{_config['torque_space']}/environments/{environment_id}"
+        
+        # Stop background streamer if terminal (it may already have stopped itself)
+        if status in _TERMINAL_STATUSES:
+            _stop_background_streamer(environment_id)
+            _streamer_cache.pop(environment_id, None)
+        
+        # We need a client for extracting outputs, cleanup, and grain log fetching
+        async with get_torque_client() as client:
             # Completed successfully
             if status in ("active", "success"):
                 outputs = client._extract_outputs(env_data)
@@ -2057,7 +2172,8 @@ This may indicate a deployment failure. Check the environment URL for details.""
                 try:
                     grain_log = await client.get_grain_log(environment_id)
                     if grain_log:
-                        log_block = format_code_block(grain_log[-2000:])  # Last 2000 chars
+                        filtered_log = filter_grain_log(grain_log)
+                        log_block = format_code_block(filtered_log[-2000:])
                         output_text += f"""
 
 **Grain Execution Log (tail):**
@@ -2072,9 +2188,7 @@ This may indicate a deployment failure. Check the environment URL for details.""
                 partial_output = ""
                 try:
                     grain_log = await client.get_grain_log(environment_id) or ""
-                    filtered = filter_grain_log(grain_log)
-                    timestamp_pattern = re.compile(r'^\[\d{2}:\d{2}:\d{2}\.\d{3}\] ', re.MULTILINE)
-                    partial_output = timestamp_pattern.sub('', filtered)
+                    partial_output = filter_grain_log(grain_log)
                 except Exception:
                     pass
                 
@@ -2104,9 +2218,7 @@ This may indicate a deployment failure. Check the environment URL for details.""
                 partial_output = ""
                 try:
                     grain_log = await client.get_grain_log(environment_id) or ""
-                    filtered = filter_grain_log(grain_log)
-                    timestamp_pattern = re.compile(r'^\[\d{2}:\d{2}:\d{2}\.\d{3}\] ', re.MULTILINE)
-                    partial_output = timestamp_pattern.sub('', filtered)
+                    partial_output = filter_grain_log(grain_log)
                 except Exception:
                     pass
                 
@@ -2142,6 +2254,10 @@ async def handle_cancel_execution(arguments: dict):
     
     if not environment_id:
         return [TextContent(type="text", text="Error: environment_id is required.")]
+    
+    # Stop background streamer for this environment
+    _stop_background_streamer(environment_id)
+    _streamer_cache.pop(environment_id, None)
     
     try:
         async with get_torque_client() as client:
