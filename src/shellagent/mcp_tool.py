@@ -1328,7 +1328,8 @@ async def handle_run_on_ssh(arguments: dict):
         
         if result.status == "completed":
             output_block = format_code_block(result.command_output)
-            output_text = f"""Command executed successfully on {target_ip}
+            success_msg = "Command executed successfully" if result.exit_code == 0 else "Command failed"
+            output_text = f"""{success_msg} on {target_ip}
 {files_summary}
 **Exit Code:** {result.exit_code}
 
@@ -1591,7 +1592,8 @@ async def handle_run_on_persistent_container(arguments: dict):
         
         if result.status == "completed":
             output_block = format_code_block(result.command_output)
-            output_text = f"""Command executed successfully on agent `{agent_name}`
+            success_msg = "Command executed successfully" if result.exit_code == 0 else "Command failed"
+            output_text = f"""{success_msg} on agent `{agent_name}`
 {files_summary}
 **Persistent Container:** {env_id}
 **Exit Code:** {result.exit_code}
@@ -1715,7 +1717,8 @@ async def handle_run_on_disposable_container(arguments: dict):
         
         if result.status == "completed":
             output_block = format_code_block(result.command_output)
-            output_text = f"""Command executed successfully on agent `{agent_name}`
+            success_msg = "Command executed successfully" if result.exit_code == 0 else "Command failed"
+            output_text = f"""{success_msg} on agent `{agent_name}`
 {files_summary}
 **Exit Code:** {result.exit_code}
 
@@ -2065,9 +2068,10 @@ async def handle_get_execution_status(arguments: dict):
                 duration_str = f"{int(duration // 60)}m {duration % 60:.1f}s" if duration and duration >= 60 else f"{duration:.1f}s" if duration else "N/A"
                 
                 output_block = format_code_block(command_output)
-                output_text = f"""Command completed.
+                status_msg = "Command completed." if exit_code == 0 else "Command failed."
+                output_text = f"""{status_msg}
 
-**Status:** COMPLETED
+**Status:** {"COMPLETED" if exit_code == 0 else "FAILED"}
 **Exit Code:** {exit_code}
 
 **Output:**
@@ -2116,9 +2120,10 @@ async def handle_get_execution_status(arguments: dict):
                     duration_str = f"{int(duration // 60)}m {duration % 60:.1f}s" if duration and duration >= 60 else f"{duration:.1f}s" if duration else "N/A"
                     
                     output_block = format_code_block(command_output)
-                    output_text = f"""Command completed.
+                    status_msg = "Command completed." if exit_code == 0 else "Command failed."
+                    output_text = f"""{status_msg}
 
-**Status:** COMPLETED
+**Status:** {"COMPLETED" if exit_code == 0 else "FAILED"}
 **Exit Code:** {exit_code}
 
 **Output:**
