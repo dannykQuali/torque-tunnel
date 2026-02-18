@@ -587,8 +587,13 @@ If you need to see partial output mid-execution (to make decisions or cancel ear
 use run_on_ssh_async instead - it returns immediately and lets you poll for partial output
 with get_execution_status. If you don't need intermediate output, this blocking tool is simpler.
 
-**WHEN TO USE THIS TOOL:**
-Use run_on_ssh (or run_on_ssh_async) whenever you need to execute a command on a REMOTE SERVER.
+**WHEN TO USE THIS TOOL vs regular SSH:**
+This MCP server exists to reach machines on a SEPARATE INTERNAL NETWORK that you have NO DIRECT
+SSH ACCESS to from your local machine. The Torque agent acts as a bridge into that network.
+- Target is on an unreachable internal/lab network → use this tool (run_on_ssh / run_on_ssh_async)
+- Target is on your LOCAL network, a local VM (VMware/VirtualBox), or directly SSH-reachable → use
+  a regular `ssh` command in the terminal instead. Do NOT use this tool for locally accessible machines.
+
 This tool handles the SSH connection for you - just provide host, user, private_key, and command.
 Prefer this over manually running `ssh` from a container - it's simpler and more efficient.
 (SSHing from a container is fine when you need extra logic around the SSH call that can't run as
@@ -709,7 +714,10 @@ This tool runs commands directly on the Torque agent container - NO SSH target n
 Unlike run_on_ssh, this doesn't connect to a remote server.
 
 **IMPORTANT - Choosing the right tool:**
-- To run a simple command on a REMOTE SERVER: prefer run_on_ssh instead - it handles SSH for you
+All tools on this MCP server are for machines on a SEPARATE INTERNAL NETWORK unreachable from your
+local machine. For targets on your local network or local VMs (VMware/VirtualBox), use regular
+terminal commands (ssh, scp, etc.) instead.
+- To run a command on a remote server (on the internal network): prefer run_on_ssh - it handles SSH for you
 - For one-off commands that don't need state: use THIS tool (disposable) - it's cheaper and faster
 - For multi-step workflows needing state across calls: use run_on_persistent_container
 
@@ -786,9 +794,13 @@ use run_on_persistent_container_async instead. If you don't need intermediate ou
 this blocking tool is simpler.
 
 **IMPORTANT - Only use persistent containers when you NEED state across multiple calls.**
+All tools on this MCP server are for machines on a SEPARATE INTERNAL NETWORK unreachable from your
+local machine. For targets on your local network or local VMs (VMware/VirtualBox), use regular
+terminal commands (ssh, scp, etc.) instead.
+
 Examples: install a tool, then use it later; build something incrementally; maintain a working directory.
 For one-off commands, use run_on_disposable_container instead - it's cheaper and faster.
-To run a simple command on a REMOTE SERVER, prefer run_on_ssh instead - it handles SSH for you.
+To run a command on a remote server (on the internal network), prefer run_on_ssh instead - it handles SSH for you.
 
 On the first call, a new container is automatically provisioned (~30-40 seconds one-time setup).
 Subsequent calls reuse the same container with near-zero overhead.
@@ -886,8 +898,13 @@ or cancel early. Call get_execution_status repeatedly to read output as it's pro
 If you don't need intermediate output, use run_on_ssh instead - it's simpler (one call
 instead of multiple).
 
-**WHEN TO USE THIS TOOL:**
-Use run_on_ssh_async whenever you need to execute a long-running command on a REMOTE SERVER.
+**WHEN TO USE THIS TOOL vs regular SSH:**
+This MCP server exists to reach machines on a SEPARATE INTERNAL NETWORK that you have NO DIRECT
+SSH ACCESS to from your local machine. The Torque agent acts as a bridge into that network.
+- Target is on an unreachable internal/lab network → use this tool (run_on_ssh_async / run_on_ssh)
+- Target is on your LOCAL network, a local VM (VMware/VirtualBox), or directly SSH-reachable → use
+  a regular `ssh` command in the terminal instead. Do NOT use this tool for locally accessible machines.
+
 This tool handles the SSH connection for you - just provide host, user, private_key, and command.
 Prefer this over manually running `ssh` from a container - it's simpler and more efficient.
 
@@ -976,9 +993,13 @@ If you don't need intermediate output, use run_on_persistent_container instead -
 (one call instead of multiple).
 
 **IMPORTANT - Only use persistent containers when you NEED state across multiple calls.**
+All tools on this MCP server are for machines on a SEPARATE INTERNAL NETWORK unreachable from your
+local machine. For targets on your local network or local VMs (VMware/VirtualBox), use regular
+terminal commands (ssh, scp, etc.) instead.
+
 Examples: install a tool, then use it later; build something incrementally; maintain a working directory.
 For one-off commands, use run_on_disposable_container_async instead - it's cheaper and faster.
-To run a simple command on a REMOTE SERVER, prefer run_on_ssh_async instead - it handles SSH for you.
+To run a command on a remote server (on the internal network), prefer run_on_ssh_async instead - it handles SSH for you.
 
 On the first call, a new container is automatically provisioned (~30-40 seconds one-time setup).
 Subsequent calls reuse the same container with near-zero overhead.
@@ -1070,7 +1091,10 @@ If you don't need intermediate output, use run_on_disposable_container instead -
 (one call instead of multiple).
 
 **IMPORTANT - Choosing the right tool:**
-- To run a simple command on a REMOTE SERVER: prefer run_on_ssh_async instead - it handles SSH for you
+All tools on this MCP server are for machines on a SEPARATE INTERNAL NETWORK unreachable from your
+local machine. For targets on your local network or local VMs (VMware/VirtualBox), use regular
+terminal commands (ssh, scp, etc.) instead.
+- To run a command on a remote server (on the internal network): prefer run_on_ssh_async - it handles SSH for you
 - For one-off commands that don't need state: use THIS tool (disposable) - it's cheaper and faster
 - For multi-step workflows needing state across calls: use run_on_persistent_container_async""",
             inputSchema={
