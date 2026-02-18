@@ -580,50 +580,26 @@ async def list_tools():
     """List available tools."""
     return [
         Tool(
-            name="run_on_ssh",
-            description="""Execute a shell command on a remote server via SSH. This tool BLOCKS until completion.
+            name="run_on_tunneled_ssh",
+            description="""Execute a shell command on a remote server via SSH. BLOCKS until completion.
+For partial output or cancel mid-execution, use run_on_tunneled_ssh_async instead.
 
-If you need to see partial output mid-execution (to make decisions or cancel early),
-use run_on_ssh_async instead - it returns immediately and lets you poll for partial output
-with get_execution_status. If you don't need intermediate output, this blocking tool is simpler.
+**WHEN TO USE vs regular SSH:**
+All tools on this MCP server reach machines on a SEPARATE INTERNAL NETWORK with no direct access
+from your machine. The Torque agent bridges into that network.
+- Unreachable internal/lab network target → use this tool
+- Local network, local VM (VMware/VirtualBox), or directly SSH-reachable → use regular `ssh` in terminal
 
-**WHEN TO USE THIS TOOL vs regular SSH:**
-This MCP server exists to reach machines on a SEPARATE INTERNAL NETWORK that you have NO DIRECT
-SSH ACCESS to from your local machine. The Torque agent acts as a bridge into that network.
-- Target is on an unreachable internal/lab network → use this tool (run_on_ssh / run_on_ssh_async)
-- Target is on your LOCAL network, a local VM (VMware/VirtualBox), or directly SSH-reachable → use
-  a regular `ssh` command in the terminal instead. Do NOT use this tool for locally accessible machines.
+Prefer this over running `ssh` from a container - simpler and more efficient.
 
-This tool handles the SSH connection for you - just provide host, user, private_key, and command.
-Prefer this over manually running `ssh` from a container - it's simpler and more efficient.
-(SSHing from a container is fine when you need extra logic around the SSH call that can't run as
-part of a single SSH session, e.g., installing tools first then using them to connect.)
+**private_key** accepts a file path (e.g., C:\\Users\\you\\.ssh\\id_rsa) OR raw key content ('-----BEGIN...').
 
-**SSH private_key parameter accepts BOTH:**
-- A file path on the local machine (e.g., C:\\Users\\you\\.ssh\\id_rsa, /home/user/.ssh/id_rsa)
-- The raw key content directly as a string (starting with '-----BEGIN')
-You do NOT need to save the key to a file first - just pass the key content directly.
+Can upload files AND run commands in one call. Order: files → init_commands → command → finally_commands. Use this along with chained commands to minimize calls and overhead and improve performance.
 
-This tool connects to a remote server using SSH credentials and can:
-1. Upload files/directories from your local machine to the remote server
-2. Execute shell commands on the remote server
-3. Both upload files AND run commands in a single operation (recommended for efficiency)
+**DANGEROUS COMMANDS** (may kill our Torque agent if running there):
+docker restart/stop/kill, systemctl restart docker, reboot, shutdown, init 0/6
 
-Execution order: files are deployed FIRST, then init_commands, then main command, then finally_commands.
-
-**CRITICAL WARNING - DANGEROUS COMMANDS:**
-The following commands may KILL the Torque agent and cause the operation to fail:
-- `docker restart`, `docker stop`, `docker kill` (any container operations that affect the agent)
-- `systemctl restart docker` or any Docker daemon restart
-- `reboot`, `shutdown`, `init 6`, `init 0`
-
-These commands require MANUAL execution via direct SSH or console access.
-
-**PERFORMANCE TIP:**
-Each invocation has significant roundtrip overhead. Consolidate operations:
-- Upload files AND run commands in one call
-- Chain commands: `cmd1 && cmd2 && cmd3`
-- Use the `files` parameter instead of multiple write operations""",
+**PERFORMANCE:** Each call has overhead. Chain commands (`cmd1 && cmd2`) with `files` param for uploads in a single call.""",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -702,43 +678,16 @@ Each invocation has significant roundtrip overhead. Consolidate operations:
             },
         ),
         Tool(
-            name="run_on_disposable_container",
-            description="""Execute a command on a fresh Torque agent container. This tool BLOCKS until completion.
+            name="run_on_tunneled_disposable_container",
+            description="""Execute a command directly on a fresh container spawned by Torque agent and then kills it. BLOCKS until completion.
+**Choosing the right tool** (all tools here reach an unreachable internal network -
+for local network/VMs use regular terminal commands):
+- Partial output or cancel mid-execution → run_on_tunneled_disposable_container_async.
+- Particular remote server on internal network → run_on_tunneled_ssh (handles SSH)
+- One-off container command, no state needed → THIS tool (cheaper/faster)
+- Multi-step workflow needing state across calls → run_on_tunneled_persistent_container
 
-If you need to see partial output mid-execution (to make decisions or cancel early),
-use run_on_disposable_container_async instead - it returns immediately and lets you poll
-for partial output with get_execution_status. If you don't need intermediate output,
-this blocking tool is simpler.
-
-This tool runs commands directly on the Torque agent container - NO SSH target needed.
-Unlike run_on_ssh, this doesn't connect to a remote server.
-
-**IMPORTANT - Choosing the right tool:**
-All tools on this MCP server are for machines on a SEPARATE INTERNAL NETWORK unreachable from your
-local machine. For targets on your local network or local VMs (VMware/VirtualBox), use regular
-terminal commands (ssh, scp, etc.) instead.
-- To run a command on a remote server (on the internal network): prefer run_on_ssh - it handles SSH for you
-- For one-off commands that don't need state: use THIS tool (disposable) - it's cheaper and faster
-- For multi-step workflows needing state across calls: use run_on_persistent_container
-
-**Use cases:**
-- Run tools/scripts available in the agent environment
-- Test network connectivity from the Torque infrastructure
-- Upload scripts and run them on the agent
-- Build/compile projects in a clean container environment
-- Operations that don't require a specific target machine
-
-**Files parameter:**
-You can upload files/directories to the agent container and then run commands on them.
-This is powerful because files persist for the entire command execution - unlike
-separate invocations which would get different containers.
-
-Execution order: files deployed FIRST, then init_commands, then main command.
-
-**PERFORMANCE TIP:**
-Each invocation spawns a fresh container. Consolidate operations:
-- Upload files AND run commands in one call
-- Chain commands: `cmd1 && cmd2 && cmd3`""",
+Can upload files AND run commands in one call. Order: files → init_commands → command → finally_commands. Use this along with chained commands to minimize calls and overhead and improve performance.""",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -785,56 +734,24 @@ Each invocation spawns a fresh container. Consolidate operations:
             },
         ),
         Tool(
-            name="run_on_persistent_container",
-            description="""Execute a command on a persistent Torque agent container. This tool BLOCKS until completion.
-The container persists across calls - files, installed packages, and environment variables are preserved.
+            name="run_on_tunneled_persistent_container",
+            description="""Execute a command on a persistent Torque agent container. BLOCKS until completion.
+State persists across calls (files, packages, env vars) without the need for a particular machine for SSH.
+For partial output or cancel mid-execution, use run_on_tunneled_persistent_container_async instead.
 
-If you need to see partial output mid-execution (to make decisions or cancel early),
-use run_on_persistent_container_async instead. If you don't need intermediate output,
-this blocking tool is simpler.
+**Only use when you NEED state across calls** (install then use a tool, incremental builds, etc.).
+All tools here reach an unreachable internal network - for local network/VMs, use terminal commands instead.
+For one-off commands: run_on_tunneled_disposable_container. For remote servers: run_on_tunneled_ssh.
 
-**IMPORTANT - Only use persistent containers when you NEED state across multiple calls.**
-All tools on this MCP server are for machines on a SEPARATE INTERNAL NETWORK unreachable from your
-local machine. For targets on your local network or local VMs (VMware/VirtualBox), use regular
-terminal commands (ssh, scp, etc.) instead.
+First call provisions ~30-40s. Subsequent calls reuse with near-zero overhead. Idle timeout: 2h default.
 
-Examples: install a tool, then use it later; build something incrementally; maintain a working directory.
-For one-off commands, use run_on_disposable_container instead - it's cheaper and faster.
-To run a command on a remote server (on the internal network), prefer run_on_ssh instead - it handles SSH for you.
+**Multiple containers:** `new_container=true` creates additional ones. `environment_id` targets a
+specific one. Output includes `Persistent Container: <env_id>` - save to target it later.
 
-On the first call, a new container is automatically provisioned (~30-40 seconds one-time setup).
-Subsequent calls reuse the same container with near-zero overhead.
-The container stays alive for a configurable idle timeout (default: 2 hours) after the last command.
+**After restart:** Pass previous `environment_id` to reconnect (works if not expired).
+Without the ID, a new container is created.
 
-**Multiple containers:** You can run multiple persistent containers simultaneously.
-Use `new_container=true` to create additional containers (old ones stay alive).
-Use `environment_id` to target a specific container by its persistent container environment ID.
-The output includes `Persistent Container: <env_id>` - save this ID to target that container later.
-
-**After restart (MCP/VSCode/machine):** The server loses its in-memory container cache, but
-containers keep running on the agent. To reconnect, pass the `environment_id` from a previous
-session. The server will automatically fetch the container's connection details from Torque.
-If you don't have the ID, a new container will be created.
-Note: containers are automatically terminated after the idle timeout (default 2 hours), so
-reconnection only works if the container hasn't expired.
-
-This tool runs commands directly on the Torque agent container - NO SSH target needed.
-Unlike run_on_ssh, this doesn't connect to a remote server.
-
-**Use cases (where state across calls matters):**
-- Install a tool once, then run multiple commands using it
-- Build projects incrementally across steps
-- Maintain working directories and environment between commands
-
-**Files parameter:**
-You can upload files/directories to the agent container and then run commands on them.
-
-Execution order: files deployed FIRST, then init_commands, then main command.
-
-**PERFORMANCE TIP:**
-Consolidate operations:
-- Upload files AND run commands in one call
-- Chain commands: `cmd1 && cmd2 && cmd3`""",
+Can upload files AND run commands in one call. Order: files → init_commands → command → finally_commands. Use this along with chained commands to minimize calls and overhead and improve performance.""",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -889,38 +806,18 @@ Consolidate operations:
             },
         ),
         Tool(
-            name="run_on_ssh_async",
-            description="""Execute a command on a remote server via SSH WITHOUT waiting for completion.
-Returns immediately with an environment ID. Use get_execution_status to poll for output and progress.
+            name="run_on_tunneled_ssh_async",
+            description="""Like run_on_tunneled_ssh but returns IMMEDIATELY with an environment ID.
+Use get_execution_status to poll output/progress. Use cancel_execution to abort.
+If you don't need intermediate output or cancel early, use run_on_tunneled_ssh instead (simpler, one call).
 
-Use this when you need to see partial output mid-execution - to learn from logs, make decisions,
-or cancel early. Call get_execution_status repeatedly to read output as it's produced.
-If you don't need intermediate output, use run_on_ssh instead - it's simpler (one call
-instead of multiple).
+Same network rules: only for unreachable internal network targets.
+For local network/VMs, use regular `ssh` in terminal.
 
-**WHEN TO USE THIS TOOL vs regular SSH:**
-This MCP server exists to reach machines on a SEPARATE INTERNAL NETWORK that you have NO DIRECT
-SSH ACCESS to from your local machine. The Torque agent acts as a bridge into that network.
-- Target is on an unreachable internal/lab network → use this tool (run_on_ssh_async / run_on_ssh)
-- Target is on your LOCAL network, a local VM (VMware/VirtualBox), or directly SSH-reachable → use
-  a regular `ssh` command in the terminal instead. Do NOT use this tool for locally accessible machines.
+**private_key** accepts a file path OR raw key content ('-----BEGIN...').
 
-This tool handles the SSH connection for you - just provide host, user, private_key, and command.
-Prefer this over manually running `ssh` from a container - it's simpler and more efficient.
-
-**SSH private_key parameter accepts BOTH:**
-- A file path on the local machine (e.g., ~/.ssh/id_rsa)
-- The raw key content directly as a string (starting with '-----BEGIN')
-You do NOT need to save the key to a file first - just pass the key content directly.
-
-Same parameters as run_on_ssh. The command starts executing immediately and you get
-the environment ID back to track progress.
-
-**CRITICAL WARNING - DANGEROUS COMMANDS:**
-The following commands may KILL the Torque agent and cause the operation to fail:
-- `docker restart`, `docker stop`, `docker kill` (any container operations that affect the agent)
-- `systemctl restart docker` or any Docker daemon restart
-- `reboot`, `shutdown`, `init 6`, `init 0`""",
+**DANGEROUS COMMANDS** (may kill our Torque agent if running there): docker restart/stop/kill,
+systemctl restart docker, reboot, shutdown, init 0/6""",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -983,50 +880,18 @@ The following commands may KILL the Torque agent and cause the operation to fail
             },
         ),
         Tool(
-            name="run_on_persistent_container_async",
-            description="""Execute a command on a persistent Torque agent container WITHOUT waiting for completion.
-Returns immediately with an environment ID. Use get_execution_status to poll for output and progress.
+            name="run_on_tunneled_persistent_container_async",
+            description="""Like run_on_tunneled_persistent_container but returns IMMEDIATELY with an environment ID.
+Use get_execution_status to poll output/progress. Use cancel_execution to abort.
+If you don't need intermediate output or cancel early, use run_on_tunneled_persistent_container instead (simpler).
 
-Use this when you need to see partial output mid-execution - to learn from logs, make decisions,
-or cancel early. Call get_execution_status repeatedly to read output as it's produced.
-If you don't need intermediate output, use run_on_persistent_container instead - it's simpler
-(one call instead of multiple).
+Only for unreachable internal network targets. For local network/VMs, use terminal commands.
+Only use when you NEED state across calls. One-off: run_on_tunneled_disposable_container_async.
+Remote server: run_on_tunneled_ssh_async.
 
-**IMPORTANT - Only use persistent containers when you NEED state across multiple calls.**
-All tools on this MCP server are for machines on a SEPARATE INTERNAL NETWORK unreachable from your
-local machine. For targets on your local network or local VMs (VMware/VirtualBox), use regular
-terminal commands (ssh, scp, etc.) instead.
-
-Examples: install a tool, then use it later; build something incrementally; maintain a working directory.
-For one-off commands, use run_on_disposable_container_async instead - it's cheaper and faster.
-To run a command on a remote server (on the internal network), prefer run_on_ssh_async instead - it handles SSH for you.
-
-On the first call, a new container is automatically provisioned (~30-40 seconds one-time setup).
-Subsequent calls reuse the same container with near-zero overhead.
-The container stays alive for a configurable idle timeout (default: 2 hours) after the last command.
-
-**Multiple containers:** You can run multiple persistent containers simultaneously.
-Use `new_container=true` to create additional containers (old ones stay alive).
-Use `environment_id` to target a specific container by its persistent container environment ID.
-The output includes `Persistent Container: <env_id>` - save this ID to target that container later.
-
-**After restart (MCP/VSCode/machine):** The server loses its in-memory container cache, but
-containers keep running on the agent. To reconnect, pass the `environment_id` from a previous
-session. The server will automatically fetch the container's connection details from Torque.
-If you don't have the ID, a new container will be created.
-Note: containers are automatically terminated after the idle timeout (default 2 hours), so
-reconnection only works if the container hasn't expired.
-
-This tool runs commands directly on the Torque agent container - NO SSH target needed.
-Unlike run_on_ssh_async, this doesn't connect to a remote server.
-
-**Key difference from run_on_ssh_async:**
-- run_on_ssh_async: SSH to a remote server (needs host, user, private_key)
-- run_on_persistent_container_async: Runs locally on the Torque agent container (no SSH needed)
-
-**Key difference from run_on_disposable_container_async:**
-- run_on_persistent_container_async: Persistent container - state persists across calls
-- run_on_disposable_container_async: Fresh container every time - nothing persists""",
+First call provisions ~30-40s. Subsequent calls reuse. Idle timeout: 2h default.
+`new_container=true` for additional containers. `environment_id` to target a specific one.
+After restart: pass previous `environment_id` to reconnect.""",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -1081,22 +946,15 @@ Unlike run_on_ssh_async, this doesn't connect to a remote server.
             },
         ),
         Tool(
-            name="run_on_disposable_container_async",
-            description="""Execute a command on a fresh Torque agent container WITHOUT waiting for completion.
-Returns immediately with an environment ID. Use get_execution_status to poll for output and progress.
+            name="run_on_tunneled_disposable_container_async",
+            description="""Like run_on_tunneled_disposable_container but returns IMMEDIATELY with an environment ID.
+Use get_execution_status to poll output/progress. Use cancel_execution to abort.
+If you don't need intermediate output or cancel early, use run_on_tunneled_disposable_container instead (simpler).
 
-Use this when you need to see partial output mid-execution - to learn from logs, make decisions,
-or cancel early. Call get_execution_status repeatedly to read output as it's produced.
-If you don't need intermediate output, use run_on_disposable_container instead - it's simpler
-(one call instead of multiple).
-
-**IMPORTANT - Choosing the right tool:**
-All tools on this MCP server are for machines on a SEPARATE INTERNAL NETWORK unreachable from your
-local machine. For targets on your local network or local VMs (VMware/VirtualBox), use regular
-terminal commands (ssh, scp, etc.) instead.
-- To run a command on a remote server (on the internal network): prefer run_on_ssh_async - it handles SSH for you
-- For one-off commands that don't need state: use THIS tool (disposable) - it's cheaper and faster
-- For multi-step workflows needing state across calls: use run_on_persistent_container_async""",
+Only for unreachable internal network targets. For local network/VMs, use terminal commands.
+- Remote server on internal network → run_on_tunneled_ssh_async
+- One-off container command → THIS tool
+- Multi-step with state → run_on_tunneled_persistent_container_async""",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -1144,22 +1002,14 @@ terminal commands (ssh, scp, etc.) instead.
         ),
         Tool(
             name="get_execution_status",
-            description="""Check the status and output of an async command started with run_on_ssh_async or run_on_persistent_container_async.
-
-Returns the current status (running/completed/failed), partial output if still running,
-or full output if completed. Use the `wait` parameter to avoid tight polling loops.
-
-Typical usage pattern:
-1. Call run_on_ssh_async or run_on_persistent_container_async to start a command
-2. Call get_execution_status with wait=10 to check after 10 seconds
-3. If still running, call again with wait=10-15
-4. When completed, get the full output""",
+            description="""Check status/output of an async command. Returns running/completed/failed with partial or full output.
+Use `wait` to avoid tight polling. Typical: wait=10, repeat until completed.""",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "environment_id": {
                         "type": "string",
-                        "description": "The environment ID returned by run_on_ssh_async or run_on_persistent_container_async.",
+                        "description": "The environment ID returned by run_on_tunneled_ssh_async or run_on_tunneled_persistent_container_async.",
                     },
                     "wait": {
                         "type": "integer",
@@ -1171,20 +1021,13 @@ Typical usage pattern:
         ),
         Tool(
             name="cancel_execution",
-            description="""Cancel a running async command started with run_on_ssh_async or run_on_persistent_container_async.
-
-Terminates the Torque environment, stopping the command. Use this when:
-- A command is taking too long and you want to abort
-- You started the wrong command
-- The partial output shows the command is failing and there's no point waiting
-
-The environment will be terminated and cleaned up.""",
+            description="""Cancel a running async command. Terminates the environment and stops execution.""",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "environment_id": {
                         "type": "string",
-                        "description": "The environment ID returned by run_on_ssh_async or run_on_persistent_container_async.",
+                        "description": "The environment ID returned by run_on_tunneled_ssh_async or run_on_tunneled_persistent_container_async.",
                     },
                 },
                 "required": ["environment_id"],
@@ -1197,23 +1040,23 @@ The environment will be terminated and cleaned up.""",
 async def call_tool(name: str, arguments: dict):
     """Handle tool calls."""
     
-    if name == "run_on_ssh":
-        return await handle_run_on_ssh(arguments)
+    if name == "run_on_tunneled_ssh":
+        return await handle_run_on_tunneled_ssh(arguments)
     
-    elif name == "run_on_persistent_container":
-        return await handle_run_on_persistent_container(arguments)
+    elif name == "run_on_tunneled_persistent_container":
+        return await handle_run_on_tunneled_persistent_container(arguments)
     
-    elif name == "run_on_disposable_container":
-        return await handle_run_on_disposable_container(arguments)
+    elif name == "run_on_tunneled_disposable_container":
+        return await handle_run_on_tunneled_disposable_container(arguments)
     
-    elif name == "run_on_ssh_async":
-        return await handle_run_on_ssh_async(arguments)
+    elif name == "run_on_tunneled_ssh_async":
+        return await handle_run_on_tunneled_ssh_async(arguments)
     
-    elif name == "run_on_persistent_container_async":
-        return await handle_run_on_persistent_container_async(arguments)
+    elif name == "run_on_tunneled_persistent_container_async":
+        return await handle_run_on_tunneled_persistent_container_async(arguments)
     
-    elif name == "run_on_disposable_container_async":
-        return await handle_run_on_disposable_container_async(arguments)
+    elif name == "run_on_tunneled_disposable_container_async":
+        return await handle_run_on_tunneled_disposable_container_async(arguments)
     
     elif name == "get_execution_status":
         return await handle_get_execution_status(arguments)
@@ -1225,7 +1068,7 @@ async def call_tool(name: str, arguments: dict):
         return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
 
-async def handle_run_on_ssh(arguments: dict):
+async def handle_run_on_tunneled_ssh(arguments: dict):
     """Execute a remote command via SSH, optionally uploading files first."""
     target_ip = arguments.get("host") or _config["default_target_ip"]
     ssh_user = arguments.get("user") or _config["default_ssh_user"]
@@ -1391,7 +1234,7 @@ async def handle_run_on_ssh(arguments: dict):
         
         # Add tip if command took >60s
         if result.execution_duration is not None and result.execution_duration > 60:
-            output_text += "\n\n**TIP:** This command took over 60 seconds. Consider using `run_on_ssh_async` for similar long-running commands to get progress updates while waiting."
+            output_text += "\n\n**TIP:** This command took over 60 seconds. Consider using `run_on_tunneled_ssh_async` for similar long-running commands to get progress updates while waiting."
         
         return [TextContent(type="text", text=output_text)]
     
@@ -1504,14 +1347,14 @@ async def _ensure_persistent_container(
         return dict(container_entry)
 
 
-async def handle_run_on_persistent_container(arguments: dict):
+async def handle_run_on_tunneled_persistent_container(arguments: dict):
     """Execute a command on a persistent Torque agent container via SSH.
     
     On first call, launches a persistent container with dropbear (SSH server). Subsequent calls
     reuse the same container. The command is executed by SSHing from a disposable
     grain container into the persistent container.
     
-    Reuses the same SSH execution logic as handle_run_on_ssh.
+    Reuses the same SSH execution logic as handle_run_on_tunneled_ssh.
     """
     command = arguments.get("command")
     files = arguments.get("files", [])
@@ -1600,7 +1443,7 @@ async def handle_run_on_persistent_container(arguments: dict):
             except Exception:
                 pass  # Non-critical
         
-        # Format output (same formatting as handle_run_on_ssh)
+        # Format output (same formatting as handle_run_on_tunneled_ssh)
         if result.execution_duration is not None:
             duration = result.execution_duration
             duration_str = f"{int(duration // 60)}m {duration % 60:.1f}s" if duration >= 60 else f"{duration:.1f}s"
@@ -1654,7 +1497,7 @@ async def handle_run_on_persistent_container(arguments: dict):
 {log_block}"""
         
         if result.execution_duration is not None and result.execution_duration > 60:
-            output_text += "\n\n**TIP:** This command took over 60 seconds. Consider using `run_on_persistent_container_async` for similar long-running commands to get progress updates while waiting."
+            output_text += "\n\n**TIP:** This command took over 60 seconds. Consider using `run_on_tunneled_persistent_container_async` for similar long-running commands to get progress updates while waiting."
         
         return [TextContent(type="text", text=output_text)]
     
@@ -1662,7 +1505,7 @@ async def handle_run_on_persistent_container(arguments: dict):
         return [TextContent(type="text", text=f"Error executing command on container: {str(e)}")]
 
 
-async def handle_run_on_disposable_container(arguments: dict):
+async def handle_run_on_tunneled_disposable_container(arguments: dict):
     """Execute a command on a fresh Torque agent container, optionally uploading files first."""
     command = arguments.get("command")
     files = arguments.get("files", [])
@@ -1780,7 +1623,7 @@ async def handle_run_on_disposable_container(arguments: dict):
         
         # Add tip if command took >60s
         if result.execution_duration is not None and result.execution_duration > 60:
-            output_text += "\n\n**TIP:** This command took over 60 seconds. Consider using `run_on_disposable_container_async` for similar long-running commands to get progress updates while waiting."
+            output_text += "\n\n**TIP:** This command took over 60 seconds. Consider using `run_on_tunneled_disposable_container_async` for similar long-running commands to get progress updates while waiting."
         
         return [TextContent(type="text", text=output_text)]
     
@@ -1788,7 +1631,7 @@ async def handle_run_on_disposable_container(arguments: dict):
         return [TextContent(type="text", text=f"Error executing command on agent: {str(e)}")]
 
 
-async def handle_run_on_ssh_async(arguments: dict):
+async def handle_run_on_tunneled_ssh_async(arguments: dict):
     """Start a remote SSH command without waiting for completion."""
     target_ip = arguments.get("host") or _config["default_target_ip"]
     ssh_user = arguments.get("user") or _config["default_ssh_user"]
@@ -1868,7 +1711,7 @@ Use `cancel_execution` with the same environment_id to abort if needed."""
         return [TextContent(type="text", text=f"Error starting async command: {str(e)}")]
 
 
-async def handle_run_on_persistent_container_async(arguments: dict):
+async def handle_run_on_tunneled_persistent_container_async(arguments: dict):
     """Start a command on the persistent container without waiting for completion.
     
     Blocks until the persistent container is up, then launches the command
@@ -1962,7 +1805,7 @@ Use `cancel_execution` with the same environment_id to abort if needed."""
         return [TextContent(type="text", text=f"Error starting async command on container: {str(e)}")]
 
 
-async def handle_run_on_disposable_container_async(arguments: dict):
+async def handle_run_on_tunneled_disposable_container_async(arguments: dict):
     """Start a disposable container command without waiting for completion."""
     command = arguments.get("command")
     files = arguments.get("files", [])
@@ -2107,7 +1950,7 @@ async def handle_get_execution_status(arguments: dict):
                 
                 # Tip for fast commands
                 if duration is not None and duration < 10:
-                    output_text += "\n\n**TIP:** This command completed in under 10 seconds. For quick commands like this, `run_on_ssh` or `run_on_persistent_container` provides simpler one-shot execution without polling."
+                    output_text += "\n\n**TIP:** This command completed in under 10 seconds. For quick commands like this, `run_on_tunneled_ssh` or `run_on_tunneled_persistent_container` provides simpler one-shot execution without polling."
                 
                 # Auto-cleanup
                 try:
