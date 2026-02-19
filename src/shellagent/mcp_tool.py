@@ -552,19 +552,22 @@ def _remove_container_from_state(env_id: str):
     _write_state(state)
 
 
-def get_torque_client() -> TorqueClient:
-    """Create a Torque client with current configuration."""
-    if not _config["torque_url"]:
+def get_torque_client(torque_url=None, torque_token=None, torque_space=None) -> TorqueClient:
+    """Create a Torque client with current configuration, with optional per-call overrides."""
+    url = torque_url or _config["torque_url"]
+    token = torque_token or _config["torque_token"]
+    space = torque_space or _config["torque_space"]
+    if not url:
         raise ValueError("Torque URL not configured. Set TORQUE_URL or use --torque-url")
-    if not _config["torque_token"]:
+    if not token:
         raise ValueError("Torque token not configured. Set TORQUE_TOKEN or use --torque-token")
-    if not _config["torque_space"]:
+    if not space:
         raise ValueError("Torque space not configured. Set TORQUE_SPACE or use --torque-space")
     
     return TorqueClient(
-        base_url=_config["torque_url"],
-        token=_config["torque_token"],
-        space=_config["torque_space"],
+        base_url=url,
+        token=token,
+        space=space,
         default_agent=_config["default_agent"],
         init_commands=_config["init_commands"],
         finally_commands=_config["finally_commands"],
@@ -586,7 +589,7 @@ For partial output or cancel mid-execution, use run_on_tunneled_ssh_async instea
 
 **WHEN TO USE vs regular SSH:**
 All tools on this MCP server reach machines on a SEPARATE INTERNAL NETWORK with no direct access
-from your machine. The Torque agent bridges into that network.
+from your machine. The Torque agent tunnels into that network.
 - Unreachable internal/lab network target → use this tool
 - Local network, local VM (VMware/VirtualBox), or directly SSH-reachable → use regular `ssh` in terminal
 
@@ -645,7 +648,7 @@ docker restart/stop/kill, systemctl restart docker, reboot, shutdown, init 0/6
                             "required": ["remote_path"],
                         },
                     },
-                    "agent": {
+                    "torque_agent": {
                         "type": "string",
                         "description": "Optional: The Torque agent name to use. If not specified, uses the default agent.",
                     },
@@ -685,7 +688,7 @@ for local network/VMs use regular terminal commands):
 - Partial output or cancel mid-execution → run_on_tunneled_disposable_container_async.
 - Particular remote server on internal network → run_on_tunneled_ssh (handles SSH)
 - One-off container command, no state needed → THIS tool (cheaper/faster)
-- Multi-step workflow needing state across calls → run_on_tunneled_persistent_container
+- Multi-step workflow needing state across calls (install then use a tool, incremental builds, etc.) → run_on_tunneled_persistent_container
 
 Can upload files AND run commands in one call. Order: files → init_commands → command → finally_commands. Use this along with chained commands to minimize calls and overhead and improve performance.""",
             inputSchema={
@@ -721,13 +724,25 @@ Can upload files AND run commands in one call. Order: files → init_commands �
                             "required": ["remote_path"],
                         },
                     },
-                    "agent": {
+                    "torque_agent": {
                         "type": "string",
                         "description": "Optional: The Torque agent name to use. If not specified, uses the default agent.",
                     },
                     "timeout": {
                         "type": "integer",
                         "description": "Optional: Maximum time in seconds. Default is 1800 (30 minutes).",
+                    },
+                    "torque_token": {
+                        "type": "string",
+                        "description": "Optional: Torque API token. Overrides global config.",
+                    },
+                    "torque_url": {
+                        "type": "string",
+                        "description": "Optional: Torque platform URL. Overrides global config.",
+                    },
+                    "torque_space": {
+                        "type": "string",
+                        "description": "Optional: Torque space name. Overrides global config.",
                     },
                 },
                 "required": [],
@@ -785,7 +800,7 @@ Can upload files AND run commands in one call. Order: files → init_commands �
                             "required": ["remote_path"],
                         },
                     },
-                    "agent": {
+                    "torque_agent": {
                         "type": "string",
                         "description": "Optional: The Torque agent name to use. If not specified, uses the default agent.",
                     },
@@ -800,6 +815,18 @@ Can upload files AND run commands in one call. Order: files → init_commands �
                     "environment_id": {
                         "type": "string",
                         "description": "Target a specific persistent container by its environment ID. If omitted, uses the most recently used container (or creates one).",
+                    },
+                    "torque_token": {
+                        "type": "string",
+                        "description": "Optional: Torque API token. Overrides global config.",
+                    },
+                    "torque_url": {
+                        "type": "string",
+                        "description": "Optional: Torque platform URL. Overrides global config.",
+                    },
+                    "torque_space": {
+                        "type": "string",
+                        "description": "Optional: Torque space name. Overrides global config.",
                     },
                 },
                 "required": [],
@@ -863,7 +890,7 @@ systemctl restart docker, reboot, shutdown, init 0/6""",
                             "required": ["remote_path"],
                         },
                     },
-                    "agent": {
+                    "torque_agent": {
                         "type": "string",
                         "description": "Optional: The Torque agent name to use.",
                     },
@@ -874,6 +901,18 @@ systemctl restart docker, reboot, shutdown, init 0/6""",
                     "timeout": {
                         "type": "integer",
                         "description": "Optional: Maximum time in seconds. Default is 1800 (30 minutes).",
+                    },
+                    "torque_token": {
+                        "type": "string",
+                        "description": "Optional: Torque API token. Overrides global config.",
+                    },
+                    "torque_url": {
+                        "type": "string",
+                        "description": "Optional: Torque platform URL. Overrides global config.",
+                    },
+                    "torque_space": {
+                        "type": "string",
+                        "description": "Optional: Torque space name. Overrides global config.",
                     },
                 },
                 "required": ["command"],
@@ -925,7 +964,7 @@ After restart: pass previous `environment_id` to reconnect.""",
                             "required": ["remote_path"],
                         },
                     },
-                    "agent": {
+                    "torque_agent": {
                         "type": "string",
                         "description": "Optional: The Torque agent name to use.",
                     },
@@ -940,6 +979,18 @@ After restart: pass previous `environment_id` to reconnect.""",
                     "timeout": {
                         "type": "integer",
                         "description": "Optional: Maximum time in seconds. Default is 1800 (30 minutes).",
+                    },
+                    "torque_token": {
+                        "type": "string",
+                        "description": "Optional: Torque API token. Overrides global config.",
+                    },
+                    "torque_url": {
+                        "type": "string",
+                        "description": "Optional: Torque platform URL. Overrides global config.",
+                    },
+                    "torque_space": {
+                        "type": "string",
+                        "description": "Optional: Torque space name. Overrides global config.",
                     },
                 },
                 "required": ["command"],
@@ -988,13 +1039,25 @@ Only for unreachable internal network targets. For local network/VMs, use termin
                             "required": ["remote_path"],
                         },
                     },
-                    "agent": {
+                    "torque_agent": {
                         "type": "string",
                         "description": "Optional: The Torque agent name to use.",
                     },
                     "timeout": {
                         "type": "integer",
                         "description": "Optional: Maximum time in seconds. Default is 1800 (30 minutes).",
+                    },
+                    "torque_token": {
+                        "type": "string",
+                        "description": "Optional: Torque API token. Overrides global config.",
+                    },
+                    "torque_url": {
+                        "type": "string",
+                        "description": "Optional: Torque platform URL. Overrides global config.",
+                    },
+                    "torque_space": {
+                        "type": "string",
+                        "description": "Optional: Torque space name. Overrides global config.",
                     },
                 },
                 "required": ["command"],
@@ -1075,7 +1138,7 @@ async def handle_run_on_tunneled_ssh(arguments: dict):
     private_key_value = arguments.get("private_key") or _config["default_ssh_key"]
     command = arguments.get("command")
     files = arguments.get("files", [])
-    agent = arguments.get("agent")
+    agent = arguments.get("torque_agent")
     allow_dangerous_commands = arguments.get("allow_dangerous_commands", False)
     timeout = arguments.get("timeout")  # Optional timeout override
     # Per-call auto_delete overrides global config if specified
@@ -1246,6 +1309,9 @@ async def _ensure_persistent_container(
     agent: Optional[str] = None,
     new_container: bool = False,
     environment_id: Optional[str] = None,
+    torque_url: Optional[str] = None,
+    torque_token: Optional[str] = None,
+    torque_space: Optional[str] = None,
 ) -> dict:
     """
     Ensure a persistent container is running and return its connection details.
@@ -1268,7 +1334,7 @@ async def _ensure_persistent_container(
             info = _persistent_containers[environment_id]
             # Verify it's still alive (deploying/launching = SSH daemon still running)
             try:
-                async with get_torque_client() as client:
+                async with get_torque_client(torque_url, torque_token, torque_space) as client:
                     env_data = await client.get_environment_status(environment_id)
                     current_state = env_data.get("details", {}).get("state", {}).get("current_state", "")
                     if current_state in ("deploying", "launching"):
@@ -1284,7 +1350,7 @@ async def _ensure_persistent_container(
         else:
             # Not cached - try to fetch details from Torque
             try:
-                async with get_torque_client() as client:
+                async with get_torque_client(torque_url, torque_token, torque_space) as client:
                     env_data = await client.get_environment_status(environment_id)
                     current_state = env_data.get("details", {}).get("state", {}).get("current_state", "")
                     if current_state not in ("deploying", "launching"):
@@ -1314,7 +1380,7 @@ async def _ensure_persistent_container(
             if (info.get("agent") or "") == (agent_name or ""):
                 # Verify it's still alive
                 try:
-                    async with get_torque_client() as client:
+                    async with get_torque_client(torque_url, torque_token, torque_space) as client:
                         env_data = await client.get_environment_status(_default_persistent_container_id)
                         current_state = env_data.get("details", {}).get("state", {}).get("current_state", "")
                         if current_state in ("deploying", "launching"):
@@ -1326,7 +1392,7 @@ async def _ensure_persistent_container(
                 _default_persistent_container_id = None
     
     # Launch a new persistent container  
-    async with get_torque_client() as client:
+    async with get_torque_client(torque_url, torque_token, torque_space) as client:
         env_id = await client.start_persistent_container(agent=agent_name)
         print(f"[shellagent] Launching persistent container (env: {env_id})...", file=sys.stderr, flush=True)
         
@@ -1358,10 +1424,13 @@ async def handle_run_on_tunneled_persistent_container(arguments: dict):
     """
     command = arguments.get("command")
     files = arguments.get("files", [])
-    agent = arguments.get("agent")
+    agent = arguments.get("torque_agent")
     timeout = arguments.get("timeout")
     new_container = arguments.get("new_container", False)
     target_env_id = arguments.get("environment_id")
+    torque_url = arguments.get("torque_url")
+    torque_token = arguments.get("torque_token")
+    torque_space = arguments.get("torque_space")
     
     # Must have at least command OR files
     if not command and not files:
@@ -1372,7 +1441,7 @@ async def handle_run_on_tunneled_persistent_container(arguments: dict):
     
     try:
         # Ensure we have a persistent container running
-        container_info = await _ensure_persistent_container(agent=agent, new_container=new_container, environment_id=target_env_id)
+        container_info = await _ensure_persistent_container(agent=agent, new_container=new_container, environment_id=target_env_id, torque_url=torque_url, torque_token=torque_token, torque_space=torque_space)
         container_ip = container_info["container_ip"]
         private_key = container_info["private_key"]
         env_id = container_info["environment_id"]
@@ -1408,7 +1477,7 @@ async def handle_run_on_tunneled_persistent_container(arguments: dict):
     
     try:
         # Reuse the SSH execution logic - SSH from a disposable grain into the persistent container
-        async with get_torque_client() as client:
+        async with get_torque_client(torque_url, torque_token, torque_space) as client:
             result = await client.execute_remote_command(
                 target_ip=container_ip,
                 ssh_user="root",
@@ -1450,7 +1519,7 @@ async def handle_run_on_tunneled_persistent_container(arguments: dict):
         else:
             duration_str = "N/A"
         
-        env_url = f"{_config['torque_url']}/{_config['torque_space']}/environments/{result.environment_id}"
+        env_url = f"{torque_url or _config['torque_url']}/{torque_space or _config['torque_space']}/environments/{result.environment_id}"
         agent_name = agent or _config["default_agent"]
         
         files_summary = ""
@@ -1509,8 +1578,11 @@ async def handle_run_on_tunneled_disposable_container(arguments: dict):
     """Execute a command on a fresh Torque agent container, optionally uploading files first."""
     command = arguments.get("command")
     files = arguments.get("files", [])
-    agent = arguments.get("agent")
+    agent = arguments.get("torque_agent")
     timeout = arguments.get("timeout")  # Optional timeout override
+    torque_url = arguments.get("torque_url")
+    torque_token = arguments.get("torque_token")
+    torque_space = arguments.get("torque_space")
     
     # Must have at least command OR files
     if not command and not files:
@@ -1549,7 +1621,7 @@ async def handle_run_on_tunneled_disposable_container(arguments: dict):
         pass  # Streaming not available
     
     try:
-        async with get_torque_client() as client:
+        async with get_torque_client(torque_url, torque_token, torque_space) as client:
             result = await client.execute_local_command(
                 command=effective_command,
                 agent=agent,
@@ -1574,7 +1646,7 @@ async def handle_run_on_tunneled_disposable_container(arguments: dict):
             duration_str = "N/A"
         
         # Build environment URL for reference
-        env_url = f"{_config['torque_url']}/{_config['torque_space']}/environments/{result.environment_id}"
+        env_url = f"{torque_url or _config['torque_url']}/{torque_space or _config['torque_space']}/environments/{result.environment_id}"
         agent_name = agent or _config["default_agent"]
         
         # Build files summary if any were uploaded
@@ -1638,9 +1710,12 @@ async def handle_run_on_tunneled_ssh_async(arguments: dict):
     private_key_value = arguments.get("private_key") or _config["default_ssh_key"]
     command = arguments.get("command")
     files = arguments.get("files", [])
-    agent = arguments.get("agent")
+    agent = arguments.get("torque_agent")
     allow_dangerous_commands = arguments.get("allow_dangerous_commands", False)
     timeout = arguments.get("timeout")
+    torque_url = arguments.get("torque_url")
+    torque_token = arguments.get("torque_token")
+    torque_space = arguments.get("torque_space")
     
     if not command and not files:
         return [TextContent(type="text", text="Error: Must provide either 'command' or 'files' (or both).")]
@@ -1674,7 +1749,7 @@ async def handle_run_on_tunneled_ssh_async(arguments: dict):
     effective_command = command or "echo 'Files deployed successfully'"
     
     try:
-        async with get_torque_client() as client:
+        async with get_torque_client(torque_url, torque_token, torque_space) as client:
             environment_id = await client.start_environment(
                 target_ip=target_ip,
                 ssh_user=ssh_user,
@@ -1688,7 +1763,7 @@ async def handle_run_on_tunneled_ssh_async(arguments: dict):
         # Start background streaming of grain log to stderr
         _start_background_streamer(environment_id)
         
-        env_url = f"{_config['torque_url']}/{_config['torque_space']}/environments/{environment_id}"
+        env_url = f"{torque_url or _config['torque_url']}/{torque_space or _config['torque_space']}/environments/{environment_id}"
         
         files_summary = ""
         if files_info:
@@ -1719,17 +1794,20 @@ async def handle_run_on_tunneled_persistent_container_async(arguments: dict):
     """
     command = arguments.get("command")
     files = arguments.get("files", [])
-    agent = arguments.get("agent")
+    agent = arguments.get("torque_agent")
     new_container = arguments.get("new_container", False)
     target_env_id = arguments.get("environment_id")
     timeout = arguments.get("timeout")
+    torque_url = arguments.get("torque_url")
+    torque_token = arguments.get("torque_token")
+    torque_space = arguments.get("torque_space")
     
     if not command and not files:
         return [TextContent(type="text", text="Error: Must provide either 'command' or 'files' (or both).")]
     
     try:
         # Ensure persistent container is up (this blocks until ready)
-        container_info = await _ensure_persistent_container(agent=agent, new_container=new_container, environment_id=target_env_id)
+        container_info = await _ensure_persistent_container(agent=agent, new_container=new_container, environment_id=target_env_id, torque_url=torque_url, torque_token=torque_token, torque_space=torque_space)
         container_ip = container_info["container_ip"]
         private_key = container_info["private_key"]
         env_id = container_info["environment_id"]
@@ -1752,7 +1830,7 @@ async def handle_run_on_tunneled_persistent_container_async(arguments: dict):
     
     try:
         # Start the SSH command asynchronously - SSH from disposable grain into persistent container
-        async with get_torque_client() as client:
+        async with get_torque_client(torque_url, torque_token, torque_space) as client:
             environment_id = await client.start_environment(
                 target_ip=container_ip,
                 ssh_user="root",
@@ -1781,7 +1859,7 @@ async def handle_run_on_tunneled_persistent_container_async(arguments: dict):
         # Start background streaming of grain log to stderr
         _start_background_streamer(environment_id)
         
-        env_url = f"{_config['torque_url']}/{_config['torque_space']}/environments/{environment_id}"
+        env_url = f"{torque_url or _config['torque_url']}/{torque_space or _config['torque_space']}/environments/{environment_id}"
         agent_name = agent or _config["default_agent"]
         
         files_summary = ""
@@ -1809,8 +1887,11 @@ async def handle_run_on_tunneled_disposable_container_async(arguments: dict):
     """Start a disposable container command without waiting for completion."""
     command = arguments.get("command")
     files = arguments.get("files", [])
-    agent = arguments.get("agent")
+    agent = arguments.get("torque_agent")
     timeout = arguments.get("timeout")
+    torque_url = arguments.get("torque_url")
+    torque_token = arguments.get("torque_token")
+    torque_space = arguments.get("torque_space")
     
     if not command and not files:
         return [TextContent(type="text", text="Error: Must provide either 'command' or 'files' (or both).")]
@@ -1830,7 +1911,7 @@ async def handle_run_on_tunneled_disposable_container_async(arguments: dict):
     effective_command = command or "echo 'Files deployed successfully'"
     
     try:
-        async with get_torque_client() as client:
+        async with get_torque_client(torque_url, torque_token, torque_space) as client:
             environment_id = await client.start_local_environment(
                 command=effective_command,
                 agent=agent,
@@ -1841,7 +1922,7 @@ async def handle_run_on_tunneled_disposable_container_async(arguments: dict):
         # Start background streaming of grain log to stderr
         _start_background_streamer(environment_id)
         
-        env_url = f"{_config['torque_url']}/{_config['torque_space']}/environments/{environment_id}"
+        env_url = f"{torque_url or _config['torque_url']}/{torque_space or _config['torque_space']}/environments/{environment_id}"
         agent_name = agent or _config["default_agent"]
         
         files_summary = ""
@@ -2290,7 +2371,7 @@ async def cli_dispatch(args):
             target_ip = _config["default_target_ip"]
             ssh_user = getattr(args, 'user', None) or _config["default_ssh_user"]
             ssh_key_path = getattr(args, 'key', None) or _config["default_ssh_key"]
-            agent = getattr(args, 'agent', None)
+            agent = getattr(args, 'torque_agent', None)
             timeout = getattr(args, 'timeout', None)
             allow_dangerous_commands = getattr(args, 'allow_dangerous_commands', False)
             output_json = getattr(args, 'json', False)
@@ -2364,7 +2445,7 @@ async def cli_dispatch(args):
         
         elif args.command in ("persistent-container", "container"):
             # Persistent container command
-            agent = getattr(args, 'agent', None)
+            agent = getattr(args, 'torque_agent', None)
             timeout = getattr(args, 'timeout', None)
             output_json = getattr(args, 'json', False)
             uploads = parse_uploads(getattr(args, 'upload', None))
@@ -2564,7 +2645,7 @@ async def cli_dispatch(args):
         
         elif args.command == "disposable-container":
             # Disposable container command (with optional file uploads)
-            agent = getattr(args, 'agent', None)
+            agent = getattr(args, 'torque_agent', None)
             timeout = getattr(args, 'timeout', None)
             output_json = getattr(args, 'json', False)
             uploads = parse_uploads(getattr(args, 'upload', None))
@@ -2620,7 +2701,7 @@ async def cli_dispatch(args):
             target_ip = _config["default_target_ip"]
             ssh_user = getattr(args, 'user', None) or _config["default_ssh_user"]
             ssh_key_path = getattr(args, 'key', None) or _config["default_ssh_key"]
-            agent = getattr(args, 'agent', None)
+            agent = getattr(args, 'torque_agent', None)
             timeout = getattr(args, 'timeout', None)
             max_size = getattr(args, 'max_size', 102400)
             
@@ -2661,7 +2742,7 @@ async def cli_dispatch(args):
             target_ip = _config["default_target_ip"]
             ssh_user = getattr(args, 'user', None) or _config["default_ssh_user"]
             ssh_key_path = getattr(args, 'key', None) or _config["default_ssh_key"]
-            agent = getattr(args, 'agent', None)
+            agent = getattr(args, 'torque_agent', None)
             timeout = getattr(args, 'timeout', None)
             show_all = getattr(args, 'all', False)
             long_format = getattr(args, 'long', False)
@@ -2858,7 +2939,6 @@ PERFORMANCE TIP:
     ssh_parser.add_argument("cmd", nargs='?', help="The shell command to execute (optional if --upload used)")
     ssh_parser.add_argument("--user", "-u", help="SSH username (overrides --ssh-user)")
     ssh_parser.add_argument("--key", "-k", help="SSH private key - file path or key content (overrides --ssh-key)")
-    ssh_parser.add_argument("--agent", "-a", help="Torque agent name (overrides default)")
     ssh_parser.add_argument("--timeout", type=int, help="Timeout in seconds")
     ssh_parser.add_argument("--allow-dangerous-commands", action="store_true", help="Bypass dangerous command warnings (use with extreme caution)")
     ssh_parser.add_argument("--json", "-j", action="store_true", help="Output as JSON")
@@ -2871,7 +2951,6 @@ PERFORMANCE TIP:
     pc_parser.add_argument("cmd", nargs='?', help="The shell command to execute, or a sub-action: create, list, release")
     pc_parser.add_argument("--env-id", help="Target a specific persistent container by environment ID")
     pc_parser.add_argument("--new", action="store_true", help="Create a new container (keeps existing ones alive)")
-    pc_parser.add_argument("--agent", "-a", help="Torque agent name (overrides default)")
     pc_parser.add_argument("--timeout", type=int, help="Timeout in seconds")
     pc_parser.add_argument("--json", "-j", action="store_true", help="Output as JSON")
     pc_parser.add_argument("--upload", action="append", metavar="LOCAL:REMOTE[:MODE]",
@@ -2884,7 +2963,6 @@ PERFORMANCE TIP:
     c_parser.add_argument("cmd", nargs='?', help="The shell command to execute, or a sub-action: create, list, release")
     c_parser.add_argument("--env-id", help="Target a specific persistent container by environment ID")
     c_parser.add_argument("--new", action="store_true", help="Create a new container (keeps existing ones alive)")
-    c_parser.add_argument("--agent", "-a", help="Torque agent name (overrides default)")
     c_parser.add_argument("--timeout", type=int, help="Timeout in seconds")
     c_parser.add_argument("--json", "-j", action="store_true", help="Output as JSON")
     c_parser.add_argument("--upload", action="append", metavar="LOCAL:REMOTE[:MODE]",
@@ -2895,7 +2973,6 @@ PERFORMANCE TIP:
     dc_parser = subparsers.add_parser("disposable-container", parents=[common_parser],
                                        help="Execute a command on a fresh disposable Torque agent container (nothing persists)")
     dc_parser.add_argument("cmd", nargs='?', help="The shell command to execute (optional if --upload used)")
-    dc_parser.add_argument("--agent", "-a", help="Torque agent name (overrides default)")
     dc_parser.add_argument("--timeout", type=int, help="Timeout in seconds")
     dc_parser.add_argument("--json", "-j", action="store_true", help="Output as JSON")
     dc_parser.add_argument("--upload", action="append", metavar="LOCAL:REMOTE[:MODE]",
@@ -2906,7 +2983,6 @@ PERFORMANCE TIP:
     read_parser.add_argument("path", help="Remote file path to read")
     read_parser.add_argument("--user", "-u", help="SSH username")
     read_parser.add_argument("--key", "-k", help="SSH private key - file path or key content")
-    read_parser.add_argument("--agent", "-a", help="Torque agent name")
     read_parser.add_argument("--timeout", type=int, help="Timeout in seconds")
     read_parser.add_argument("--max-size", type=int, default=102400, help="Max file size in bytes (default: 100KB)")
     
@@ -2915,7 +2991,6 @@ PERFORMANCE TIP:
     list_parser.add_argument("path", help="Remote directory path")
     list_parser.add_argument("--user", "-u", help="SSH username")
     list_parser.add_argument("--key", "-k", help="SSH private key - file path or key content")
-    list_parser.add_argument("--agent", "-a", help="Torque agent name")
     list_parser.add_argument("--timeout", type=int, help="Timeout in seconds")
     list_parser.add_argument("--all", "-A", action="store_true", help="Show hidden files")
     list_parser.add_argument("--long", "-l", action="store_true", help="Long format with details")
