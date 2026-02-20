@@ -1,7 +1,7 @@
 {
   "servers": {
-    "shellagent": {
-      "command": "C:\\ZeroTouch\\ShellAgent\\.venv\\Scripts\\shellagent.exe",
+    "torque-tunnel": {
+      "command": "C:\\ZeroTouch\\ShellAgent\\.venv\\Scripts\\torque-tunnel.exe",
       "args": [
         "--torque-url", "https://review1.qualilabs.net",
         "--torque-token", "------------------------------REDACTED------------------------------",

@@ -3,9 +3,9 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "shellagent"
+name = "torque-tunnel"
 version = "0.1.0"
-description = "MCP tool for executing remote commands via Torque Shell Grains"
+description = "MCP tool for executing remote commands via Torque tunneled infrastructure"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
@@ -17,7 +17,7 @@ dependencies = [
 ]
 
 [project.scripts]
-shellagent = "shellagent.mcp_tool:main"
+torque-tunnel = "torque_tunnel.mcp_tool:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

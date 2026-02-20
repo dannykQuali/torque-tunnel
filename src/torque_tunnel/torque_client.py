@@ -828,7 +828,7 @@ class TorqueClient:
         """
         Wait for a persistent container to be ready and extract connection details.
         
-        Polls the deploy log for the SHELLAGENT::READY marker and extracts
+        Polls the deploy log for the wire-protocol READY marker and extracts
         the container IP and SSH private key.
         
         Args:
@@ -893,21 +893,21 @@ class TorqueClient:
                     
                     # Check for READY marker as a line-start (not inside printf echo)
                     # Torque echoes the script source before running it, so
-                    # "printf 'SHELLAGENT::READY\n'" appears in the echo section.
-                    # Actual output lines start with SHELLAGENT:: directly.
-                    if re.search(r'^SHELLAGENT::READY', clean_log, re.MULTILINE):
+                    # "printf 'TORQUE_TUNNEL::READY\n'" appears in the echo section.
+                    # Actual output lines start with the marker prefix directly.
+                    if re.search(r'^TORQUE_TUNNEL::READY', clean_log, re.MULTILINE):
                         # Parse connection details from actual output lines
                         info = {}
                         
-                        ip_match = re.search(r'^SHELLAGENT::CONTAINER_IP=(\S+)', clean_log, re.MULTILINE)
+                        ip_match = re.search(r'^TORQUE_TUNNEL::CONTAINER_IP=(\S+)', clean_log, re.MULTILINE)
                         if ip_match:
                             info['container_ip'] = ip_match.group(1)
                         
-                        id_match = re.search(r'^SHELLAGENT::CONTAINER_ID=(\S+)', clean_log, re.MULTILINE)
+                        id_match = re.search(r'^TORQUE_TUNNEL::CONTAINER_ID=(\S+)', clean_log, re.MULTILINE)
                         if id_match:
                             info['container_id'] = id_match.group(1)
                         
-                        key_match = re.search(r'^SHELLAGENT::KEY_START\s*\n(.*?)^SHELLAGENT::KEY_END', clean_log, re.MULTILINE | re.DOTALL)
+                        key_match = re.search(r'^TORQUE_TUNNEL::KEY_START\s*\n(.*?)^TORQUE_TUNNEL::KEY_END', clean_log, re.MULTILINE | re.DOTALL)
                         if key_match:
                             info['private_key'] = key_match.group(1).strip()
                         

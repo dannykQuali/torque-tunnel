@@ -1,8 +1,8 @@
 """
-ShellAgent MCP Tool - Execute remote commands via Torque Shell Grains.
+torque-tunnel MCP Tool - Execute remote commands via Torque tunneled infrastructure.
 
 This MCP tool provides Copilot with the ability to run commands on remote servers
-by leveraging Torque's Shell Grain infrastructure.
+by tunneling through Torque's agent infrastructure into unreachable networks.
 """
 
 import base64
@@ -74,7 +74,7 @@ def create_log_streamer(session) -> Callable[[str, str], Awaitable[None]]:
             if state['found']:
                 # Already past marker - print everything
                 print(content, file=sys.stderr, end='', flush=True)
-                session.send_log_message(level="info", data=content, logger="shellagent.grain_log")
+                session.send_log_message(level="info", data=content, logger="torque_tunnel.grain_log")
                 return
             
             # Buffer data to handle markers split across chunks
@@ -90,7 +90,7 @@ def create_log_streamer(session) -> Callable[[str, str], Awaitable[None]]:
                     env_info = f". {env_url}" if environment_id else ""
                     output = f"{first_line}{env_info}\n"
                     print(output, file=sys.stderr, end='', flush=True)
-                    session.send_log_message(level="info", data=output, logger="shellagent.grain_log")
+                    session.send_log_message(level="info", data=output, logger="torque_tunnel.grain_log")
                     state['first_line_shown'] = True
             
             # Look for execution marker
@@ -101,7 +101,7 @@ def create_log_streamer(session) -> Callable[[str, str], Awaitable[None]]:
                 after_marker = state['buffer'][match.end():]
                 if after_marker:
                     print(after_marker, file=sys.stderr, end='', flush=True)
-                    session.send_log_message(level="info", data=after_marker, logger="shellagent.grain_log")
+                    session.send_log_message(level="info", data=after_marker, logger="torque_tunnel.grain_log")
                 state['buffer'] = ''
         except Exception:
             pass  # Ignore streaming errors
@@ -502,7 +502,7 @@ def _stop_background_streamer(environment_id: str) -> None:
 def _state_file_path() -> str:
     """Get the path to the persistent container state file."""
     from pathlib import Path
-    state_dir = Path.home() / ".shellagent"
+    state_dir = Path.home() / ".torque-tunnel"
     state_dir.mkdir(exist_ok=True)
     return str(state_dir / "containers.json")
 
@@ -575,7 +575,7 @@ def get_torque_client(torque_url=None, torque_token=None, torque_space=None) -> 
 
 
 # Create MCP server
-server = Server("shellagent")
+server = Server("torque-tunnel")
 
 
 @server.list_tools()
@@ -1346,7 +1346,7 @@ async def _ensure_persistent_container(
             del _persistent_containers[environment_id]
             if _default_persistent_container_id == environment_id:
                 _default_persistent_container_id = None
-            print(f"[shellagent] Persistent container {environment_id} is no longer usable, creating a new one...", file=sys.stderr, flush=True)
+            print(f"[torque-tunnel] Persistent container {environment_id} is no longer usable, creating a new one...", file=sys.stderr, flush=True)
         else:
             # Not cached - try to fetch details from Torque
             try:
@@ -1354,7 +1354,7 @@ async def _ensure_persistent_container(
                     env_data = await client.get_environment_status(environment_id)
                     current_state = env_data.get("details", {}).get("state", {}).get("current_state", "")
                     if current_state not in ("deploying", "launching"):
-                        print(f"[shellagent] Environment {environment_id} is in state '{current_state}', creating a new container...", file=sys.stderr, flush=True)
+                        print(f"[torque-tunnel] Environment {environment_id} is in state '{current_state}', creating a new container...", file=sys.stderr, flush=True)
                     else:
                         # Fetch connection details from the deploy log
                         info = await client.get_persistent_container_info(environment_id)
@@ -1367,10 +1367,10 @@ async def _ensure_persistent_container(
                         }
                         _persistent_containers[environment_id] = container_entry
                         _default_persistent_container_id = environment_id
-                        print(f"[shellagent] Attached to persistent container: {info['container_id']} @ {info['container_ip']} (env: {environment_id})", file=sys.stderr, flush=True)
+                        print(f"[torque-tunnel] Attached to persistent container: {info['container_id']} @ {info['container_ip']} (env: {environment_id})", file=sys.stderr, flush=True)
                         return dict(container_entry)
             except Exception as e:
-                print(f"[shellagent] Could not connect to persistent container {environment_id}: {e}. Creating a new one...", file=sys.stderr, flush=True)
+                print(f"[torque-tunnel] Could not connect to persistent container {environment_id}: {e}. Creating a new one...", file=sys.stderr, flush=True)
     
     # If new_container requested, always create a new one (don't release old ones)
     if not new_container:
@@ -1394,7 +1394,7 @@ async def _ensure_persistent_container(
     # Launch a new persistent container  
     async with get_torque_client(torque_url, torque_token, torque_space) as client:
         env_id = await client.start_persistent_container(agent=agent_name)
-        print(f"[shellagent] Launching persistent container (env: {env_id})...", file=sys.stderr, flush=True)
+        print(f"[torque-tunnel] Launching persistent container (env: {env_id})...", file=sys.stderr, flush=True)
         
         info = await client.get_persistent_container_info(env_id)
         
@@ -1408,7 +1408,7 @@ async def _ensure_persistent_container(
         _persistent_containers[env_id] = container_entry
         _default_persistent_container_id = env_id
         
-        print(f"[shellagent] Persistent container ready: {info['container_id']} @ {info['container_ip']} (env: {env_id})", file=sys.stderr, flush=True)
+        print(f"[torque-tunnel] Persistent container ready: {info['container_id']} @ {info['container_ip']} (env: {env_id})", file=sys.stderr, flush=True)
         
         return dict(container_entry)
 
@@ -2865,7 +2865,7 @@ def main():
     # Main parser with subcommands - also inherits common args for when no subcommand is given
     parser = argparse.ArgumentParser(
         parents=[common_parser],
-        description="ShellAgent - Execute remote commands via Torque (MCP server or CLI)",
+        description="torque-tunnel - Execute remote commands via Torque (MCP server or CLI)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Modes:
@@ -2877,23 +2877,23 @@ Modes:
 
 Examples:
   # Run as MCP server (for VS Code)
-  shellagent serve
+  torque-tunnel serve
 
   # CLI mode - run a command on a remote server
-  shellagent ssh "uname -a"
-  shellagent ssh --host 10.0.0.1 --user root "df -h"
+  torque-tunnel ssh "uname -a"
+  torque-tunnel ssh --host 10.0.0.1 --user root "df -h"
 
   # CLI mode - upload files and run a command on remote server
-  shellagent ssh --upload ./script.sh:/tmp/script.sh:755 "bash /tmp/script.sh"
-  shellagent ssh --upload ./config.yaml:/etc/app/config.yaml --upload ./data:/var/data "cat /etc/app/config.yaml"
+  torque-tunnel ssh --upload ./script.sh:/tmp/script.sh:755 "bash /tmp/script.sh"
+  torque-tunnel ssh --upload ./config.yaml:/etc/app/config.yaml --upload ./data:/var/data "cat /etc/app/config.yaml"
 
   # CLI mode - run on the Torque agent container directly
-  shellagent container "curl https://example.com"
-  shellagent container --upload ./test.py:/tmp/test.py "python /tmp/test.py"
+  torque-tunnel container "curl https://example.com"
+  torque-tunnel container --upload ./test.py:/tmp/test.py "python /tmp/test.py"
 
   # CLI mode - read/list files
-  shellagent read /etc/hostname
-  shellagent list /var/log
+  torque-tunnel read /etc/hostname
+  torque-tunnel list /var/log
 
 Environment Variables:
   TORQUE_URL, TORQUE_TOKEN, TORQUE_SPACE, TORQUE_AGENT
@@ -2916,16 +2916,16 @@ DANGEROUS COMMANDS (may kill the Torque agent):
 LONG-RUNNING COMMANDS:
   Default timeout is 30 minutes. Use --timeout to extend.
   For very long operations, run in background:
-    shellagent ssh "nohup command > /tmp/output.log 2>&1 &"
+    torque-tunnel ssh "nohup command > /tmp/output.log 2>&1 &"
   Then check status:
-    shellagent ssh "cat /tmp/output.log"
+    torque-tunnel ssh "cat /tmp/output.log"
 
 PERFORMANCE TIP:
   Each command invocation has significant roundtrip overhead
   (environment provisioning, SSH connection, etc.).
   Consolidate multiple commands into a single invocation:
-    shellagent ssh "cmd1; cmd2; cmd3"           # sequential
-    shellagent ssh "cmd1 && cmd2 && cmd3"       # stop on failure
+    torque-tunnel ssh "cmd1; cmd2; cmd3"           # sequential
+    torque-tunnel ssh "cmd1 && cmd2 && cmd3"       # stop on failure
         """,
     )
     

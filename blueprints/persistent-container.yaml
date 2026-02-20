@@ -3,7 +3,7 @@ description: |
   Launch a persistent container with SSH access on the Torque agent.
   The container runs dropbear (lightweight SSH server) in foreground and stays alive
   until the environment is terminated.
-  Used by the ShellAgent MCP tool to provide persistent container sessions.
+  Used by the torque-tunnel MCP tool to provide persistent container sessions.
   
   Connection details (IP and private key) are output via the deploy log.
   The container is based on the same Ubuntu 22.04 image used by Torque shell grains.
@@ -53,19 +53,19 @@ grains:
                 # Convert private key to OpenSSH PEM format (required by Torque shell grain)
                 dropbearconvert dropbear openssh /root/.ssh/container_key /root/.ssh/container_key_openssh
                 
-                # Output connection details with unique SHELLAGENT:: prefix
+                # Output connection details with unique TORQUE_TUNNEL:: prefix
                 # so the parser can distinguish actual output from the script echo
                 # that Torque prints before execution
                 _SA_IP=$(hostname -I | awk '{print $1}')
                 _SA_ID=$(hostname)
                 _SA_KEY=$(cat /root/.ssh/container_key_openssh)
                 
-                printf 'SHELLAGENT::CONTAINER_IP=%s\n' "$_SA_IP"
-                printf 'SHELLAGENT::CONTAINER_ID=%s\n' "$_SA_ID"
-                printf 'SHELLAGENT::KEY_START\n'
+                printf 'TORQUE_TUNNEL::CONTAINER_IP=%s\n' "$_SA_IP"
+                printf 'TORQUE_TUNNEL::CONTAINER_ID=%s\n' "$_SA_ID"
+                printf 'TORQUE_TUNNEL::KEY_START\n'
                 printf '%s\n' "$_SA_KEY"
-                printf 'SHELLAGENT::KEY_END\n'
-                printf 'SHELLAGENT::READY\n'
+                printf 'TORQUE_TUNNEL::KEY_END\n'
+                printf 'TORQUE_TUNNEL::READY\n'
                 
                 export container_ready="true"
                 

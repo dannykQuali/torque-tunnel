@@ -1,6 +1,6 @@
-# ShellAgent
+# torque-tunnel
 
-An MCP tool that enables Copilot to execute commands on remote servers via Torque Shell Grains.
+An MCP tool that enables Copilot to execute commands on remote servers by tunneling through Torque agent infrastructure.
 
 ## Overview
 
@@ -22,7 +22,7 @@ Copilot → MCP Tool (local) → Torque REST API → Shell Grain Blueprint → S
 ### 1. Install the MCP Tool
 
 ```bash
-cd ShellAgent
+cd torque-tunnel
 pip install -r requirements.txt
 pip install -e .
 ```
@@ -60,10 +60,10 @@ Add to your VS Code settings (`settings.json`):
 {
   "mcp": {
     "servers": {
-      "shellagent": {
+      "torque-tunnel": {
         "command": "python",
-        "args": ["-m", "shellagent.mcp_tool"],
-        "cwd": "c:\\ZeroTouch\\ShellAgent\\src",
+        "args": ["-m", "torque_tunnel.mcp_tool"],
+        "cwd": "c:\\ZeroTouch\\torque-tunnel\\src",
         "env": {
           "TORQUE_URL": "https://review1.qualilabs.net",
           "TORQUE_TOKEN": "your-token-here",
@@ -82,16 +82,16 @@ Or using command-line arguments:
 {
   "mcp": {
     "servers": {
-      "shellagent": {
+      "torque-tunnel": {
         "command": "python",
         "args": [
-          "-m", "shellagent.mcp_tool",
+          "-m", "torque_tunnel.mcp_tool",
           "--torque-url", "https://review1.qualilabs.net",
           "--torque-token", "your-token-here",
           "--torque-space", "BMaaS",
           "--torque-agent", "dannyk-revertable-alma2"
         ],
-        "cwd": "c:\\ZeroTouch\\ShellAgent\\src"
+        "cwd": "c:\\ZeroTouch\\torque-tunnel\\src"
       }
     }
   }
@@ -149,11 +149,11 @@ Ensure the Torque agent can reach the target server on port 22.
 ## Project Structure
 
 ```
-ShellAgent/
+torque-tunnel/
 ├── blueprints/
 │   └── remote-shell-executor.yaml  # Torque blueprint
 ├── src/
-│   └── shellagent/
+│   └── torque-tunnel/
 │       ├── __init__.py
 │       ├── mcp_tool.py            # MCP tool implementation
 │       └── torque_client.py       # Torque API client
