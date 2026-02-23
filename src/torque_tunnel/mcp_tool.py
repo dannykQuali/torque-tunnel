@@ -277,9 +277,9 @@ def prepare_files_deployment(files: list[dict]) -> tuple[str, list[str]]:
     
     Args:
         files: List of file specs, each with:
-            - local_path: Path to local file or directory to upload
-            - content: Direct content string (alternative to local_path)
-            - remote_path: Destination path on target
+            - local_source_path: Path to local file or directory to upload
+            - content: Direct content string (alternative to local_source_path)
+            - remote_destination_path: Destination path on target
             - mode: Optional file permissions (e.g., "755")
     
     Returns:
@@ -297,13 +297,13 @@ def prepare_files_deployment(files: list[dict]) -> tuple[str, list[str]]:
     commands.append("# === File Deployment ===")
     
     for i, file_spec in enumerate(files):
-        remote_path = file_spec.get("remote_path")
-        local_path = file_spec.get("local_path")
+        remote_path = file_spec.get("remote_destination_path")
+        local_path = file_spec.get("local_source_path")
         content = file_spec.get("content")
         mode = file_spec.get("mode")
         
         if not remote_path:
-            errors.append(f"File {i+1}: missing 'remote_path'")
+            errors.append(f"File {i+1}: missing 'remote_destination_path'")
             continue
         
         # Escape remote path for shell
@@ -311,12 +311,12 @@ def prepare_files_deployment(files: list[dict]) -> tuple[str, list[str]]:
         remote_dir = os.path.dirname(remote_path)
         escaped_dir = remote_dir.replace("'", "'\\''") if remote_dir else ""
         
-        # Get content from local_path or direct content
+        # Get content from local_source_path or direct content
         if local_path and content:
-            errors.append(f"File {i+1}: provide either 'local_path' OR 'content', not both")
+            errors.append(f"File {i+1}: provide either 'local_source_path' OR 'content', not both")
             continue
         elif not local_path and not content:
-            errors.append(f"File {i+1}: must provide either 'local_path' or 'content'")
+            errors.append(f"File {i+1}: must provide either 'local_source_path' or 'content'")
             continue
         
         if local_path:
@@ -597,12 +597,12 @@ Prefer this over running `ssh` from a container - simpler and more efficient.
 
 **private_key** accepts a file path (e.g., C:\\Users\\you\\.ssh\\id_rsa) OR raw key content ('-----BEGIN...').
 
-Can upload files AND run commands in one call. Order: files → init_commands → command → finally_commands. Use this along with chained commands to minimize calls and overhead and improve performance.
+Use `upload_files` to send local files/content to the target before running the command. Order: upload_files → init_commands → command → finally_commands. Use this along with chained commands to minimize calls and overhead and improve performance.
 
 **DANGEROUS COMMANDS** (may kill our Torque agent if running there):
 docker restart/stop/kill, systemctl restart docker, reboot, shutdown, init 0/6
 
-**PERFORMANCE:** Each call has overhead. Chain commands (`cmd1 && cmd2`) with `files` param for uploads in a single call.""",
+**PERFORMANCE:** Each call has overhead. Chain commands (`cmd1 && cmd2`) and use `upload_files` for uploads in a single call.""",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -620,32 +620,32 @@ docker restart/stop/kill, systemctl restart docker, reboot, shutdown, init 0/6
                     },
                     "command": {
                         "type": "string",
-                        "description": "The shell command to execute on the remote server. Optional if only uploading files.",
+                        "description": "The shell command to execute on the remote server. Optional if only uploading files via upload_files.",
                     },
-                    "files": {
+                    "upload_files": {
                         "type": "array",
-                        "description": "Files to upload TO THE REMOTE SERVER before running the command. These are transferred from your local machine to the target server.",
+                        "description": "Upload files from your local machine to the remote server BEFORE the command runs. Each item specifies one file to upload.",
                         "items": {
                             "type": "object",
                             "properties": {
-                                "local_path": {
+                                "local_source_path": {
                                     "type": "string",
-                                    "description": "Path on YOUR LOCAL MACHINE to a file/directory to upload. Use this OR content, not both.",
+                                    "description": "Absolute path on your local machine to a file or directory to upload. Use this OR content, not both.",
                                 },
                                 "content": {
                                     "type": "string",
-                                    "description": "Direct content to write TO THE REMOTE SERVER. Use this OR local_path, not both.",
+                                    "description": "Direct text content to write as a file on the remote server. Use this OR local_source_path, not both.",
                                 },
-                                "remote_path": {
+                                "remote_destination_path": {
                                     "type": "string",
-                                    "description": "Destination path ON THE REMOTE SERVER where the file will be written.",
+                                    "description": "Absolute destination path on the remote server where the file will be written.",
                                 },
                                 "mode": {
                                     "type": "string",
                                     "description": "Optional file permissions (e.g., '755' for executable).",
                                 },
                             },
-                            "required": ["remote_path"],
+                            "required": ["remote_destination_path"],
                         },
                     },
                     "torque_agent": {
@@ -690,38 +690,38 @@ for local network/VMs use regular terminal commands):
 - One-off container command, no state needed → THIS tool (cheaper/faster)
 - Multi-step workflow needing state across calls (install then use a tool, incremental builds, etc.) → run_on_tunneled_persistent_container
 
-Can upload files AND run commands in one call. Order: files → init_commands → command → finally_commands. Use this along with chained commands to minimize calls and overhead and improve performance.""",
+Use `upload_files` to send local files/content to the target before running the command. Order: upload_files → init_commands → command → finally_commands. Use this along with chained commands to minimize calls and overhead and improve performance.""",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "command": {
                         "type": "string",
-                        "description": "The shell command to execute on the agent container. Optional if only uploading files.",
+                        "description": "The shell command to execute on the agent container. Optional if only uploading files via upload_files.",
                     },
-                    "files": {
+                    "upload_files": {
                         "type": "array",
-                        "description": "Files to upload TO THE CONTAINER before running the command. These are transferred from your local machine to the target container.",
+                        "description": "Upload files from your local machine to the container BEFORE the command runs. Each item specifies one file to upload.",
                         "items": {
                             "type": "object",
                             "properties": {
-                                "local_path": {
+                                "local_source_path": {
                                     "type": "string",
-                                    "description": "Path on YOUR LOCAL MACHINE to a file/directory to upload. Use this OR content, not both.",
+                                    "description": "Absolute path on your local machine to a file or directory to upload. Use this OR content, not both.",
                                 },
                                 "content": {
                                     "type": "string",
-                                    "description": "Direct content to write TO THE CONTAINER. Use this OR local_path, not both.",
+                                    "description": "Direct text content to write as a file on the container. Use this OR local_source_path, not both.",
                                 },
-                                "remote_path": {
+                                "remote_destination_path": {
                                     "type": "string",
-                                    "description": "Destination path ON THE CONTAINER where the file will be written.",
+                                    "description": "Absolute destination path on the container where the file will be written.",
                                 },
                                 "mode": {
                                     "type": "string",
                                     "description": "Optional file permissions (e.g., '755' for executable).",
                                 },
                             },
-                            "required": ["remote_path"],
+                            "required": ["remote_destination_path"],
                         },
                     },
                     "torque_agent": {
@@ -766,38 +766,38 @@ specific one. Output includes `Persistent Container: <env_id>` - save to target 
 **After restart:** Pass previous `environment_id` to reconnect (works if not expired).
 Without the ID, a new container is created.
 
-Can upload files AND run commands in one call. Order: files → init_commands → command → finally_commands. Use this along with chained commands to minimize calls and overhead and improve performance.""",
+Use `upload_files` to send local files/content to the target before running the command. Order: upload_files → init_commands → command → finally_commands. Use this along with chained commands to minimize calls and overhead and improve performance.""",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "command": {
                         "type": "string",
-                        "description": "The shell command to execute on the agent container. Optional if only uploading files.",
+                        "description": "The shell command to execute on the agent container. Optional if only uploading files via upload_files.",
                     },
-                    "files": {
+                    "upload_files": {
                         "type": "array",
-                        "description": "Files to upload TO THE CONTAINER before running the command. These are transferred from your local machine to the target container.",
+                        "description": "Upload files from your local machine to the container BEFORE the command runs. Each item specifies one file to upload.",
                         "items": {
                             "type": "object",
                             "properties": {
-                                "local_path": {
+                                "local_source_path": {
                                     "type": "string",
-                                    "description": "Path on YOUR LOCAL MACHINE to a file/directory to upload. Use this OR content, not both.",
+                                    "description": "Absolute path on your local machine to a file or directory to upload. Use this OR content, not both.",
                                 },
                                 "content": {
                                     "type": "string",
-                                    "description": "Direct content to write TO THE CONTAINER. Use this OR local_path, not both.",
+                                    "description": "Direct text content to write as a file on the container. Use this OR local_source_path, not both.",
                                 },
-                                "remote_path": {
+                                "remote_destination_path": {
                                     "type": "string",
-                                    "description": "Destination path ON THE CONTAINER where the file will be written.",
+                                    "description": "Absolute destination path on the container where the file will be written.",
                                 },
                                 "mode": {
                                     "type": "string",
                                     "description": "Optional file permissions (e.g., '755' for executable).",
                                 },
                             },
-                            "required": ["remote_path"],
+                            "required": ["remote_destination_path"],
                         },
                     },
                     "torque_agent": {
@@ -864,30 +864,30 @@ systemctl restart docker, reboot, shutdown, init 0/6""",
                         "type": "string",
                         "description": "The shell command to execute on the remote server.",
                     },
-                    "files": {
+                    "upload_files": {
                         "type": "array",
-                        "description": "Files to upload TO THE REMOTE SERVER before running the command.",
+                        "description": "Upload files from your local machine to the remote server BEFORE the command runs. Each item specifies one file to upload.",
                         "items": {
                             "type": "object",
                             "properties": {
-                                "local_path": {
+                                "local_source_path": {
                                     "type": "string",
-                                    "description": "Path on YOUR LOCAL MACHINE to a file/directory to upload. Use this OR content, not both.",
+                                    "description": "Absolute path on your local machine to a file or directory to upload. Use this OR content, not both.",
                                 },
                                 "content": {
                                     "type": "string",
-                                    "description": "Direct content to write TO THE REMOTE SERVER. Use this OR local_path, not both.",
+                                    "description": "Direct text content to write as a file on the remote server. Use this OR local_source_path, not both.",
                                 },
-                                "remote_path": {
+                                "remote_destination_path": {
                                     "type": "string",
-                                    "description": "Destination path ON THE REMOTE SERVER where the file will be written.",
+                                    "description": "Absolute destination path on the remote server where the file will be written.",
                                 },
                                 "mode": {
                                     "type": "string",
                                     "description": "Optional file permissions (e.g., '755' for executable).",
                                 },
                             },
-                            "required": ["remote_path"],
+                            "required": ["remote_destination_path"],
                         },
                     },
                     "torque_agent": {
@@ -938,30 +938,30 @@ After restart: pass previous `environment_id` to reconnect.""",
                         "type": "string",
                         "description": "The shell command to execute on the agent container.",
                     },
-                    "files": {
+                    "upload_files": {
                         "type": "array",
-                        "description": "Files to upload TO THE CONTAINER before running the command.",
+                        "description": "Upload files from your local machine to the container BEFORE the command runs. Each item specifies one file to upload.",
                         "items": {
                             "type": "object",
                             "properties": {
-                                "local_path": {
+                                "local_source_path": {
                                     "type": "string",
-                                    "description": "Path on YOUR LOCAL MACHINE to a file/directory to upload. Use this OR content, not both.",
+                                    "description": "Absolute path on your local machine to a file or directory to upload. Use this OR content, not both.",
                                 },
                                 "content": {
                                     "type": "string",
-                                    "description": "Direct content to write TO THE CONTAINER. Use this OR local_path, not both.",
+                                    "description": "Direct text content to write as a file on the container. Use this OR local_source_path, not both.",
                                 },
-                                "remote_path": {
+                                "remote_destination_path": {
                                     "type": "string",
-                                    "description": "Destination path ON THE CONTAINER where the file will be written.",
+                                    "description": "Absolute destination path on the container where the file will be written.",
                                 },
                                 "mode": {
                                     "type": "string",
                                     "description": "Optional file permissions (e.g., '755' for executable).",
                                 },
                             },
-                            "required": ["remote_path"],
+                            "required": ["remote_destination_path"],
                         },
                     },
                     "torque_agent": {
@@ -1013,30 +1013,30 @@ Only for unreachable internal network targets. For local network/VMs, use termin
                         "type": "string",
                         "description": "The shell command to execute on the agent container.",
                     },
-                    "files": {
+                    "upload_files": {
                         "type": "array",
-                        "description": "Files to upload TO THE CONTAINER before running the command.",
+                        "description": "Upload files from your local machine to the container BEFORE the command runs. Each item specifies one file to upload.",
                         "items": {
                             "type": "object",
                             "properties": {
-                                "local_path": {
+                                "local_source_path": {
                                     "type": "string",
-                                    "description": "Path on YOUR LOCAL MACHINE to a file/directory to upload. Use this OR content, not both.",
+                                    "description": "Absolute path on your local machine to a file or directory to upload. Use this OR content, not both.",
                                 },
                                 "content": {
                                     "type": "string",
-                                    "description": "Direct content to write TO THE CONTAINER. Use this OR local_path, not both.",
+                                    "description": "Direct text content to write as a file on the container. Use this OR local_source_path, not both.",
                                 },
-                                "remote_path": {
+                                "remote_destination_path": {
                                     "type": "string",
-                                    "description": "Destination path ON THE CONTAINER where the file will be written.",
+                                    "description": "Absolute destination path on the container where the file will be written.",
                                 },
                                 "mode": {
                                     "type": "string",
                                     "description": "Optional file permissions (e.g., '755' for executable).",
                                 },
                             },
-                            "required": ["remote_path"],
+                            "required": ["remote_destination_path"],
                         },
                     },
                     "torque_agent": {
@@ -1137,7 +1137,7 @@ async def handle_run_on_tunneled_ssh(arguments: dict):
     ssh_user = arguments.get("user") or _config["default_ssh_user"]
     private_key_value = arguments.get("private_key") or _config["default_ssh_key"]
     command = arguments.get("command")
-    files = arguments.get("files", [])
+    files = arguments.get("upload_files", [])
     agent = arguments.get("torque_agent")
     allow_dangerous_commands = arguments.get("allow_dangerous_commands", False)
     timeout = arguments.get("timeout")  # Optional timeout override
@@ -1155,7 +1155,7 @@ async def handle_run_on_tunneled_ssh(arguments: dict):
     if not command and not files:
         return [TextContent(
             type="text",
-            text="Error: Must provide either 'command' or 'files' (or both).",
+            text="Error: Must provide either 'command' or 'upload_files' (or both).",
         )]
     
     if not all([target_ip, ssh_user, private_key_value]):
@@ -1196,8 +1196,8 @@ async def handle_run_on_tunneled_ssh(arguments: dict):
             init_commands = file_deploy_commands
         # Track files for output reporting
         for f in files:
-            local = f.get("local_path", "<content>")
-            remote = f.get("remote_path", "")
+            local = f.get("local_source_path", "<content>")
+            remote = f.get("remote_destination_path", "")
             files_info.append(f"{local} -> {remote}")
     
     # If no command, use a simple echo
@@ -1423,7 +1423,7 @@ async def handle_run_on_tunneled_persistent_container(arguments: dict):
     Reuses the same SSH execution logic as handle_run_on_tunneled_ssh.
     """
     command = arguments.get("command")
-    files = arguments.get("files", [])
+    files = arguments.get("upload_files", [])
     agent = arguments.get("torque_agent")
     timeout = arguments.get("timeout")
     new_container = arguments.get("new_container", False)
@@ -1436,7 +1436,7 @@ async def handle_run_on_tunneled_persistent_container(arguments: dict):
     if not command and not files:
         return [TextContent(
             type="text",
-            text="Error: Must provide either 'command' or 'files' (or both).",
+            text="Error: Must provide either 'command' or 'upload_files' (or both).",
         )]
     
     try:
@@ -1461,8 +1461,8 @@ async def handle_run_on_tunneled_persistent_container(arguments: dict):
         if file_deploy_commands:
             init_commands = file_deploy_commands
         for f in files:
-            local = f.get("local_path", "<content>")
-            remote = f.get("remote_path", "")
+            local = f.get("local_source_path", "<content>")
+            remote = f.get("remote_destination_path", "")
             files_info.append(f"{local} -> {remote}")
     
     effective_command = command or "echo 'Files deployed successfully'"
@@ -1577,7 +1577,7 @@ async def handle_run_on_tunneled_persistent_container(arguments: dict):
 async def handle_run_on_tunneled_disposable_container(arguments: dict):
     """Execute a command on a fresh Torque agent container, optionally uploading files first."""
     command = arguments.get("command")
-    files = arguments.get("files", [])
+    files = arguments.get("upload_files", [])
     agent = arguments.get("torque_agent")
     timeout = arguments.get("timeout")  # Optional timeout override
     torque_url = arguments.get("torque_url")
@@ -1588,7 +1588,7 @@ async def handle_run_on_tunneled_disposable_container(arguments: dict):
     if not command and not files:
         return [TextContent(
             type="text",
-            text="Error: Must provide either 'command' or 'files' (or both).",
+            text="Error: Must provide either 'command' or 'upload_files' (or both).",
         )]
     
     # Process files parameter - generate deployment commands
@@ -1605,8 +1605,8 @@ async def handle_run_on_tunneled_disposable_container(arguments: dict):
             init_commands = file_deploy_commands
         # Track files for output reporting
         for f in files:
-            local = f.get("local_path", "<content>")
-            remote = f.get("remote_path", "")
+            local = f.get("local_source_path", "<content>")
+            remote = f.get("remote_destination_path", "")
             files_info.append(f"{local} -> {remote}")
     
     # If no command, use a simple echo
@@ -1709,7 +1709,7 @@ async def handle_run_on_tunneled_ssh_async(arguments: dict):
     ssh_user = arguments.get("user") or _config["default_ssh_user"]
     private_key_value = arguments.get("private_key") or _config["default_ssh_key"]
     command = arguments.get("command")
-    files = arguments.get("files", [])
+    files = arguments.get("upload_files", [])
     agent = arguments.get("torque_agent")
     allow_dangerous_commands = arguments.get("allow_dangerous_commands", False)
     timeout = arguments.get("timeout")
@@ -1718,7 +1718,7 @@ async def handle_run_on_tunneled_ssh_async(arguments: dict):
     torque_space = arguments.get("torque_space")
     
     if not command and not files:
-        return [TextContent(type="text", text="Error: Must provide either 'command' or 'files' (or both).")]
+        return [TextContent(type="text", text="Error: Must provide either 'command' or 'upload_files' (or both).")]
     
     if not all([target_ip, ssh_user, private_key_value]):
         return [TextContent(type="text", text="Error: Missing required parameters. Need host, user, private_key (or configure defaults).")]
@@ -1744,7 +1744,7 @@ async def handle_run_on_tunneled_ssh_async(arguments: dict):
         if file_deploy_commands:
             init_commands = file_deploy_commands
         for f in files:
-            files_info.append(f"{f.get('local_path', '<content>')} -> {f.get('remote_path', '')}")
+            files_info.append(f"{f.get('local_source_path', '<content>')} -> {f.get('remote_destination_path', '')}")
     
     effective_command = command or "echo 'Files deployed successfully'"
     
@@ -1793,7 +1793,7 @@ async def handle_run_on_tunneled_persistent_container_async(arguments: dict):
     asynchronously via SSH from a disposable grain into the persistent container.
     """
     command = arguments.get("command")
-    files = arguments.get("files", [])
+    files = arguments.get("upload_files", [])
     agent = arguments.get("torque_agent")
     new_container = arguments.get("new_container", False)
     target_env_id = arguments.get("environment_id")
@@ -1803,7 +1803,7 @@ async def handle_run_on_tunneled_persistent_container_async(arguments: dict):
     torque_space = arguments.get("torque_space")
     
     if not command and not files:
-        return [TextContent(type="text", text="Error: Must provide either 'command' or 'files' (or both).")]
+        return [TextContent(type="text", text="Error: Must provide either 'command' or 'upload_files' (or both).")]
     
     try:
         # Ensure persistent container is up (this blocks until ready)
@@ -1824,7 +1824,7 @@ async def handle_run_on_tunneled_persistent_container_async(arguments: dict):
         if file_deploy_commands:
             init_commands = file_deploy_commands
         for f in files:
-            files_info.append(f"{f.get('local_path', '<content>')} -> {f.get('remote_path', '')}")
+            files_info.append(f"{f.get('local_source_path', '<content>')} -> {f.get('remote_destination_path', '')}")
     
     effective_command = command or "echo 'Files deployed successfully'"
     
@@ -1886,7 +1886,7 @@ Use `cancel_execution` with the same environment_id to abort if needed."""
 async def handle_run_on_tunneled_disposable_container_async(arguments: dict):
     """Start a disposable container command without waiting for completion."""
     command = arguments.get("command")
-    files = arguments.get("files", [])
+    files = arguments.get("upload_files", [])
     agent = arguments.get("torque_agent")
     timeout = arguments.get("timeout")
     torque_url = arguments.get("torque_url")
@@ -1894,7 +1894,7 @@ async def handle_run_on_tunneled_disposable_container_async(arguments: dict):
     torque_space = arguments.get("torque_space")
     
     if not command and not files:
-        return [TextContent(type="text", text="Error: Must provide either 'command' or 'files' (or both).")]
+        return [TextContent(type="text", text="Error: Must provide either 'command' or 'upload_files' (or both).")]
     
     # Process files
     files_info = []
@@ -1906,7 +1906,7 @@ async def handle_run_on_tunneled_disposable_container_async(arguments: dict):
         if file_deploy_commands:
             init_commands = file_deploy_commands
         for f in files:
-            files_info.append(f"{f.get('local_path', '<content>')} -> {f.get('remote_path', '')}")
+            files_info.append(f"{f.get('local_source_path', '<content>')} -> {f.get('remote_destination_path', '')}")
     
     effective_command = command or "echo 'Files deployed successfully'"
     
@@ -2357,8 +2357,8 @@ async def cli_dispatch(args):
                 print(f"Error: Invalid upload spec '{spec}'. Use LOCAL:REMOTE[:MODE]", file=sys.stderr)
                 sys.exit(1)
             file_spec = {
-                'local_path': parts[0],
-                'remote_path': parts[1],
+                'local_source_path': parts[0],
+                'remote_destination_path': parts[1],
             }
             if len(parts) >= 3:
                 file_spec['mode'] = parts[2]
