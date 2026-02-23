@@ -3,8 +3,11 @@
   // torque-tunnel MCP Server Configuration
   // ============================================================================
   //
-  // SETUP: Copy this file to %APPDATA%\Code\User\mcp.json
+  // SETUP: Add the "torque-tunnel" server entry below to your VS Code MCP config at:
+  //        %APPDATA%\Code\User\mcp.json
   //        (typically C:\Users\<USERNAME>\AppData\Roaming\Code\User\mcp.json)
+  //        If the file already exists with other servers, merge the "torque-tunnel"
+  //        entry into the existing "servers" object.
   //
   // HOW TO GET A LONG TOKEN:
   //   You need a short-lived Bearer token first (obtained when you log in to Torque),

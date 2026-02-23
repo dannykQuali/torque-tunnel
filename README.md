@@ -27,121 +27,82 @@ pip install -r requirements.txt
 pip install -e .
 ```
 
-### 2. Deploy the Blueprint to Torque
+### 2. Configure VS Code
 
-Upload the blueprint file `blueprints/remote-shell-executor.yaml` to your Torque space's blueprint repository.
+See [`mcp.json`](mcp.json) for the full annotated configuration template with all available options and detailed instructions on how to obtain a long-lived API token.
 
-### 3. Configure Environment Variables
+**Quick start:**
 
-Copy `.env.example` to `.env` and fill in your values:
+1. Open `mcp.json` in this repo and follow the setup instructions in the comments
+2. Copy/merge the `"torque-tunnel"` server entry into `%APPDATA%\Code\User\mcp.json`
+   (typically `C:\Users\<USERNAME>\AppData\Roaming\Code\User\mcp.json`)
+3. If you already have other MCP servers configured there, just add `"torque-tunnel"` to the existing `"servers"` object
 
-```bash
-cp .env.example .env
-```
-
-Edit `.env`:
-```
-TORQUE_URL=https://review1.qualilabs.net
-TORQUE_TOKEN=your-api-token-here
-TORQUE_SPACE=BMaaS
-TORQUE_AGENT=dannyk-revertable-alma2
-```
-
-To get a Torque API token:
-1. Go to Torque UI → Settings → Integrations
-2. Click on any CI tool → New Token
-3. Copy the generated token
-
-### 4. Configure VS Code MCP
-
-Add to your VS Code settings (`settings.json`):
-
-```json
-{
-  "mcp": {
-    "servers": {
-      "torque-tunnel": {
-        "command": "python",
-        "args": ["-m", "torque_tunnel.mcp_tool"],
-        "cwd": "c:\\ZeroTouch\\torque-tunnel\\src",
-        "env": {
-          "TORQUE_URL": "https://review1.qualilabs.net",
-          "TORQUE_TOKEN": "your-token-here",
-          "TORQUE_SPACE": "BMaaS",
-          "TORQUE_AGENT": "dannyk-revertable-alma2"
-        }
-      }
-    }
-  }
-}
-```
-
-Or using command-line arguments:
-
-```json
-{
-  "mcp": {
-    "servers": {
-      "torque-tunnel": {
-        "command": "python",
-        "args": [
-          "-m", "torque_tunnel.mcp_tool",
-          "--torque-url", "https://review1.qualilabs.net",
-          "--torque-token", "your-token-here",
-          "--torque-space", "BMaaS",
-          "--torque-agent", "dannyk-revertable-alma2"
-        ],
-        "cwd": "c:\\ZeroTouch\\torque-tunnel\\src"
-      }
-    }
-  }
-}
-```
+The minimum required settings are `--torque-url`, `--torque-token`, `--torque-space`, and `--torque-agent`. All other options (SSH target, command hooks, behavior flags) can be supplied by the AI agent at runtime or pre-configured for convenience.
 
 ## Available Tools
 
-### `run_remote_command`
+### Synchronous (blocking)
 
-Execute any shell command on a remote server.
+| Tool | Description |
+|------|-------------|
+| `run_on_tunneled_ssh` | Execute a command on a remote server via SSH through the Torque agent |
+| `run_on_tunneled_persistent_container` | Execute a command on a persistent Torque agent container (state preserved across calls) |
+| `run_on_tunneled_disposable_container` | Execute a command on a fresh container spawned by Torque agent (nothing persists) |
 
-**Parameters:**
-- `target_ip` (required): IP address or hostname of the remote server
-- `ssh_user` (required): SSH username
-- `ssh_private_key` (required): SSH private key content
-- `command` (required): Shell command to execute
-- `agent` (optional): Torque agent name (uses default if not specified)
+### Asynchronous (non-blocking)
 
-## Usage Example
+| Tool | Description |
+|------|-------------|
+| `run_on_tunneled_ssh_async` | Start an SSH command asynchronously, returns immediately with an execution ID |
+| `run_on_tunneled_persistent_container_async` | Start a persistent container command asynchronously |
+| `run_on_tunneled_disposable_container_async` | Start a disposable container command asynchronously |
+| `get_execution_status` | Check the status/output of an async execution by ID |
+| `cancel_execution` | Cancel a running async execution |
 
-Once configured, you can ask Copilot things like:
+## CLI Usage
 
-> "Check the disk space on server 192.168.1.100 using SSH user admin"
+The tool also supports direct CLI usage outside of VS Code:
 
-Copilot will use the `run_remote_command` tool to execute `df -h` on the remote server via Torque.
+```bash
+# Run a command on a remote server via SSH
+torque-tunnel ssh "uname -a"
+torque-tunnel ssh --host 10.0.0.1 --user root "df -h"
+
+# Upload files and run a command
+torque-tunnel ssh --upload ./script.sh:/tmp/script.sh:755 "bash /tmp/script.sh"
+
+# Run on the Torque agent container directly
+torque-tunnel container "curl https://example.com"
+
+# Read/list remote files
+torque-tunnel read /etc/hostname
+torque-tunnel list /var/log
+```
 
 ## How It Works
 
-1. You provide Copilot with SSH credentials and a command
-2. The MCP tool calls Torque's REST API to launch the `remote-shell-executor` blueprint
-3. The blueprint runs as a Shell Grain on the specified Torque agent
-4. The Shell Grain SSHs to the target host and executes the command
-5. Output is captured and returned to Copilot
-6. The Torque environment is automatically cleaned up
+1. Copilot sends a command via the MCP tool
+2. The MCP tool calls Torque's REST API to launch a shell blueprint on the specified agent
+3. The blueprint runs as a Shell Grain on the Torque agent
+4. For SSH commands: the grain SSHs to the target host and executes the command
+5. Output is streamed back and returned to Copilot
+6. The Torque environment can be auto-cleaned (see `--auto-delete-environments`)
 
 ## Security Notes
 
 - SSH private keys are base64 encoded before transmission
 - Keys are stored in temporary files with 600 permissions during execution
-- Torque environments are short-lived (10 minutes max) and auto-cleaned
 - All execution is audited in Torque's environment logs
+- Dangerous commands (docker restart, reboot, shutdown, etc.) are blocked by default
 
 ## Troubleshooting
 
 ### "Agent name must be provided"
-Set the `TORQUE_AGENT` environment variable or pass `--torque-agent`.
+Set `--torque-agent` in your mcp.json config or pass it at runtime.
 
 ### "Environment did not complete within X seconds"
-The command may be taking too long. Check Torque UI for environment status.
+The command may be taking too long. Check Torque UI for environment status. Use `--timeout` to extend.
 
 ### SSH Connection Refused
 Ensure the Torque agent can reach the target server on port 22.
@@ -150,14 +111,17 @@ Ensure the Torque agent can reach the target server on port 22.
 
 ```
 torque-tunnel/
+├── mcp.json                          # Annotated config template — copy to %APPDATA%\Code\User\mcp.json
 ├── blueprints/
-│   └── remote-shell-executor.yaml  # Torque blueprint
+│   ├── remote-shell-executor.yaml    # SSH-to-target blueprint
+│   ├── persistent-container.yaml     # Persistent container blueprint
+│   └── local-shell-executor.yaml     # Disposable container blueprint
 ├── src/
-│   └── torque-tunnel/
+│   └── torque_tunnel/
 │       ├── __init__.py
-│       ├── mcp_tool.py            # MCP tool implementation
-│       └── torque_client.py       # Torque API client
-├── .env.example
+│       ├── mcp_tool.py               # MCP tool + CLI implementation
+│       └── torque_client.py          # Torque API client
+├── pyproject.toml
 ├── requirements.txt
 └── README.md
 ```
