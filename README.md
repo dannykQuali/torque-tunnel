@@ -72,8 +72,11 @@ torque-tunnel ssh --host 10.0.0.1 --user root "df -h"
 # Upload files and run a command
 torque-tunnel ssh --upload ./script.sh:/tmp/script.sh:755 "bash /tmp/script.sh"
 
-# Run on the Torque agent container directly
-torque-tunnel container "curl https://example.com"
+# Run on a persistent Torque agent container
+torque-tunnel persistent-container "curl https://example.com"
+
+# Run on a fresh disposable container
+torque-tunnel disposable-container "curl https://example.com"
 
 # Read/list remote files
 torque-tunnel read /etc/hostname

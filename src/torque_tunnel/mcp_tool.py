@@ -2443,7 +2443,7 @@ async def cli_dispatch(args):
                     print(f"Error: {result.error}", file=sys.stderr)
                     sys.exit(1)
         
-        elif args.command in ("persistent-container", "container"):
+        elif args.command == "persistent-container":
             # Persistent container command
             agent = getattr(args, 'torque_agent', None)
             timeout = getattr(args, 'timeout', None)
@@ -2869,11 +2869,12 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Modes:
-  serve (default)  Run as MCP server (for VS Code Copilot)
-  ssh              Execute a command on a remote target server via SSH
-  container        Execute a command on the Torque agent container itself
-  read             Read a file from a remote server
-  list             List a directory on a remote server
+  serve (default)           Run as MCP server (for VS Code Copilot)
+  ssh                      Execute a command on a remote target server via SSH
+  persistent-container     Execute a command on a persistent Torque agent container (state preserved)
+  disposable-container     Execute a command on a fresh disposable Torque agent container (nothing persists)
+  read                     Read a file from a remote server
+  list                     List a directory on a remote server
 
 Examples:
   # Run as MCP server (for VS Code)
@@ -2887,9 +2888,12 @@ Examples:
   torque-tunnel ssh --upload ./script.sh:/tmp/script.sh:755 "bash /tmp/script.sh"
   torque-tunnel ssh --upload ./config.yaml:/etc/app/config.yaml --upload ./data:/var/data "cat /etc/app/config.yaml"
 
-  # CLI mode - run on the Torque agent container directly
-  torque-tunnel container "curl https://example.com"
-  torque-tunnel container --upload ./test.py:/tmp/test.py "python /tmp/test.py"
+  # CLI mode - run on a persistent Torque agent container
+  torque-tunnel persistent-container "curl https://example.com"
+  torque-tunnel persistent-container --upload ./test.py:/tmp/test.py "python /tmp/test.py"
+
+  # CLI mode - run on a fresh disposable container
+  torque-tunnel disposable-container "curl https://example.com"
 
   # CLI mode - read/list files
   torque-tunnel read /etc/hostname
@@ -2956,18 +2960,6 @@ PERFORMANCE TIP:
     pc_parser.add_argument("--upload", action="append", metavar="LOCAL:REMOTE[:MODE]",
                              help="Upload local file/dir to container (can be repeated)")
     pc_parser.add_argument("--all", action="store_true", help="Release all containers (used with 'release' action)")
-
-    # container is an alias for persistent-container
-    c_parser = subparsers.add_parser("container", parents=[common_parser],
-                                      help="Alias for persistent-container")
-    c_parser.add_argument("cmd", nargs='?', help="The shell command to execute, or a sub-action: create, list, release")
-    c_parser.add_argument("--env-id", help="Target a specific persistent container by environment ID")
-    c_parser.add_argument("--new", action="store_true", help="Create a new container (keeps existing ones alive)")
-    c_parser.add_argument("--timeout", type=int, help="Timeout in seconds")
-    c_parser.add_argument("--json", "-j", action="store_true", help="Output as JSON")
-    c_parser.add_argument("--upload", action="append", metavar="LOCAL:REMOTE[:MODE]",
-                             help="Upload local file/dir to container (can be repeated)")
-    c_parser.add_argument("--all", action="store_true", help="Release all containers (used with 'release' action)")
 
     # disposable-container subcommand (run on fresh Torque agent container)
     dc_parser = subparsers.add_parser("disposable-container", parents=[common_parser],
