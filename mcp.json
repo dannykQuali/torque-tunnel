@@ -1,0 +1,77 @@
+{
+  // ============================================================================
+  // torque-tunnel MCP Server Configuration
+  // ============================================================================
+  //
+  // SETUP: Copy this file to %APPDATA%\Code\User\mcp.json
+  //        (typically C:\Users\<USERNAME>\AppData\Roaming\Code\User\mcp.json)
+  //
+  // HOW TO GET A LONG TOKEN:
+  //   You need a short-lived Bearer token first (obtained when you log in to Torque),
+  //   then exchange it for a long-lived token (~68 years) via the API.
+  //
+  //   Option A — Use the API Reference UI (review/dev servers only):
+  //     1. Log in to your Torque portal
+  //     2. Go to: https://<YOUR-TORQUE-DOMAIN>/api_reference/#/paths/api-token-longtoken/post
+  //     3. Click "Send API Request" — your session token is used automatically
+  //     4. Copy the "access_token" from the response
+  //
+  //   Option B — Use curl (works on any server including production):
+  //     1. Log in to Torque and grab your Bearer token from the browser:
+  //        - Open DevTools (F12) → Network tab → find any API request → copy the
+  //          Authorization header value (the part after "Bearer ")
+  //     2. Run:
+  //        curl -X POST https://<YOUR-TORQUE-DOMAIN>/api/token/longtoken \
+  //          -H "Authorization: Bearer <YOUR-SHORT-TOKEN>" \
+  //          -H "Accept: application/json" \
+  //          -H "Content-Type: application/json"
+  //     3. Copy the "access_token" from the JSON response
+  //
+  //   Paste the resulting long token in --torque-token below.
+  //
+  // RECOMMENDED: Create a dedicated Torque space for this MCP server.
+  //   Every command launches a separate Torque environment, so using your
+  //   regular space will mix MCP-generated environments with your own.
+  //   When creating a dedicated space, don't forget to assign your agent to it.
+  //
+  // Most options below (SSH target, hooks, flags) can be provided at runtime
+  // by the AI agent — only the four Torque connection settings are essential
+  // to pre-configure here.
+  //
+  // All options can also be set via environment variables (see comments below).
+  // ============================================================================
+  "servers": {
+    "torque-tunnel": {
+      "command": "C:\\ZeroTouch\\torque-tunnel\\.venv\\Scripts\\torque-tunnel.exe",
+      "args": [
+        // ---- Torque Connection ----
+        // The AI agent can override all four at runtime, but url/token/space are validated
+        // at startup — the server won't launch without them. Pre-configuring all four is
+        // strongly recommended so the AI doesn't have to supply them on every call.
+        "--torque-url", "https://<YOUR-TORQUE-DOMAIN>",       // Torque base URL (env: TORQUE_URL) — required at startup
+        "--torque-token", "<YOUR-LONG-TOKEN>",                // Torque API long token (env: TORQUE_TOKEN) — required at startup, see instructions above
+        "--torque-space", "<YOUR-SPACE-NAME>",                // Torque space name (env: TORQUE_SPACE) — required at startup, use a dedicated space (see above)
+        "--torque-agent", "<YOUR-AGENT-NAME>",                // Torque agent name (env: TORQUE_AGENT) — not required at startup, but recommended; must be assigned to the space above
+
+        // ---- Optional: Default SSH Target (for ssh/read/list commands) ----
+        // Pre-configure these if you have a default machine you want the tool to SSH into.
+        // The AI agent can also supply or override these at runtime.
+        "--ssh-key", "C:\\path\\to\\your\\private-key.pem",   // SSH private key file path or key content (env: SSH_KEY)
+        "--host", "10.0.0.1",                                 // Target server IP or hostname (env: TARGET_HOST)
+        "--ssh-user", "root",                                 // SSH username (env: SSH_USER)
+
+        // ---- Optional: Command Hooks ----
+        "--init-commands", "",                                 // Commands to run BEFORE every SSH command (env: INIT_COMMANDS)
+                                                               //   e.g. "export HTTP_PROXY=http://proxy:80; export HTTPS_PROXY=http://proxy:80"
+        "--finally-commands", ""                               // Commands to run AFTER every SSH command (env: FINALLY_COMMANDS)
+
+        // ---- Optional: Behavior Flags (uncomment as needed) ----
+        // "--auto-delete-environments"                        // Auto-delete Torque environments after completion (env: AUTO_DELETE_ENVIRONMENTS=true)
+                                                               //   NOTE: Torque environment deletion is admin-only and not well maintained — use with caution
+        // "--container-idle-timeout", "7200"                  // Idle timeout (seconds) for persistent containers before auto-cleanup (default: 7200 = 2h, env: CONTAINER_IDLE_TIMEOUT)
+        // "--verbose"                                         // Show full unfiltered Torque output — usually not needed; raw output is very noisy
+                                                               //   as it includes the entire blueprint bash command preamble
+      ]
+    }
+  }
+}
