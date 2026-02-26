@@ -650,7 +650,7 @@ docker restart/stop/kill, systemctl restart docker, reboot, shutdown, init 0/6
                     },
                     "torque_agent": {
                         "type": "string",
-                        "description": "Optional: The Torque agent name to use. If not specified, uses the default agent.",
+                        "description": "DO NOT set unless the user explicitly provides this value or asks you to change it. Overrides the pre-configured Torque agent.",
                     },
                     "allow_dangerous_commands": {
                         "type": "boolean",
@@ -666,15 +666,15 @@ docker restart/stop/kill, systemctl restart docker, reboot, shutdown, init 0/6
                     },
                     "torque_token": {
                         "type": "string",
-                        "description": "Optional: Torque API token. Overrides global config.",
+                        "description": "DO NOT set unless the user explicitly provides this value or asks you to change it. Overrides the pre-configured Torque API token.",
                     },
                     "torque_url": {
                         "type": "string",
-                        "description": "Optional: Torque platform URL. Overrides global config.",
+                        "description": "DO NOT set unless the user explicitly provides this value or asks you to change it. Overrides the pre-configured Torque platform URL.",
                     },
                     "torque_space": {
                         "type": "string",
-                        "description": "Optional: Torque space name. Overrides global config.",
+                        "description": "DO NOT set unless the user explicitly provides this value or asks you to change it. Overrides the pre-configured Torque space name.",
                     },
                 },
                 "required": [],
@@ -726,7 +726,7 @@ Use `upload_files` to send local files/content to the target before running the 
                     },
                     "torque_agent": {
                         "type": "string",
-                        "description": "Optional: The Torque agent name to use. If not specified, uses the default agent.",
+                        "description": "DO NOT set unless the user explicitly provides this value or asks you to change it. Overrides the pre-configured Torque agent.",
                     },
                     "timeout": {
                         "type": "integer",
@@ -734,15 +734,15 @@ Use `upload_files` to send local files/content to the target before running the 
                     },
                     "torque_token": {
                         "type": "string",
-                        "description": "Optional: Torque API token. Overrides global config.",
+                        "description": "DO NOT set unless the user explicitly provides this value or asks you to change it. Overrides the pre-configured Torque API token.",
                     },
                     "torque_url": {
                         "type": "string",
-                        "description": "Optional: Torque platform URL. Overrides global config.",
+                        "description": "DO NOT set unless the user explicitly provides this value or asks you to change it. Overrides the pre-configured Torque platform URL.",
                     },
                     "torque_space": {
                         "type": "string",
-                        "description": "Optional: Torque space name. Overrides global config.",
+                        "description": "DO NOT set unless the user explicitly provides this value or asks you to change it. Overrides the pre-configured Torque space name.",
                     },
                 },
                 "required": [],
@@ -802,7 +802,7 @@ Use `upload_files` to send local files/content to the target before running the 
                     },
                     "torque_agent": {
                         "type": "string",
-                        "description": "Optional: The Torque agent name to use. If not specified, uses the default agent.",
+                        "description": "DO NOT set unless the user explicitly provides this value or asks you to change it. Overrides the pre-configured Torque agent.",
                     },
                     "timeout": {
                         "type": "integer",
@@ -818,15 +818,15 @@ Use `upload_files` to send local files/content to the target before running the 
                     },
                     "torque_token": {
                         "type": "string",
-                        "description": "Optional: Torque API token. Overrides global config.",
+                        "description": "DO NOT set unless the user explicitly provides this value or asks you to change it. Overrides the pre-configured Torque API token.",
                     },
                     "torque_url": {
                         "type": "string",
-                        "description": "Optional: Torque platform URL. Overrides global config.",
+                        "description": "DO NOT set unless the user explicitly provides this value or asks you to change it. Overrides the pre-configured Torque platform URL.",
                     },
                     "torque_space": {
                         "type": "string",
-                        "description": "Optional: Torque space name. Overrides global config.",
+                        "description": "DO NOT set unless the user explicitly provides this value or asks you to change it. Overrides the pre-configured Torque space name.",
                     },
                 },
                 "required": [],
@@ -892,7 +892,7 @@ systemctl restart docker, reboot, shutdown, init 0/6""",
                     },
                     "torque_agent": {
                         "type": "string",
-                        "description": "Optional: The Torque agent name to use.",
+                        "description": "DO NOT set unless the user explicitly provides this value or asks you to change it. Overrides the pre-configured Torque agent.",
                     },
                     "allow_dangerous_commands": {
                         "type": "boolean",
@@ -904,15 +904,15 @@ systemctl restart docker, reboot, shutdown, init 0/6""",
                     },
                     "torque_token": {
                         "type": "string",
-                        "description": "Optional: Torque API token. Overrides global config.",
+                        "description": "DO NOT set unless the user explicitly provides this value or asks you to change it. Overrides the pre-configured Torque API token.",
                     },
                     "torque_url": {
                         "type": "string",
-                        "description": "Optional: Torque platform URL. Overrides global config.",
+                        "description": "DO NOT set unless the user explicitly provides this value or asks you to change it. Overrides the pre-configured Torque platform URL.",
                     },
                     "torque_space": {
                         "type": "string",
-                        "description": "Optional: Torque space name. Overrides global config.",
+                        "description": "DO NOT set unless the user explicitly provides this value or asks you to change it. Overrides the pre-configured Torque space name.",
                     },
                 },
                 "required": ["command"],
@@ -966,7 +966,7 @@ After restart: pass previous `environment_id` to reconnect.""",
                     },
                     "torque_agent": {
                         "type": "string",
-                        "description": "Optional: The Torque agent name to use.",
+                        "description": "DO NOT set unless the user explicitly provides this value or asks you to change it. Overrides the pre-configured Torque agent.",
                     },
                     "new_container": {
                         "type": "boolean",
@@ -982,15 +982,15 @@ After restart: pass previous `environment_id` to reconnect.""",
                     },
                     "torque_token": {
                         "type": "string",
-                        "description": "Optional: Torque API token. Overrides global config.",
+                        "description": "DO NOT set unless the user explicitly provides this value or asks you to change it. Overrides the pre-configured Torque API token.",
                     },
                     "torque_url": {
                         "type": "string",
-                        "description": "Optional: Torque platform URL. Overrides global config.",
+                        "description": "DO NOT set unless the user explicitly provides this value or asks you to change it. Overrides the pre-configured Torque platform URL.",
                     },
                     "torque_space": {
                         "type": "string",
-                        "description": "Optional: Torque space name. Overrides global config.",
+                        "description": "DO NOT set unless the user explicitly provides this value or asks you to change it. Overrides the pre-configured Torque space name.",
                     },
                 },
                 "required": ["command"],
@@ -1041,7 +1041,7 @@ Only for unreachable internal network targets. For local network/VMs, use termin
                     },
                     "torque_agent": {
                         "type": "string",
-                        "description": "Optional: The Torque agent name to use.",
+                        "description": "DO NOT set unless the user explicitly provides this value or asks you to change it. Overrides the pre-configured Torque agent.",
                     },
                     "timeout": {
                         "type": "integer",
@@ -1049,15 +1049,15 @@ Only for unreachable internal network targets. For local network/VMs, use termin
                     },
                     "torque_token": {
                         "type": "string",
-                        "description": "Optional: Torque API token. Overrides global config.",
+                        "description": "DO NOT set unless the user explicitly provides this value or asks you to change it. Overrides the pre-configured Torque API token.",
                     },
                     "torque_url": {
                         "type": "string",
-                        "description": "Optional: Torque platform URL. Overrides global config.",
+                        "description": "DO NOT set unless the user explicitly provides this value or asks you to change it. Overrides the pre-configured Torque platform URL.",
                     },
                     "torque_space": {
                         "type": "string",
-                        "description": "Optional: Torque space name. Overrides global config.",
+                        "description": "DO NOT set unless the user explicitly provides this value or asks you to change it. Overrides the pre-configured Torque space name.",
                     },
                 },
                 "required": ["command"],
@@ -3003,7 +3003,7 @@ PERFORMANCE TIP:
     _config["verbose"] = args.verbose
     _config["container_idle_timeout"] = args.container_idle_timeout
     
-    # Validate required config
+    # Warn about missing recommended config (but don't block startup — AI agent can supply at runtime)
     missing = []
     if not _config["torque_url"]:
         missing.append("--torque-url or TORQUE_URL")
@@ -3011,10 +3011,12 @@ PERFORMANCE TIP:
         missing.append("--torque-token or TORQUE_TOKEN")
     if not _config["torque_space"]:
         missing.append("--torque-space or TORQUE_SPACE")
+    if not _config.get("default_agent"):
+        missing.append("--torque-agent or TORQUE_AGENT")
     
     if missing:
-        print(f"Error: Missing required configuration: {', '.join(missing)}", file=sys.stderr)
-        sys.exit(1)
+        print(f"Warning: Missing recommended configuration: {', '.join(missing)}. "
+              f"The AI agent can supply these at runtime, but pre-configuring them is recommended.", file=sys.stderr)
     
     # Default to serve mode if no subcommand
     if args.command is None or args.command == "serve":

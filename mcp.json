@@ -48,13 +48,13 @@
       "command": "C:\\ZeroTouch\\torque-tunnel\\.venv\\Scripts\\torque-tunnel.exe",
       "args": [
         // ---- Torque Connection ----
-        // The AI agent can override all four at runtime, but url/token/space are validated
-        // at startup — the server won't launch without them. Pre-configuring all four is
-        // strongly recommended so the AI doesn't have to supply them on every call.
-        "--torque-url", "https://<YOUR-TORQUE-DOMAIN>",       // Torque base URL (env: TORQUE_URL) — required at startup
-        "--torque-token", "<YOUR-LONG-TOKEN>",                // Torque API long token (env: TORQUE_TOKEN) — required at startup, see instructions above
-        "--torque-space", "<YOUR-SPACE-NAME>",                // Torque space name (env: TORQUE_SPACE) — required at startup, use a dedicated space (see above)
-        "--torque-agent", "<YOUR-AGENT-NAME>",                // Torque agent name (env: TORQUE_AGENT) — not required at startup, but recommended; must be assigned to the space above
+        // None of these are required at startup — the AI agent can supply them at runtime.
+        // However, pre-configuring all four is strongly recommended so the AI doesn't
+        // have to supply them on every call.
+        "--torque-url", "https://<YOUR-TORQUE-DOMAIN>",       // Torque base URL (env: TORQUE_URL)
+        "--torque-token", "<YOUR-LONG-TOKEN>",                // Torque API long token (env: TORQUE_TOKEN) — see instructions above
+        "--torque-space", "<YOUR-SPACE-NAME>",                // Torque space name (env: TORQUE_SPACE) — use a dedicated space (see above)
+        "--torque-agent", "<YOUR-AGENT-NAME>",                // Torque agent name (env: TORQUE_AGENT) — must be assigned to the space above
 
         // ---- Optional: Default SSH Target (for ssh/read/list commands) ----
         // Pre-configure these if you have a default machine you want the tool to SSH into.
