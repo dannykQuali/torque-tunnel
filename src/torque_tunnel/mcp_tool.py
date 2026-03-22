@@ -398,6 +398,7 @@ _config = {
     "torque_space": None,
     "default_agent": None,
     "default_ssh_key": None,
+    "default_ssh_password": None,
     "default_target_ip": None,
     "default_ssh_user": None,
     "init_commands": None,
@@ -596,6 +597,7 @@ from your machine. The Torque agent tunnels into that network.
 Prefer this over running `ssh` from a container - simpler and more efficient.
 
 **private_key** accepts a file path (e.g., C:\\Users\\you\\.ssh\\id_rsa) OR raw key content ('-----BEGIN...').
+Alternatively, use **password** for password-based SSH authentication (requires sshpass on the agent).
 
 Use `upload_files` to send local files/content to the target before running the command. Order: upload_files → init_commands → command → finally_commands. Use this along with chained commands to minimize calls and overhead and improve performance.
 
@@ -616,7 +618,11 @@ docker restart/stop/kill, systemctl restart docker, reboot, shutdown, init 0/6
                     },
                     "private_key": {
                         "type": "string",
-                        "description": "SSH private key - either a LOCAL file path (e.g., C:\\Users\\you\\.ssh\\id_rsa) OR the key content directly (starting with '-----BEGIN').",
+                        "description": "SSH private key - either a LOCAL file path (e.g., C:\\Users\\you\\.ssh\\id_rsa) OR the key content directly (starting with '-----BEGIN'). Use this OR password.",
+                    },
+                    "password": {
+                        "type": "string",
+                        "description": "SSH password for authentication. Use this OR private_key. Requires sshpass on the Torque agent.",
                     },
                     "command": {
                         "type": "string",
@@ -842,6 +848,7 @@ Same network rules: only for unreachable internal network targets.
 For local network/VMs, use regular `ssh` in terminal.
 
 **private_key** accepts a file path OR raw key content ('-----BEGIN...').
+Alternatively, use **password** for password-based SSH authentication (requires sshpass on the agent).
 
 **DANGEROUS COMMANDS** (may kill our Torque agent if running there): docker restart/stop/kill,
 systemctl restart docker, reboot, shutdown, init 0/6""",
@@ -858,7 +865,11 @@ systemctl restart docker, reboot, shutdown, init 0/6""",
                     },
                     "private_key": {
                         "type": "string",
-                        "description": "SSH private key - either a LOCAL file path OR the key content directly (starting with '-----BEGIN').",
+                        "description": "SSH private key - either a LOCAL file path OR the key content directly (starting with '-----BEGIN'). Use this OR password.",
+                    },
+                    "password": {
+                        "type": "string",
+                        "description": "SSH password for authentication. Use this OR private_key. Requires sshpass on the Torque agent.",
                     },
                     "command": {
                         "type": "string",
@@ -1136,6 +1147,7 @@ async def handle_run_on_tunneled_ssh(arguments: dict):
     target_ip = arguments.get("host") or _config["default_target_ip"]
     ssh_user = arguments.get("user") or _config["default_ssh_user"]
     private_key_value = arguments.get("private_key") or _config["default_ssh_key"]
+    ssh_password = arguments.get("password") or _config.get("default_ssh_password")
     command = arguments.get("command")
     files = arguments.get("upload_files", [])
     agent = arguments.get("torque_agent")
@@ -1158,10 +1170,16 @@ async def handle_run_on_tunneled_ssh(arguments: dict):
             text="Error: Must provide either 'command' or 'upload_files' (or both).",
         )]
     
-    if not all([target_ip, ssh_user, private_key_value]):
+    if not all([target_ip, ssh_user]):
         return [TextContent(
             type="text",
-            text="Error: Missing required parameters. Need host, user, private_key (or configure defaults).",
+            text="Error: Missing required parameters. Need host and user (or configure defaults).",
+        )]
+    
+    if not private_key_value and not ssh_password:
+        return [TextContent(
+            type="text",
+            text="Error: Missing authentication. Need private_key or password (or configure defaults).",
         )]
     
     if not all([torque_url, torque_token, torque_space]):
@@ -1176,10 +1194,13 @@ async def handle_run_on_tunneled_ssh(arguments: dict):
         if warning:
             return [TextContent(type="text", text=warning)]
     
-    try:
-        ssh_private_key = resolve_ssh_private_key(private_key_value)
-    except ValueError as e:
-        return [TextContent(type="text", text=f"Error: {str(e)}")]
+    # Resolve SSH private key (only if provided)
+    ssh_private_key = ""
+    if private_key_value:
+        try:
+            ssh_private_key = resolve_ssh_private_key(private_key_value)
+        except ValueError as e:
+            return [TextContent(type="text", text=f"Error: {str(e)}")]
     
     # Process files parameter - generate deployment commands
     files_info = []
@@ -1232,6 +1253,7 @@ async def handle_run_on_tunneled_ssh(arguments: dict):
                 auto_cleanup=auto_delete,
                 log_callback=log_callback,
                 init_commands=init_commands,
+                ssh_password=ssh_password,
             )
             
             # Try to get grain log for additional context (especially useful on failures)
@@ -1708,6 +1730,7 @@ async def handle_run_on_tunneled_ssh_async(arguments: dict):
     target_ip = arguments.get("host") or _config["default_target_ip"]
     ssh_user = arguments.get("user") or _config["default_ssh_user"]
     private_key_value = arguments.get("private_key") or _config["default_ssh_key"]
+    ssh_password = arguments.get("password") or _config.get("default_ssh_password")
     command = arguments.get("command")
     files = arguments.get("upload_files", [])
     agent = arguments.get("torque_agent")
@@ -1720,8 +1743,11 @@ async def handle_run_on_tunneled_ssh_async(arguments: dict):
     if not command and not files:
         return [TextContent(type="text", text="Error: Must provide either 'command' or 'upload_files' (or both).")]
     
-    if not all([target_ip, ssh_user, private_key_value]):
-        return [TextContent(type="text", text="Error: Missing required parameters. Need host, user, private_key (or configure defaults).")]
+    if not all([target_ip, ssh_user]):
+        return [TextContent(type="text", text="Error: Missing required parameters. Need host and user (or configure defaults).")]
+    
+    if not private_key_value and not ssh_password:
+        return [TextContent(type="text", text="Error: Missing authentication. Need private_key or password (or configure defaults).")]
     
     # Check for dangerous commands
     if command and not allow_dangerous_commands:
@@ -1729,10 +1755,13 @@ async def handle_run_on_tunneled_ssh_async(arguments: dict):
         if warning:
             return [TextContent(type="text", text=warning)]
     
-    try:
-        ssh_private_key = resolve_ssh_private_key(private_key_value)
-    except ValueError as e:
-        return [TextContent(type="text", text=f"Error: {str(e)}")]
+    # Resolve SSH private key (only if provided)
+    ssh_private_key = ""
+    if private_key_value:
+        try:
+            ssh_private_key = resolve_ssh_private_key(private_key_value)
+        except ValueError as e:
+            return [TextContent(type="text", text=f"Error: {str(e)}")]
     
     # Process files
     files_info = []
@@ -1758,6 +1787,7 @@ async def handle_run_on_tunneled_ssh_async(arguments: dict):
                 agent=agent,
                 init_commands=init_commands,
                 timeout=timeout,
+                ssh_password=ssh_password,
             )
         
         # Start background streaming of grain log to stderr
@@ -2371,6 +2401,7 @@ async def cli_dispatch(args):
             target_ip = _config["default_target_ip"]
             ssh_user = getattr(args, 'user', None) or _config["default_ssh_user"]
             ssh_key_path = getattr(args, 'key', None) or _config["default_ssh_key"]
+            ssh_password = getattr(args, 'password', None) or _config["default_ssh_password"]
             agent = getattr(args, 'torque_agent', None)
             timeout = getattr(args, 'timeout', None)
             allow_dangerous_commands = getattr(args, 'allow_dangerous_commands', False)
@@ -2383,8 +2414,12 @@ async def cli_dispatch(args):
                 print("Error: Must provide a command or --upload files (or both).", file=sys.stderr)
                 sys.exit(1)
             
-            if not all([target_ip, ssh_user, ssh_key_path]):
-                print("Error: Missing host, user, or SSH key. Use --host, --user, --key or set defaults.", file=sys.stderr)
+            if not all([target_ip, ssh_user]):
+                print("Error: Missing host or user. Use --host, --user or set defaults.", file=sys.stderr)
+                sys.exit(1)
+            
+            if not ssh_key_path and not ssh_password:
+                print("Error: Missing authentication. Use --key or --password (or set defaults).", file=sys.stderr)
                 sys.exit(1)
             
             # Check dangerous commands
@@ -2394,11 +2429,13 @@ async def cli_dispatch(args):
                     print(warning, file=sys.stderr)
                     sys.exit(2)
             
-            try:
-                ssh_key = resolve_ssh_private_key(ssh_key_path)
-            except ValueError as e:
-                print(f"Error: {e}", file=sys.stderr)
-                sys.exit(1)
+            ssh_key = ""
+            if ssh_key_path:
+                try:
+                    ssh_key = resolve_ssh_private_key(ssh_key_path)
+                except ValueError as e:
+                    print(f"Error: {e}", file=sys.stderr)
+                    sys.exit(1)
             
             # Process file uploads
             init_commands = None
@@ -2425,6 +2462,7 @@ async def cli_dispatch(args):
                     auto_cleanup=_config["auto_delete_environments"],
                     log_callback=cli_log_callback(""),
                     init_commands=init_commands,
+                    ssh_password=ssh_password,
                 )
             
             if output_json:
@@ -2701,22 +2739,29 @@ async def cli_dispatch(args):
             target_ip = _config["default_target_ip"]
             ssh_user = getattr(args, 'user', None) or _config["default_ssh_user"]
             ssh_key_path = getattr(args, 'key', None) or _config["default_ssh_key"]
+            ssh_password = getattr(args, 'password', None) or _config["default_ssh_password"]
             agent = getattr(args, 'torque_agent', None)
             timeout = getattr(args, 'timeout', None)
             max_size = getattr(args, 'max_size', 102400)
             
-            if not all([target_ip, ssh_user, ssh_key_path]):
-                print("Error: Missing target, user, or SSH key.", file=sys.stderr)
+            if not all([target_ip, ssh_user]):
+                print("Error: Missing target or user.", file=sys.stderr)
                 sys.exit(1)
             
-            try:
-                ssh_key = resolve_ssh_private_key(ssh_key_path)
-            except ValueError as e:
-                print(f"Error: {e}", file=sys.stderr)
+            if not ssh_key_path and not ssh_password:
+                print("Error: Missing authentication. Use --key or --password.", file=sys.stderr)
                 sys.exit(1)
+            
+            ssh_key = ""
+            if ssh_key_path:
+                try:
+                    ssh_key = resolve_ssh_private_key(ssh_key_path)
+                except ValueError as e:
+                    print(f"Error: {e}", file=sys.stderr)
+                    sys.exit(1)
             
             # Build safe read command
-            escaped_path = args.path.replace("'", "'\\''")
+            escaped_path = args.path.replace("'", "'\\''") 
             cmd = f"head -c {max_size} '{escaped_path}' 2>/dev/null || cat '{escaped_path}' 2>&1"
             
             async with get_torque_client() as client:
@@ -2728,6 +2773,7 @@ async def cli_dispatch(args):
                     agent=agent,
                     timeout=timeout,
                     auto_cleanup=_config["auto_delete_environments"],
+                    ssh_password=ssh_password,
                 )
             
             if result.status == "completed":
@@ -2742,20 +2788,27 @@ async def cli_dispatch(args):
             target_ip = _config["default_target_ip"]
             ssh_user = getattr(args, 'user', None) or _config["default_ssh_user"]
             ssh_key_path = getattr(args, 'key', None) or _config["default_ssh_key"]
+            ssh_password = getattr(args, 'password', None) or _config["default_ssh_password"]
             agent = getattr(args, 'torque_agent', None)
             timeout = getattr(args, 'timeout', None)
             show_all = getattr(args, 'all', False)
             long_format = getattr(args, 'long', False)
             
-            if not all([target_ip, ssh_user, ssh_key_path]):
-                print("Error: Missing target, user, or SSH key.", file=sys.stderr)
+            if not all([target_ip, ssh_user]):
+                print("Error: Missing target or user.", file=sys.stderr)
                 sys.exit(1)
             
-            try:
-                ssh_key = resolve_ssh_private_key(ssh_key_path)
-            except ValueError as e:
-                print(f"Error: {e}", file=sys.stderr)
+            if not ssh_key_path and not ssh_password:
+                print("Error: Missing authentication. Use --key or --password.", file=sys.stderr)
                 sys.exit(1)
+            
+            ssh_key = ""
+            if ssh_key_path:
+                try:
+                    ssh_key = resolve_ssh_private_key(ssh_key_path)
+                except ValueError as e:
+                    print(f"Error: {e}", file=sys.stderr)
+                    sys.exit(1)
             
             # Build ls command
             flags = "-"
@@ -2765,7 +2818,7 @@ async def cli_dispatch(args):
                 flags += "lh"
             flags = flags if len(flags) > 1 else ""
             
-            escaped_path = args.path.replace("'", "'\\''")
+            escaped_path = args.path.replace("'", "'\\''") 
             cmd = f"ls {flags} '{escaped_path}'" if flags else f"ls '{escaped_path}'"
             
             async with get_torque_client() as client:
@@ -2777,6 +2830,7 @@ async def cli_dispatch(args):
                     agent=agent,
                     timeout=timeout,
                     auto_cleanup=_config["auto_delete_environments"],
+                    ssh_password=ssh_password,
                 )
             
             if result.status == "completed":
@@ -2823,6 +2877,11 @@ def main():
         "--ssh-key",
         default=os.environ.get("SSH_KEY"),
         help="SSH private key - file path or key content (env: $SSH_KEY)",
+    )
+    common_parser.add_argument(
+        "--ssh-password",
+        default=os.environ.get("SSH_PASSWORD"),
+        help="SSH password for authentication (env: $SSH_PASSWORD)",
     )
     common_parser.add_argument(
         "--host",
@@ -2901,7 +2960,7 @@ Examples:
 
 Environment Variables:
   TORQUE_URL, TORQUE_TOKEN, TORQUE_SPACE, TORQUE_AGENT
-  SSH_KEY, TARGET_HOST, SSH_USER
+  SSH_KEY, SSH_PASSWORD, TARGET_HOST, SSH_USER
 
 UPLOAD FORMAT:
   --upload LOCAL:REMOTE[:MODE]
@@ -2943,6 +3002,7 @@ PERFORMANCE TIP:
     ssh_parser.add_argument("cmd", nargs='?', help="The shell command to execute (optional if --upload used)")
     ssh_parser.add_argument("--user", "-u", help="SSH username (overrides --ssh-user)")
     ssh_parser.add_argument("--key", "-k", help="SSH private key - file path or key content (overrides --ssh-key)")
+    ssh_parser.add_argument("--password", help="SSH password for authentication (overrides --ssh-password)")
     ssh_parser.add_argument("--timeout", type=int, help="Timeout in seconds")
     ssh_parser.add_argument("--allow-dangerous-commands", action="store_true", help="Bypass dangerous command warnings (use with extreme caution)")
     ssh_parser.add_argument("--json", "-j", action="store_true", help="Output as JSON")
@@ -2975,6 +3035,7 @@ PERFORMANCE TIP:
     read_parser.add_argument("path", help="Remote file path to read")
     read_parser.add_argument("--user", "-u", help="SSH username")
     read_parser.add_argument("--key", "-k", help="SSH private key - file path or key content")
+    read_parser.add_argument("--password", help="SSH password for authentication")
     read_parser.add_argument("--timeout", type=int, help="Timeout in seconds")
     read_parser.add_argument("--max-size", type=int, default=102400, help="Max file size in bytes (default: 100KB)")
     
@@ -2983,6 +3044,7 @@ PERFORMANCE TIP:
     list_parser.add_argument("path", help="Remote directory path")
     list_parser.add_argument("--user", "-u", help="SSH username")
     list_parser.add_argument("--key", "-k", help="SSH private key - file path or key content")
+    list_parser.add_argument("--password", help="SSH password for authentication")
     list_parser.add_argument("--timeout", type=int, help="Timeout in seconds")
     list_parser.add_argument("--all", "-A", action="store_true", help="Show hidden files")
     list_parser.add_argument("--long", "-l", action="store_true", help="Long format with details")
@@ -2995,6 +3057,7 @@ PERFORMANCE TIP:
     _config["torque_space"] = args.torque_space
     _config["default_agent"] = args.torque_agent
     _config["default_ssh_key"] = args.ssh_key
+    _config["default_ssh_password"] = args.ssh_password
     _config["default_target_ip"] = args.host
     _config["default_ssh_user"] = args.ssh_user
     _config["init_commands"] = args.init_commands

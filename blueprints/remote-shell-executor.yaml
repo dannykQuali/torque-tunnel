@@ -20,8 +20,14 @@ inputs:
     description: The SSH username to connect with
   ssh_private_key:
     type: string
-    description: The SSH private key in PEM format for authentication
+    description: The SSH private key in PEM format for authentication (use this OR ssh_password)
     sensitive: true
+    default: ""
+  ssh_password:
+    type: string
+    description: SSH password for authentication (use this OR ssh_private_key)
+    sensitive: true
+    default: ""
   command_b64:
     type: string
     description: Base64-encoded shell command(s) to execute on the remote host
@@ -70,12 +76,41 @@ grains:
                 
                 # Wrap the main logic in a function so we can capture any errors
                 __run_main() {
-                  # Save the private key to temp file
-                  KEY_FILE=$(mktemp)
-                  cat << 'KEYEOF' > "$KEY_FILE"
+                  # Determine auth method: private key or password
+                  SSH_AUTH_ARGS=""
+                  KEY_FILE=""
+                  SSH_PASS_PREFIX=""
+                  
+                  SSH_PASSWORD='{{ .inputs.ssh_password }}'
+                  SSH_PRIVATE_KEY='{{ .inputs.ssh_private_key }}'
+                  
+                  if [ -n "$SSH_PRIVATE_KEY" ]; then
+                    # Key-based authentication
+                    KEY_FILE=$(mktemp)
+                    cat << 'KEYEOF' > "$KEY_FILE"
                 {{ .inputs.ssh_private_key }}
                 KEYEOF
-                  chmod 600 "$KEY_FILE"
+                    chmod 600 "$KEY_FILE"
+                    SSH_AUTH_ARGS="-i $KEY_FILE"
+                  elif [ -n "$SSH_PASSWORD" ]; then
+                    # Password-based authentication using sshpass
+                    if ! command -v sshpass &>/dev/null; then
+                      # Try install without apt-get update first (~2s vs ~17s with update)
+                      apt-get install -y -qq sshpass >/dev/null 2>&1 \
+                        || { apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq sshpass >/dev/null 2>&1; }
+                      if ! command -v sshpass &>/dev/null; then
+                        echo "ERROR: Failed to install sshpass. Use private_key authentication instead." >&2
+                        echo "1" > "$EXIT_CODE_FILE"
+                        return
+                      fi
+                    fi
+                    SSH_AUTH_ARGS="-o PubkeyAuthentication=no"
+                    SSH_PASS_PREFIX="sshpass -p '$SSH_PASSWORD'"
+                  else
+                    echo "ERROR: Either ssh_private_key or ssh_password must be provided." >&2
+                    echo "1" > "$EXIT_CODE_FILE"
+                    return
+                  fi
                   
                   REMOTE_SCRIPT=$(mktemp)
                   
@@ -131,13 +166,24 @@ grains:
                   TIMEOUT_SECONDS=$(( {{ .inputs.timeout_minutes }} * 60 ))
                   
                   START_TIME=$(date +%s%3N 2>/dev/null || echo "$(date +%s)000")
-                  timeout "${TIMEOUT_SECONDS}" \
-                  ssh -o StrictHostKeyChecking=no \
-                      -o UserKnownHostsFile=/dev/null \
-                      -o LogLevel=ERROR \
-                      -i "$KEY_FILE" \
-                      "{{ .inputs.ssh_user }}@{{ .inputs.target_ip }}" \
-                      "bash -s" < "$REMOTE_SCRIPT" 2>&1 | tee "$OUTPUT_FILE"
+                  if [ -n "$SSH_PASS_PREFIX" ]; then
+                    timeout "${TIMEOUT_SECONDS}" \
+                    sshpass -p "$SSH_PASSWORD" \
+                    ssh -o StrictHostKeyChecking=no \
+                        -o UserKnownHostsFile=/dev/null \
+                        -o LogLevel=ERROR \
+                        -o PubkeyAuthentication=no \
+                        "{{ .inputs.ssh_user }}@{{ .inputs.target_ip }}" \
+                        "bash -s" < "$REMOTE_SCRIPT" 2>&1 | tee "$OUTPUT_FILE"
+                  else
+                    timeout "${TIMEOUT_SECONDS}" \
+                    ssh -o StrictHostKeyChecking=no \
+                        -o UserKnownHostsFile=/dev/null \
+                        -o LogLevel=ERROR \
+                        -i "$KEY_FILE" \
+                        "{{ .inputs.ssh_user }}@{{ .inputs.target_ip }}" \
+                        "bash -s" < "$REMOTE_SCRIPT" 2>&1 | tee "$OUTPUT_FILE"
+                  fi
                   SSH_STATUS=${PIPESTATUS[0]}
                   # timeout returns 124 when the command times out
                   if [ $SSH_STATUS -eq 124 ]; then

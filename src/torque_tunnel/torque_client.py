@@ -117,13 +117,14 @@ class TorqueClient:
         self,
         target_ip: str,
         ssh_user: str,
-        ssh_private_key: str,
-        command: str,
+        ssh_private_key: str = "",
+        command: str = "",
         agent: Optional[str] = None,
         environment_name: Optional[str] = None,
         init_commands: Optional[str] = None,
         finally_commands: Optional[str] = None,
         timeout: Optional[int] = None,
+        ssh_password: Optional[str] = None,
     ) -> str:
         """
         Start a new environment to execute remote command.
@@ -131,13 +132,14 @@ class TorqueClient:
         Args:
             target_ip: Target host IP/hostname
             ssh_user: SSH username
-            ssh_private_key: SSH private key (raw PEM format)
+            ssh_private_key: SSH private key (raw PEM format). Use this OR ssh_password.
             command: Command to execute
             agent: Agent name (uses default if not specified)
             environment_name: Optional name for the environment
             init_commands: Optional commands to run before main command (overrides instance default)
             finally_commands: Optional cleanup commands (overrides instance default)
             timeout: Optional timeout override in seconds (overrides instance default)
+            ssh_password: SSH password for authentication. Use this OR ssh_private_key.
             
         Returns:
             Environment ID
@@ -170,7 +172,8 @@ class TorqueClient:
             "agent": agent_name,
             "target_ip": target_ip,
             "ssh_user": ssh_user,
-            "ssh_private_key": ssh_private_key,
+            "ssh_private_key": ssh_private_key or "",
+            "ssh_password": ssh_password or "",
             "command_b64": base64.b64encode(command.encode()).decode(),
             "timeout_minutes": str(timeout_minutes),
         }
@@ -694,14 +697,15 @@ class TorqueClient:
         self,
         target_ip: str,
         ssh_user: str,
-        ssh_private_key: str,
-        command: str,
+        ssh_private_key: str = "",
+        command: str = "",
         agent: Optional[str] = None,
         auto_cleanup: bool = True,
         timeout: Optional[int] = None,
         log_callback: Optional[Callable[[str], Awaitable[None]]] = None,
         init_commands: Optional[str] = None,
         finally_commands: Optional[str] = None,
+        ssh_password: Optional[str] = None,
     ) -> EnvironmentResult:
         """
         Execute a remote command and wait for result.
@@ -715,7 +719,7 @@ class TorqueClient:
         Args:
             target_ip: Target host IP/hostname
             ssh_user: SSH username
-            ssh_private_key: SSH private key content
+            ssh_private_key: SSH private key content. Use this OR ssh_password.
             command: Command to execute
             agent: Agent name (uses default if not specified)
             auto_cleanup: Whether to automatically end the environment after completion
@@ -723,6 +727,7 @@ class TorqueClient:
             log_callback: Optional async callback for streaming log updates
             init_commands: Optional commands to run before main command (overrides instance default)
             finally_commands: Optional cleanup commands (overrides instance default)
+            ssh_password: SSH password for authentication. Use this OR ssh_private_key.
             
         Returns:
             EnvironmentResult with command output
@@ -735,6 +740,7 @@ class TorqueClient:
             agent=agent,
             init_commands=init_commands,
             finally_commands=finally_commands,
+            ssh_password=ssh_password,
         )
         
         result = None
