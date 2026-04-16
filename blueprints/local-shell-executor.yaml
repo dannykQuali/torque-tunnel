@@ -14,14 +14,14 @@ inputs:
     default: '30'
   command_b64:
     type: string
-    description: Base64-encoded shell command(s) to execute on the agent
+    description: Gzip-compressed and base64-encoded shell command(s) to execute on the agent
   init_commands_b64:
     type: string
-    description: Base64-encoded init commands (optional)
+    description: Gzip-compressed and base64-encoded init commands (optional)
     default: ""
   finally_commands_b64:
     type: string
-    description: Base64-encoded finally commands (optional)
+    description: Gzip-compressed and base64-encoded finally commands (optional)
     default: ""
 
 outputs:
@@ -62,13 +62,13 @@ grains:
                   SCRIPT_FILE=$(mktemp)
                   
                   # Decode base64 inputs directly to files
-                  echo '{{ .inputs.command_b64 }}' | base64 -d > "$SCRIPT_FILE"
+                  echo '{{ .inputs.command_b64 }}' | base64 -d | gzip -d > "$SCRIPT_FILE"
                   
                   INIT_FILE=$(mktemp)
-                  echo '{{ .inputs.init_commands_b64 }}' | base64 -d > "$INIT_FILE" 2>/dev/null || true
+                  echo '{{ .inputs.init_commands_b64 }}' | base64 -d | gzip -d > "$INIT_FILE" 2>/dev/null || true
                   
                   FINALLY_FILE=$(mktemp)
-                  echo '{{ .inputs.finally_commands_b64 }}' | base64 -d > "$FINALLY_FILE" 2>/dev/null || true
+                  echo '{{ .inputs.finally_commands_b64 }}' | base64 -d | gzip -d > "$FINALLY_FILE" 2>/dev/null || true
                   
                   # Build combined script
                   COMBINED=$(mktemp)

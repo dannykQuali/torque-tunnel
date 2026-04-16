@@ -4,6 +4,7 @@ Torque API Client for interacting with Quali Torque REST API.
 
 import asyncio
 import base64
+import gzip
 import re
 import sys
 import time
@@ -125,6 +126,7 @@ class TorqueClient:
         finally_commands: Optional[str] = None,
         timeout: Optional[int] = None,
         ssh_password: Optional[str] = None,
+        container_pre_commands: Optional[str] = None,
     ) -> str:
         """
         Start a new environment to execute remote command.
@@ -140,6 +142,8 @@ class TorqueClient:
             finally_commands: Optional cleanup commands (overrides instance default)
             timeout: Optional timeout override in seconds (overrides instance default)
             ssh_password: SSH password for authentication. Use this OR ssh_private_key.
+            container_pre_commands: Optional commands to run on the container BEFORE SSH
+                (e.g., croc file receive + SCP to target). Only used by remote-shell-executor.
             
         Returns:
             Environment ID
@@ -174,14 +178,18 @@ class TorqueClient:
             "ssh_user": ssh_user,
             "ssh_private_key": ssh_private_key or "",
             "ssh_password": ssh_password or "",
-            "command_b64": base64.b64encode(command.encode()).decode(),
+            "command_b64": base64.b64encode(gzip.compress(command.encode())).decode(),
             "timeout_minutes": str(timeout_minutes),
         }
         # Only include optional inputs if they have values
+        # All b64 inputs are gzip-compressed before base64 encoding to reduce payload size.
+        # The blueprints decode with: base64 -d | gzip -d
         if effective_init:
-            inputs["init_commands_b64"] = base64.b64encode(effective_init.encode()).decode()
+            inputs["init_commands_b64"] = base64.b64encode(gzip.compress(effective_init.encode())).decode()
         if effective_finally:
-            inputs["finally_commands_b64"] = base64.b64encode(effective_finally.encode()).decode()
+            inputs["finally_commands_b64"] = base64.b64encode(gzip.compress(effective_finally.encode())).decode()
+        if container_pre_commands:
+            inputs["container_pre_commands_b64"] = base64.b64encode(gzip.compress(container_pre_commands.encode())).decode()
         
         payload = {
             "blueprint_name": self.BLUEPRINT_NAME,
@@ -249,14 +257,16 @@ class TorqueClient:
         
         inputs = {
             "agent": agent_name,
-            "command_b64": base64.b64encode(command.encode()).decode(),
+            "command_b64": base64.b64encode(gzip.compress(command.encode())).decode(),
             "timeout_minutes": str(timeout_minutes),
         }
         # Only include optional inputs if they have values
+        # All b64 inputs are gzip-compressed before base64 encoding to reduce payload size.
+        # The blueprints decode with: base64 -d | gzip -d
         if combined_init:
-            inputs["init_commands_b64"] = base64.b64encode(combined_init.encode()).decode()
+            inputs["init_commands_b64"] = base64.b64encode(gzip.compress(combined_init.encode())).decode()
         if self.finally_commands:
-            inputs["finally_commands_b64"] = base64.b64encode(self.finally_commands.encode()).decode()
+            inputs["finally_commands_b64"] = base64.b64encode(gzip.compress(self.finally_commands.encode())).decode()
         
         payload = {
             "blueprint_name": self.LOCAL_BLUEPRINT_NAME,
@@ -706,6 +716,7 @@ class TorqueClient:
         init_commands: Optional[str] = None,
         finally_commands: Optional[str] = None,
         ssh_password: Optional[str] = None,
+        container_pre_commands: Optional[str] = None,
     ) -> EnvironmentResult:
         """
         Execute a remote command and wait for result.
@@ -728,6 +739,8 @@ class TorqueClient:
             init_commands: Optional commands to run before main command (overrides instance default)
             finally_commands: Optional cleanup commands (overrides instance default)
             ssh_password: SSH password for authentication. Use this OR ssh_private_key.
+            container_pre_commands: Optional commands to run on the container BEFORE SSH
+                (e.g., croc file receive + SCP to target).
             
         Returns:
             EnvironmentResult with command output
@@ -741,6 +754,7 @@ class TorqueClient:
             init_commands=init_commands,
             finally_commands=finally_commands,
             ssh_password=ssh_password,
+            container_pre_commands=container_pre_commands,
         )
         
         result = None

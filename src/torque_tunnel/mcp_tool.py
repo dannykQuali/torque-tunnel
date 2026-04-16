@@ -9,9 +9,12 @@ import base64
 import gzip
 import os
 import re
+import shutil
 import sys
 import asyncio
 import argparse
+import tempfile
+from dataclasses import dataclass, field
 from typing import Optional, Callable, Awaitable
 
 import httpx
@@ -25,6 +28,7 @@ from mcp.types import (
 )
 
 from .torque_client import TorqueClient
+from . import croc_manager
 
 
 # Shared compiled patterns for filtering grain/execution logs.
@@ -235,16 +239,16 @@ def is_valid_ssh_private_key(content: str) -> bool:
 
 def resolve_ssh_private_key(value: str) -> str:
     """
-    Resolve SSH private key from either a file path or key content.
+    Resolve SSH private key from a file path, key content, or base64-encoded key.
     
     Args:
-        value: Either a file path or the key content directly
+        value: A file path, the key content directly, or base64-encoded key content
         
     Returns:
         Normalized SSH private key content
         
     Raises:
-        ValueError: If the value is neither a valid file path nor valid key content
+        ValueError: If the value is not a valid file path, key content, or base64-encoded key
     """
     if not value:
         raise ValueError("SSH private key is required")
@@ -260,11 +264,19 @@ def resolve_ssh_private_key(value: str) -> str:
     if is_valid_ssh_private_key(value):
         return normalize_ssh_key(value)
     
-    # Neither a valid file nor valid key content
+    # Try base64 decoding (key may have been passed as base64-encoded string)
+    try:
+        decoded = base64.b64decode(value, validate=True).decode('utf-8')
+        if is_valid_ssh_private_key(decoded):
+            return normalize_ssh_key(decoded)
+    except Exception:
+        pass
+    
+    # Neither a valid file, valid key content, nor valid base64-encoded key
     raise ValueError(
         f"Invalid private_key: '{value[:50]}{'...' if len(value) > 50 else ''}' "
-        f"is not a valid file path and doesn't look like SSH private key content. "
-        f"Provide either a path to an existing key file or the key content starting with '-----BEGIN'"
+        f"is not a valid file path, SSH private key content, or base64-encoded key. "
+        f"Provide a path to a key file, the key content starting with '-----BEGIN', or a base64-encoded key."
     )
 
 
@@ -391,6 +403,315 @@ def prepare_files_deployment(files: list[dict]) -> tuple[str, list[str]]:
     return "\n".join(commands), []
 
 
+@dataclass
+class FileDeploymentPlan:
+    """Result of preparing files for deployment, potentially using croc for large files.
+    
+    For small files: only inline_commands is populated (existing base64 approach).
+    For large files: croc fields are populated, and the caller must manage the croc lifecycle.
+    """
+    # Shell commands for inline (small) files — runs on the target/container
+    inline_commands: str = ""
+    # Shell commands for croc install + receive — runs where croc receive needs to happen
+    croc_init_commands: str = ""
+    # Shell commands for croc receive + SCP (SSH targets only) — runs on the CONTAINER
+    croc_container_pre_commands: str = ""
+    # The croc secret code (needed to start local croc send)
+    croc_code: str = ""
+    # Local file paths that need croc send
+    croc_local_files: list[str] = field(default_factory=list)
+    # Temp staging directory for uniquely-named files (cleaned up after transfer)
+    croc_staging_dir: str = ""
+    # Whether croc transfer is needed
+    needs_croc: bool = False
+    # Errors during preparation
+    errors: list[str] = field(default_factory=list)
+    # File info strings for output reporting
+    files_info: list[str] = field(default_factory=list)
+
+
+def prepare_files_with_croc(
+    files: list[dict],
+    transfer_mode: str = "container",
+    target_ip: str = "",
+    ssh_user: str = "",
+    ssh_private_key: str = "",
+    ssh_password: str = "",
+) -> FileDeploymentPlan:
+    """Prepare file deployment, using croc for files exceeding the inline threshold.
+    
+    Splits files into two groups:
+    - Small files (compressed < 300KB): deployed via inline base64 (existing approach)
+    - Large files: deployed via croc (peer-to-peer encrypted transfer)
+    
+    Args:
+        files: List of file specs (same format as prepare_files_deployment).
+        transfer_mode: "container" for disposable/persistent containers,
+                       "ssh" for SSH targets (requires croc receive on container + SCP).
+        target_ip: SSH target IP (only for transfer_mode="ssh").
+        ssh_user: SSH user (only for transfer_mode="ssh").
+        ssh_private_key: SSH private key (only for transfer_mode="ssh").
+        ssh_password: SSH password (only for transfer_mode="ssh").
+    
+    Returns:
+        FileDeploymentPlan with deployment commands and croc transfer info.
+    """
+    import tarfile
+    import io
+    
+    plan = FileDeploymentPlan()
+    
+    if not files:
+        return plan
+    
+    inline_files = []  # Files that fit inline
+    croc_files = []    # Files that need croc
+    
+    for i, file_spec in enumerate(files):
+        remote_path = file_spec.get("remote_destination_path")
+        local_path = file_spec.get("local_source_path")
+        content = file_spec.get("content")
+        mode = file_spec.get("mode")
+        
+        if not remote_path:
+            plan.errors.append(f"File {i+1}: missing 'remote_destination_path'")
+            continue
+        
+        if local_path and content:
+            plan.errors.append(f"File {i+1}: provide either 'local_source_path' OR 'content', not both")
+            continue
+        elif not local_path and not content:
+            plan.errors.append(f"File {i+1}: must provide either 'local_source_path' or 'content'")
+            continue
+        
+        # Track file info for reporting
+        plan.files_info.append(
+            f"{local_path or '<content>'} -> {remote_path}"
+        )
+        
+        # Content-based files always go inline (they're typically small)
+        if content:
+            inline_files.append(file_spec)
+            continue
+        
+        # Check local file/directory size
+        expanded = os.path.expanduser(local_path)
+        if not os.path.exists(expanded):
+            plan.errors.append(f"File {i+1}: local path not found: {local_path}")
+            continue
+        
+        if os.path.isdir(expanded):
+            # For directories, estimate compressed size by creating the tar in memory
+            try:
+                tar_buffer = io.BytesIO()
+                with tarfile.open(fileobj=tar_buffer, mode='w:gz') as tar:
+                    for root, dirs, filenames in os.walk(expanded):
+                        for filename in filenames:
+                            full_path = os.path.join(root, filename)
+                            arcname = os.path.relpath(full_path, expanded)
+                            tar.add(full_path, arcname=arcname)
+                        for dirname in dirs:
+                            full_path = os.path.join(root, dirname)
+                            arcname = os.path.relpath(full_path, expanded)
+                            tar.add(full_path, arcname=arcname, recursive=False)
+                compressed_size = tar_buffer.tell()
+                
+                if compressed_size > croc_manager.CROC_THRESHOLD_BYTES:
+                    croc_files.append(file_spec)
+                else:
+                    # Store pre-computed tar for inline use
+                    file_spec["_tar_b64"] = base64.b64encode(tar_buffer.getvalue()).decode("ascii")
+                    inline_files.append(file_spec)
+            except Exception as e:
+                plan.errors.append(f"File {i+1}: error reading directory: {e}")
+                continue
+        else:
+            # Regular file — check compressed size
+            try:
+                with open(expanded, 'rb') as f:
+                    file_bytes = f.read()
+                compressed = gzip.compress(file_bytes)
+                compressed_size = len(compressed)
+                
+                if compressed_size > croc_manager.CROC_THRESHOLD_BYTES:
+                    croc_files.append(file_spec)
+                else:
+                    # Store pre-computed compressed data for inline use
+                    file_spec["_compressed_b64"] = base64.b64encode(compressed).decode("ascii")
+                    inline_files.append(file_spec)
+            except Exception as e:
+                plan.errors.append(f"File {i+1}: error reading file: {e}")
+                continue
+    
+    if plan.errors:
+        return plan
+    
+    # --- Generate inline commands for small files ---
+    if inline_files:
+        commands = ["# === File Deployment (inline) ==="]
+        for file_spec in inline_files:
+            remote_path = file_spec["remote_destination_path"]
+            local_path = file_spec.get("local_source_path")
+            content = file_spec.get("content")
+            mode = file_spec.get("mode")
+            escaped_remote = remote_path.replace("'", "'\\''")
+            remote_dir = os.path.dirname(remote_path)
+            escaped_dir = remote_dir.replace("'", "'\\''") if remote_dir else ""
+            
+            if local_path:
+                expanded = os.path.expanduser(local_path)
+                if os.path.isdir(expanded):
+                    tar_b64 = file_spec.get("_tar_b64")
+                    if not tar_b64:
+                        # Should not happen, but compute if needed
+                        import tarfile as tf_mod
+                        buf = io.BytesIO()
+                        with tf_mod.open(fileobj=buf, mode='w:gz') as tar:
+                            for root, dirs, filenames in os.walk(expanded):
+                                for fn in filenames:
+                                    fp = os.path.join(root, fn)
+                                    tar.add(fp, arcname=os.path.relpath(fp, expanded))
+                        tar_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+                    commands.append(f"mkdir -p '{escaped_remote}'")
+                    commands.append(f"echo '{tar_b64}' | base64 -d | tar xzf - -C '{escaped_remote}'")
+                else:
+                    file_b64 = file_spec.get("_compressed_b64")
+                    if not file_b64:
+                        with open(expanded, 'rb') as f:
+                            file_b64 = base64.b64encode(gzip.compress(f.read())).decode("ascii")
+                    if escaped_dir:
+                        commands.append(f"mkdir -p '{escaped_dir}'")
+                    commands.append(f"echo '{file_b64}' | base64 -d | gzip -d > '{escaped_remote}'")
+                    if mode:
+                        commands.append(f"chmod {mode} '{escaped_remote}'")
+            else:
+                # Direct content
+                if isinstance(content, bytes):
+                    content_bytes = content
+                else:
+                    content_bytes = content.encode('utf-8')
+                content_b64 = base64.b64encode(gzip.compress(content_bytes)).decode("ascii")
+                if escaped_dir:
+                    commands.append(f"mkdir -p '{escaped_dir}'")
+                commands.append(f"echo '{content_b64}' | base64 -d | gzip -d > '{escaped_remote}'")
+                if mode:
+                    commands.append(f"chmod {mode} '{escaped_remote}'")
+        
+        commands.append("# === End File Deployment (inline) ===")
+        plan.inline_commands = "\n".join(commands)
+    
+    # --- Generate croc commands for large files ---
+    if croc_files:
+        plan.needs_croc = True
+        plan.croc_code = croc_manager.generate_croc_code()
+        
+        # Create a staging directory with uniquely-named files to avoid basename collisions.
+        # Directories are tarred to match the inline extraction semantics.
+        staging_dir = tempfile.mkdtemp(prefix="torque_croc_")
+        plan.croc_staging_dir = staging_dir
+        
+        croc_transfer_info = []
+        for i, file_spec in enumerate(croc_files):
+            local_path = file_spec["local_source_path"]
+            expanded = os.path.expanduser(local_path)
+            remote_path = file_spec["remote_destination_path"]
+            mode = file_spec.get("mode")
+            
+            basename = os.path.basename(expanded)
+            
+            if os.path.isdir(expanded):
+                # Tar directory for consistent extraction semantics (matches inline behavior)
+                unique_name = f"_croc_{i}_{basename}.tar.gz"
+                tar_path = os.path.join(staging_dir, unique_name)
+                with tarfile.open(tar_path, 'w:gz') as tar:
+                    # arcname="." puts directory contents at archive root
+                    tar.add(expanded, arcname=".")
+                plan.croc_local_files.append(tar_path)
+                croc_transfer_info.append({
+                    "croc_filename": unique_name,
+                    "remote_destination_path": remote_path,
+                    "mode": mode,
+                    "is_dir_tar": True,
+                })
+            else:
+                # Copy file with unique name to staging dir
+                unique_name = f"_croc_{i}_{basename}"
+                staged_path = os.path.join(staging_dir, unique_name)
+                shutil.copy2(expanded, staged_path)
+                plan.croc_local_files.append(staged_path)
+                croc_transfer_info.append({
+                    "croc_filename": unique_name,
+                    "remote_destination_path": remote_path,
+                    "mode": mode,
+                    "is_dir_tar": False,
+                })
+        
+        # Generate croc install + receive commands
+        croc_install = croc_manager.generate_remote_croc_install_script()
+        
+        if transfer_mode == "ssh":
+            # For SSH: croc receive happens on the CONTAINER, then SCP to target
+            croc_scp = croc_manager.generate_croc_scp_commands(
+                code=plan.croc_code,
+                file_transfers=croc_transfer_info,
+                target_ip=target_ip,
+                ssh_user=ssh_user,
+                ssh_private_key=ssh_private_key,
+                ssh_password=ssh_password,
+            )
+            plan.croc_container_pre_commands = croc_install + "\n" + croc_scp
+        else:
+            # For containers: croc receive runs directly in init_commands
+            croc_recv = croc_manager.generate_croc_receive_commands(
+                code=plan.croc_code,
+                file_transfers=croc_transfer_info,
+            )
+            plan.croc_init_commands = croc_install + "\n" + croc_recv
+    
+    # Clean up cached data from file_specs
+    for file_spec in inline_files:
+        file_spec.pop("_tar_b64", None)
+        file_spec.pop("_compressed_b64", None)
+    
+    return plan
+
+
+async def execute_with_croc(plan: FileDeploymentPlan) -> asyncio.subprocess.Process:
+    """Start the local croc send process for a deployment plan.
+    
+    Must be called BEFORE launching the Torque environment.
+    The returned process stays alive until the remote side receives.
+    Caller MUST call croc_manager.cleanup_croc_send() when done.
+    
+    Args:
+        plan: A FileDeploymentPlan with needs_croc=True.
+    
+    Returns:
+        The background croc send process.
+    """
+    croc_path = await croc_manager.ensure_local_croc()
+    process = await croc_manager.start_croc_send(
+        croc_path=croc_path,
+        code=plan.croc_code,
+        files=plan.croc_local_files,
+    )
+    return process
+
+
+async def cleanup_croc_resources(
+    croc_process: Optional[asyncio.subprocess.Process] = None,
+    staging_dir: str = "",
+) -> None:
+    """Clean up croc send process and staging directory.
+    
+    Safe to call with None/empty values.
+    """
+    if croc_process is not None:
+        await croc_manager.cleanup_croc_send(croc_process)
+    if staging_dir and os.path.exists(staging_dir):
+        shutil.rmtree(staging_dir, ignore_errors=True)
+
+
 # Global configuration - set via command line args or environment variables
 _config = {
     "torque_url": None,
@@ -416,6 +737,7 @@ _persistent_containers: dict[str, dict] = {}
 _default_persistent_container_id: Optional[str] = None
 _background_streamers: dict[str, asyncio.Task] = {}  # env_id -> background streaming task
 _streamer_cache: dict[str, dict] = {}  # env_id -> {'env_data': ..., 'status': ..., 'raw_status': ...}
+_croc_async_state: dict[str, dict] = {}  # env_id -> {"process": Process, "staging_dir": str}
 
 # Terminal statuses that indicate the environment has finished
 _TERMINAL_STATUSES = {
@@ -596,7 +918,7 @@ from your machine. The Torque agent tunnels into that network.
 
 Prefer this over running `ssh` from a container - simpler and more efficient.
 
-**private_key** accepts a file path (e.g., C:\\Users\\you\\.ssh\\id_rsa) OR raw key content ('-----BEGIN...').
+**private_key** accepts a file path (e.g., C:\\Users\\you\\.ssh\\id_rsa), raw key content ('-----BEGIN...'), or a base64-encoded key.
 Alternatively, use **password** for password-based SSH authentication (requires sshpass on the agent).
 
 Use `upload_files` to send local files/content to the target before running the command. Order: upload_files → init_commands → command → finally_commands. Use this along with chained commands to minimize calls and overhead and improve performance.
@@ -618,7 +940,7 @@ docker restart/stop/kill, systemctl restart docker, reboot, shutdown, init 0/6
                     },
                     "private_key": {
                         "type": "string",
-                        "description": "SSH private key - either a LOCAL file path (e.g., C:\\Users\\you\\.ssh\\id_rsa) OR the key content directly (starting with '-----BEGIN'). Use this OR password.",
+                        "description": "SSH private key - a LOCAL file path (e.g., C:\\Users\\you\\.ssh\\id_rsa), the key content directly (starting with '-----BEGIN'), or a base64-encoded key. Use this OR password.",
                     },
                     "password": {
                         "type": "string",
@@ -847,7 +1169,7 @@ If you don't need intermediate output or cancel early, use run_on_tunneled_ssh i
 Same network rules: only for unreachable internal network targets.
 For local network/VMs, use regular `ssh` in terminal.
 
-**private_key** accepts a file path OR raw key content ('-----BEGIN...').
+**private_key** accepts a file path, raw key content ('-----BEGIN...'), or a base64-encoded key.
 Alternatively, use **password** for password-based SSH authentication (requires sshpass on the agent).
 
 **DANGEROUS COMMANDS** (may kill our Torque agent if running there): docker restart/stop/kill,
@@ -865,7 +1187,7 @@ systemctl restart docker, reboot, shutdown, init 0/6""",
                     },
                     "private_key": {
                         "type": "string",
-                        "description": "SSH private key - either a LOCAL file path OR the key content directly (starting with '-----BEGIN'). Use this OR password.",
+                        "description": "SSH private key - a LOCAL file path, the key content directly (starting with '-----BEGIN'), or a base64-encoded key. Use this OR password.",
                     },
                     "password": {
                         "type": "string",
@@ -1202,24 +1524,28 @@ async def handle_run_on_tunneled_ssh(arguments: dict):
         except ValueError as e:
             return [TextContent(type="text", text=f"Error: {str(e)}")]
     
-    # Process files parameter - generate deployment commands
+    # Process files parameter - generate deployment commands (with croc for large files)
     files_info = []
     init_commands = None
+    container_pre_commands = None
+    plan = None
+    croc_process = None
     if files:
-        file_deploy_commands, file_errors = prepare_files_deployment(files)
-        if file_errors:
+        plan = prepare_files_with_croc(
+            files, transfer_mode="ssh",
+            target_ip=target_ip, ssh_user=ssh_user,
+            ssh_private_key=ssh_private_key, ssh_password=ssh_password,
+        )
+        if plan.errors:
             return [TextContent(
                 type="text",
-                text="Error preparing files:\n" + "\n".join(f"- {e}" for e in file_errors),
+                text="Error preparing files:\n" + "\n".join(f"- {e}" for e in plan.errors),
             )]
-        # Prepend file deployment to init_commands (files run BEFORE init)
-        if file_deploy_commands:
-            init_commands = file_deploy_commands
-        # Track files for output reporting
-        for f in files:
-            local = f.get("local_source_path", "<content>")
-            remote = f.get("remote_destination_path", "")
-            files_info.append(f"{local} -> {remote}")
+        if plan.inline_commands:
+            init_commands = plan.inline_commands
+        if plan.croc_container_pre_commands:
+            container_pre_commands = plan.croc_container_pre_commands
+        files_info = plan.files_info
     
     # If no command, use a simple echo
     effective_command = command or "echo 'Files deployed successfully'"
@@ -1233,6 +1559,13 @@ async def handle_run_on_tunneled_ssh(arguments: dict):
         pass  # Streaming not available
     
     try:
+        # Start croc send locally if needed (must happen BEFORE Torque environment)
+        if plan is not None and plan.needs_croc:
+            try:
+                croc_process = await execute_with_croc(plan)
+            except Exception as e:
+                return [TextContent(type="text", text=f"Error starting croc file transfer: {str(e)}")]
+        
         # Create client with per-call or global config
         client = TorqueClient(
             base_url=torque_url,
@@ -1254,6 +1587,7 @@ async def handle_run_on_tunneled_ssh(arguments: dict):
                 log_callback=log_callback,
                 init_commands=init_commands,
                 ssh_password=ssh_password,
+                container_pre_commands=container_pre_commands,
             )
             
             # Try to get grain log for additional context (especially useful on failures)
@@ -1325,6 +1659,8 @@ async def handle_run_on_tunneled_ssh(arguments: dict):
     
     except Exception as e:
         return [TextContent(type="text", text=f"Error executing remote command: {str(e)}")]
+    finally:
+        await cleanup_croc_resources(croc_process, plan.croc_staging_dir if plan else "")
 
 
 async def _ensure_persistent_container(
@@ -1470,22 +1806,28 @@ async def handle_run_on_tunneled_persistent_container(arguments: dict):
     except Exception as e:
         return [TextContent(type="text", text=f"Error setting up persistent container: {str(e)}")]
     
-    # Process files parameter - generate deployment commands
+    # Process files parameter - generate deployment commands (with croc for large files)
     files_info = []
     init_commands = None
+    container_pre_commands = None
+    plan = None
+    croc_process = None
     if files:
-        file_deploy_commands, file_errors = prepare_files_deployment(files)
-        if file_errors:
+        plan = prepare_files_with_croc(
+            files, transfer_mode="ssh",
+            target_ip=container_ip, ssh_user="root",
+            ssh_private_key=private_key,
+        )
+        if plan.errors:
             return [TextContent(
                 type="text",
-                text="Error preparing files:\n" + "\n".join(f"- {e}" for e in file_errors),
+                text="Error preparing files:\n" + "\n".join(f"- {e}" for e in plan.errors),
             )]
-        if file_deploy_commands:
-            init_commands = file_deploy_commands
-        for f in files:
-            local = f.get("local_source_path", "<content>")
-            remote = f.get("remote_destination_path", "")
-            files_info.append(f"{local} -> {remote}")
+        if plan.inline_commands:
+            init_commands = plan.inline_commands
+        if plan.croc_container_pre_commands:
+            container_pre_commands = plan.croc_container_pre_commands
+        files_info = plan.files_info
     
     effective_command = command or "echo 'Files deployed successfully'"
     
@@ -1498,6 +1840,13 @@ async def handle_run_on_tunneled_persistent_container(arguments: dict):
         pass
     
     try:
+        # Start croc send locally if needed (must happen BEFORE Torque environment)
+        if plan is not None and plan.needs_croc:
+            try:
+                croc_process = await execute_with_croc(plan)
+            except Exception as e:
+                return [TextContent(type="text", text=f"Error starting croc file transfer: {str(e)}")]
+        
         # Reuse the SSH execution logic - SSH from a disposable grain into the persistent container
         async with get_torque_client(torque_url, torque_token, torque_space) as client:
             result = await client.execute_remote_command(
@@ -1510,6 +1859,7 @@ async def handle_run_on_tunneled_persistent_container(arguments: dict):
                 auto_cleanup=_config["auto_delete_environments"],
                 log_callback=log_callback,
                 init_commands=init_commands,
+                container_pre_commands=container_pre_commands,
             )
             
             grain_log = None
@@ -1594,6 +1944,8 @@ async def handle_run_on_tunneled_persistent_container(arguments: dict):
     
     except Exception as e:
         return [TextContent(type="text", text=f"Error executing command on container: {str(e)}")]
+    finally:
+        await cleanup_croc_resources(croc_process, plan.croc_staging_dir if plan else "")
 
 
 async def handle_run_on_tunneled_disposable_container(arguments: dict):
@@ -1613,23 +1965,27 @@ async def handle_run_on_tunneled_disposable_container(arguments: dict):
             text="Error: Must provide either 'command' or 'upload_files' (or both).",
         )]
     
-    # Process files parameter - generate deployment commands
+    # Process files parameter - generate deployment commands (with croc for large files)
     files_info = []
     init_commands = None
+    plan = None
+    croc_process = None
     if files:
-        file_deploy_commands, file_errors = prepare_files_deployment(files)
-        if file_errors:
+        plan = prepare_files_with_croc(files, transfer_mode="container")
+        if plan.errors:
             return [TextContent(
                 type="text",
-                text="Error preparing files:\n" + "\n".join(f"- {e}" for e in file_errors),
+                text="Error preparing files:\n" + "\n".join(f"- {e}" for e in plan.errors),
             )]
-        if file_deploy_commands:
-            init_commands = file_deploy_commands
-        # Track files for output reporting
-        for f in files:
-            local = f.get("local_source_path", "<content>")
-            remote = f.get("remote_destination_path", "")
-            files_info.append(f"{local} -> {remote}")
+        # Combine croc init + inline commands for container target
+        combined = []
+        if plan.croc_init_commands:
+            combined.append(plan.croc_init_commands)
+        if plan.inline_commands:
+            combined.append(plan.inline_commands)
+        if combined:
+            init_commands = "\n".join(combined)
+        files_info = plan.files_info
     
     # If no command, use a simple echo
     effective_command = command or "echo 'Files deployed successfully'"
@@ -1643,6 +1999,13 @@ async def handle_run_on_tunneled_disposable_container(arguments: dict):
         pass  # Streaming not available
     
     try:
+        # Start croc send locally if needed (must happen BEFORE Torque environment)
+        if plan is not None and plan.needs_croc:
+            try:
+                croc_process = await execute_with_croc(plan)
+            except Exception as e:
+                return [TextContent(type="text", text=f"Error starting croc file transfer: {str(e)}")]
+        
         async with get_torque_client(torque_url, torque_token, torque_space) as client:
             result = await client.execute_local_command(
                 command=effective_command,
@@ -1723,6 +2086,8 @@ async def handle_run_on_tunneled_disposable_container(arguments: dict):
     
     except Exception as e:
         return [TextContent(type="text", text=f"Error executing command on agent: {str(e)}")]
+    finally:
+        await cleanup_croc_resources(croc_process, plan.croc_staging_dir if plan else "")
 
 
 async def handle_run_on_tunneled_ssh_async(arguments: dict):
@@ -1763,21 +2128,36 @@ async def handle_run_on_tunneled_ssh_async(arguments: dict):
         except ValueError as e:
             return [TextContent(type="text", text=f"Error: {str(e)}")]
     
-    # Process files
+    # Process files parameter - generate deployment commands (with croc for large files)
     files_info = []
     init_commands = None
+    container_pre_commands = None
+    plan = None
+    croc_process = None
     if files:
-        file_deploy_commands, file_errors = prepare_files_deployment(files)
-        if file_errors:
-            return [TextContent(type="text", text="Error preparing files:\n" + "\n".join(f"- {e}" for e in file_errors))]
-        if file_deploy_commands:
-            init_commands = file_deploy_commands
-        for f in files:
-            files_info.append(f"{f.get('local_source_path', '<content>')} -> {f.get('remote_destination_path', '')}")
+        plan = prepare_files_with_croc(
+            files, transfer_mode="ssh",
+            target_ip=target_ip, ssh_user=ssh_user,
+            ssh_private_key=ssh_private_key, ssh_password=ssh_password,
+        )
+        if plan.errors:
+            return [TextContent(type="text", text="Error preparing files:\n" + "\n".join(f"- {e}" for e in plan.errors))]
+        if plan.inline_commands:
+            init_commands = plan.inline_commands
+        if plan.croc_container_pre_commands:
+            container_pre_commands = plan.croc_container_pre_commands
+        files_info = plan.files_info
     
     effective_command = command or "echo 'Files deployed successfully'"
     
     try:
+        # Start croc send locally if needed (must happen BEFORE Torque environment)
+        if plan is not None and plan.needs_croc:
+            try:
+                croc_process = await execute_with_croc(plan)
+            except Exception as e:
+                return [TextContent(type="text", text=f"Error starting croc file transfer: {str(e)}")]
+        
         async with get_torque_client(torque_url, torque_token, torque_space) as client:
             environment_id = await client.start_environment(
                 target_ip=target_ip,
@@ -1788,7 +2168,16 @@ async def handle_run_on_tunneled_ssh_async(arguments: dict):
                 init_commands=init_commands,
                 timeout=timeout,
                 ssh_password=ssh_password,
+                container_pre_commands=container_pre_commands,
             )
+        
+        # Track croc state for cleanup when execution completes
+        if croc_process is not None:
+            _croc_async_state[environment_id] = {
+                "process": croc_process,
+                "staging_dir": plan.croc_staging_dir if plan else "",
+            }
+            croc_process = None  # Don't clean up in except block
         
         # Start background streaming of grain log to stderr
         _start_background_streamer(environment_id)
@@ -1813,6 +2202,8 @@ Use `cancel_execution` with the same environment_id to abort if needed."""
         return [TextContent(type="text", text=output_text)]
     
     except Exception as e:
+        # Clean up croc on error (not tracked for async cleanup)
+        await cleanup_croc_resources(croc_process, plan.croc_staging_dir if plan else "")
         return [TextContent(type="text", text=f"Error starting async command: {str(e)}")]
 
 
@@ -1844,21 +2235,36 @@ async def handle_run_on_tunneled_persistent_container_async(arguments: dict):
     except Exception as e:
         return [TextContent(type="text", text=f"Error setting up persistent container: {str(e)}")]
     
-    # Process files
+    # Process files parameter - generate deployment commands (with croc for large files)
     files_info = []
     init_commands = None
+    container_pre_commands = None
+    plan = None
+    croc_process = None
     if files:
-        file_deploy_commands, file_errors = prepare_files_deployment(files)
-        if file_errors:
-            return [TextContent(type="text", text="Error preparing files:\n" + "\n".join(f"- {e}" for e in file_errors))]
-        if file_deploy_commands:
-            init_commands = file_deploy_commands
-        for f in files:
-            files_info.append(f"{f.get('local_source_path', '<content>')} -> {f.get('remote_destination_path', '')}")
+        plan = prepare_files_with_croc(
+            files, transfer_mode="ssh",
+            target_ip=container_ip, ssh_user="root",
+            ssh_private_key=private_key,
+        )
+        if plan.errors:
+            return [TextContent(type="text", text="Error preparing files:\n" + "\n".join(f"- {e}" for e in plan.errors))]
+        if plan.inline_commands:
+            init_commands = plan.inline_commands
+        if plan.croc_container_pre_commands:
+            container_pre_commands = plan.croc_container_pre_commands
+        files_info = plan.files_info
     
     effective_command = command or "echo 'Files deployed successfully'"
     
     try:
+        # Start croc send locally if needed (must happen BEFORE Torque environment)
+        if plan is not None and plan.needs_croc:
+            try:
+                croc_process = await execute_with_croc(plan)
+            except Exception as e:
+                return [TextContent(type="text", text=f"Error starting croc file transfer: {str(e)}")]
+        
         # Start the SSH command asynchronously - SSH from disposable grain into persistent container
         async with get_torque_client(torque_url, torque_token, torque_space) as client:
             environment_id = await client.start_environment(
@@ -1869,7 +2275,16 @@ async def handle_run_on_tunneled_persistent_container_async(arguments: dict):
                 agent=agent,
                 init_commands=init_commands,
                 timeout=timeout,
+                container_pre_commands=container_pre_commands,
             )
+            
+            # Track croc state for cleanup when execution completes
+            if croc_process is not None:
+                _croc_async_state[environment_id] = {
+                    "process": croc_process,
+                    "staging_dir": plan.croc_staging_dir if plan else "",
+                }
+                croc_process = None  # Don't clean up in except block
             
             # Extend the persistent container's idle timeout
             try:
@@ -1910,6 +2325,8 @@ Use `cancel_execution` with the same environment_id to abort if needed."""
         return [TextContent(type="text", text=output_text)]
     
     except Exception as e:
+        # Clean up croc on error (not tracked for async cleanup)
+        await cleanup_croc_resources(croc_process, plan.croc_staging_dir if plan else "")
         return [TextContent(type="text", text=f"Error starting async command on container: {str(e)}")]
 
 
@@ -1926,21 +2343,35 @@ async def handle_run_on_tunneled_disposable_container_async(arguments: dict):
     if not command and not files:
         return [TextContent(type="text", text="Error: Must provide either 'command' or 'upload_files' (or both).")]
     
-    # Process files
+    # Process files parameter - generate deployment commands (with croc for large files)
     files_info = []
     init_commands = None
+    plan = None
+    croc_process = None
     if files:
-        file_deploy_commands, file_errors = prepare_files_deployment(files)
-        if file_errors:
-            return [TextContent(type="text", text="Error preparing files:\n" + "\n".join(f"- {e}" for e in file_errors))]
-        if file_deploy_commands:
-            init_commands = file_deploy_commands
-        for f in files:
-            files_info.append(f"{f.get('local_source_path', '<content>')} -> {f.get('remote_destination_path', '')}")
+        plan = prepare_files_with_croc(files, transfer_mode="container")
+        if plan.errors:
+            return [TextContent(type="text", text="Error preparing files:\n" + "\n".join(f"- {e}" for e in plan.errors))]
+        # Combine croc init + inline commands for container target
+        combined = []
+        if plan.croc_init_commands:
+            combined.append(plan.croc_init_commands)
+        if plan.inline_commands:
+            combined.append(plan.inline_commands)
+        if combined:
+            init_commands = "\n".join(combined)
+        files_info = plan.files_info
     
     effective_command = command or "echo 'Files deployed successfully'"
     
     try:
+        # Start croc send locally if needed (must happen BEFORE Torque environment)
+        if plan is not None and plan.needs_croc:
+            try:
+                croc_process = await execute_with_croc(plan)
+            except Exception as e:
+                return [TextContent(type="text", text=f"Error starting croc file transfer: {str(e)}")]
+        
         async with get_torque_client(torque_url, torque_token, torque_space) as client:
             environment_id = await client.start_local_environment(
                 command=effective_command,
@@ -1948,6 +2379,14 @@ async def handle_run_on_tunneled_disposable_container_async(arguments: dict):
                 init_commands=init_commands,
                 timeout=timeout,
             )
+        
+        # Track croc state for cleanup when execution completes
+        if croc_process is not None:
+            _croc_async_state[environment_id] = {
+                "process": croc_process,
+                "staging_dir": plan.croc_staging_dir if plan else "",
+            }
+            croc_process = None  # Don't clean up in except block
         
         # Start background streaming of grain log to stderr
         _start_background_streamer(environment_id)
@@ -1972,6 +2411,8 @@ Use `cancel_execution` with the same environment_id to abort if needed."""
         return [TextContent(type="text", text=output_text)]
     
     except Exception as e:
+        # Clean up croc on error (not tracked for async cleanup)
+        await cleanup_croc_resources(croc_process, plan.croc_staging_dir if plan else "")
         return [TextContent(type="text", text=f"Error starting async command: {str(e)}")]
 
 
@@ -2018,6 +2459,13 @@ async def handle_get_execution_status(arguments: dict):
         if status in _TERMINAL_STATUSES:
             _stop_background_streamer(environment_id)
             _streamer_cache.pop(environment_id, None)
+            # Clean up any croc send process/staging dir associated with this async execution
+            croc_state = _croc_async_state.pop(environment_id, None)
+            if croc_state:
+                await cleanup_croc_resources(
+                    croc_state.get("process"),
+                    croc_state.get("staging_dir", ""),
+                )
         
         # We need a client for extracting outputs, cleanup, and grain log fetching
         async with get_torque_client() as client:
@@ -2241,6 +2689,14 @@ async def handle_cancel_execution(arguments: dict):
     # Stop background streamer for this environment
     _stop_background_streamer(environment_id)
     _streamer_cache.pop(environment_id, None)
+    
+    # Clean up any croc send process/staging dir associated with this execution
+    croc_state = _croc_async_state.pop(environment_id, None)
+    if croc_state:
+        await cleanup_croc_resources(
+            croc_state.get("process"),
+            croc_state.get("staging_dir", ""),
+        )
     
     try:
         async with get_torque_client() as client:
@@ -2876,7 +3332,7 @@ def main():
     common_parser.add_argument(
         "--ssh-key",
         default=os.environ.get("SSH_KEY"),
-        help="SSH private key - file path or key content (env: $SSH_KEY)",
+        help="SSH private key - file path, key content, or base64-encoded key (env: $SSH_KEY)",
     )
     common_parser.add_argument(
         "--ssh-password",
@@ -3001,7 +3457,7 @@ PERFORMANCE TIP:
     ssh_parser = subparsers.add_parser("ssh", parents=[common_parser], help="Execute a command on remote server via SSH")
     ssh_parser.add_argument("cmd", nargs='?', help="The shell command to execute (optional if --upload used)")
     ssh_parser.add_argument("--user", "-u", help="SSH username (overrides --ssh-user)")
-    ssh_parser.add_argument("--key", "-k", help="SSH private key - file path or key content (overrides --ssh-key)")
+    ssh_parser.add_argument("--key", "-k", help="SSH private key - file path, key content, or base64-encoded key (overrides --ssh-key)")
     ssh_parser.add_argument("--password", help="SSH password for authentication (overrides --ssh-password)")
     ssh_parser.add_argument("--timeout", type=int, help="Timeout in seconds")
     ssh_parser.add_argument("--allow-dangerous-commands", action="store_true", help="Bypass dangerous command warnings (use with extreme caution)")
@@ -3034,7 +3490,7 @@ PERFORMANCE TIP:
     read_parser = subparsers.add_parser("read", parents=[common_parser], help="Read a file from remote server")
     read_parser.add_argument("path", help="Remote file path to read")
     read_parser.add_argument("--user", "-u", help="SSH username")
-    read_parser.add_argument("--key", "-k", help="SSH private key - file path or key content")
+    read_parser.add_argument("--key", "-k", help="SSH private key - file path, key content, or base64-encoded key")
     read_parser.add_argument("--password", help="SSH password for authentication")
     read_parser.add_argument("--timeout", type=int, help="Timeout in seconds")
     read_parser.add_argument("--max-size", type=int, default=102400, help="Max file size in bytes (default: 100KB)")
@@ -3043,7 +3499,7 @@ PERFORMANCE TIP:
     list_parser = subparsers.add_parser("list", parents=[common_parser], help="List a directory on remote server")
     list_parser.add_argument("path", help="Remote directory path")
     list_parser.add_argument("--user", "-u", help="SSH username")
-    list_parser.add_argument("--key", "-k", help="SSH private key - file path or key content")
+    list_parser.add_argument("--key", "-k", help="SSH private key - file path, key content, or base64-encoded key")
     list_parser.add_argument("--password", help="SSH password for authentication")
     list_parser.add_argument("--timeout", type=int, help="Timeout in seconds")
     list_parser.add_argument("--all", "-A", action="store_true", help="Show hidden files")

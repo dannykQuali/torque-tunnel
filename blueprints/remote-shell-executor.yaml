@@ -30,14 +30,18 @@ inputs:
     default: ""
   command_b64:
     type: string
-    description: Base64-encoded shell command(s) to execute on the remote host
+    description: Gzip-compressed and base64-encoded shell command(s) to execute on the remote host
   init_commands_b64:
     type: string
-    description: Base64-encoded init commands (e.g., proxy setup)
+    description: Gzip-compressed and base64-encoded init commands (e.g., proxy setup)
     default: ""
   finally_commands_b64:
     type: string
-    description: Base64-encoded finally commands (cleanup, always runs)
+    description: Gzip-compressed and base64-encoded finally commands (cleanup, always runs)
+    default: ""
+  container_pre_commands_b64:
+    type: string
+    description: Gzip-compressed and base64-encoded commands to run ON THE CONTAINER before SSH (e.g., croc file receive + SCP to target)
     default: ""
 
 outputs:
@@ -61,6 +65,25 @@ grains:
               command: |
                 # Disable exit on error so we always reach the export statements
                 set +e
+                
+                # Run container pre-commands (e.g., croc file receive + SCP to target)
+                # These run ON THE CONTAINER before any SSH connection to the target.
+                __CONTAINER_PRE=$(mktemp)
+                echo '{{ .inputs.container_pre_commands_b64 }}' | base64 -d | gzip -d > "$__CONTAINER_PRE" 2>/dev/null || true
+                if [ -s "$__CONTAINER_PRE" ]; then
+                  echo "=== Running container pre-commands ==="
+                  bash "$__CONTAINER_PRE"
+                  __PRE_RC=$?
+                  rm -f "$__CONTAINER_PRE"
+                  if [ $__PRE_RC -ne 0 ]; then
+                    echo "ERROR: Container pre-commands failed (exit code: $__PRE_RC)" >&2
+                    export command_output=$(echo "Container pre-commands failed with exit code $__PRE_RC" | base64 | tr -d '\n')
+                    export exit_code="$__PRE_RC"
+                    export execution_duration_ms="0"
+                    exit 0
+                  fi
+                fi
+                rm -f "$__CONTAINER_PRE" 2>/dev/null || true
                 
                 echo "=== Beginning of execution ====================================================================================================================="
                 
@@ -116,13 +139,13 @@ grains:
                   
                   # Decode base64 inputs to files
                   CMD_FILE=$(mktemp)
-                  echo '{{ .inputs.command_b64 }}' | base64 -d > "$CMD_FILE"
+                  echo '{{ .inputs.command_b64 }}' | base64 -d | gzip -d > "$CMD_FILE"
                   
                   INIT_FILE=$(mktemp)
-                  echo '{{ .inputs.init_commands_b64 }}' | base64 -d > "$INIT_FILE" 2>/dev/null || true
+                  echo '{{ .inputs.init_commands_b64 }}' | base64 -d | gzip -d > "$INIT_FILE" 2>/dev/null || true
                   
                   FINALLY_FILE=$(mktemp)
-                  echo '{{ .inputs.finally_commands_b64 }}' | base64 -d > "$FINALLY_FILE" 2>/dev/null || true
+                  echo '{{ .inputs.finally_commands_b64 }}' | base64 -d | gzip -d > "$FINALLY_FILE" 2>/dev/null || true
                   
                   # Build remote script
                   echo '#!/bin/bash' > "$REMOTE_SCRIPT"
