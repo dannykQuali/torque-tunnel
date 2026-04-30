@@ -66,6 +66,18 @@ grains:
                 # Disable exit on error so we always reach the export statements
                 set +e
                 
+                # Initialize variables with defaults (before container pre-commands so
+                # the failure path can write to OUTPUT_FILE/EXIT_CODE_FILE and flow to exports)
+                OUTPUT_FILE=$(mktemp)
+                EXIT_CODE_FILE=$(mktemp)
+                echo "1" > "$EXIT_CODE_FILE"  # Default exit code
+                KEY_FILE=""
+                REMOTE_SCRIPT=""
+                CMD_FILE=""
+                INIT_FILE=""
+                FINALLY_FILE=""
+                __SKIP_SSH=0
+                
                 # Run container pre-commands (e.g., croc file receive + SCP to target)
                 # These run ON THE CONTAINER before any SSH connection to the target.
                 __CONTAINER_PRE=$(mktemp)
@@ -77,25 +89,15 @@ grains:
                   rm -f "$__CONTAINER_PRE"
                   if [ $__PRE_RC -ne 0 ]; then
                     echo "ERROR: Container pre-commands failed (exit code: $__PRE_RC)" >&2
-                    export command_output=$(echo "Container pre-commands failed with exit code $__PRE_RC" | base64 | tr -d '\n')
-                    export exit_code="$__PRE_RC"
-                    export execution_duration_ms="0"
-                    exit 0
+                    echo "Container pre-commands failed with exit code $__PRE_RC" > "$OUTPUT_FILE"
+                    echo "$__PRE_RC" > "$EXIT_CODE_FILE"
+                    EXEC_DURATION_MS=0
+                    __SKIP_SSH=1
                   fi
                 fi
                 rm -f "$__CONTAINER_PRE" 2>/dev/null || true
                 
                 echo "=== Beginning of execution ====================================================================================================================="
-                
-                # Initialize variables with defaults
-                OUTPUT_FILE=$(mktemp)
-                EXIT_CODE_FILE=$(mktemp)
-                echo "1" > "$EXIT_CODE_FILE"  # Default exit code
-                KEY_FILE=""
-                REMOTE_SCRIPT=""
-                CMD_FILE=""
-                INIT_FILE=""
-                FINALLY_FILE=""
                 
                 # Wrap the main logic in a function so we can capture any errors
                 __run_main() {
@@ -219,7 +221,10 @@ grains:
                 }
                 
                 # Run main logic - errors go to output file, stdout is already captured inside
-                __run_main 2>> "$OUTPUT_FILE"
+                # Skip SSH if container pre-commands failed (output already written)
+                if [ $__SKIP_SSH -eq 0 ]; then
+                  __run_main 2>> "$OUTPUT_FILE"
+                fi
                 
                 # Always export outputs - this section MUST be reached
                 COMMAND_OUTPUT_B64=$(base64 < "$OUTPUT_FILE" 2>/dev/null | tr -d '\n' || echo "")

@@ -29,6 +29,7 @@ from mcp.types import (
 
 from .torque_client import TorqueClient
 from . import croc_manager
+from . import config as config_module
 
 
 # Shared compiled patterns for filtering grain/execution logs.
@@ -649,6 +650,10 @@ def prepare_files_with_croc(
         # Generate croc install + receive commands
         croc_install = croc_manager.generate_remote_croc_install_script()
         
+        # Calculate croc timeout based on total file size: 600s base + 1s per MB
+        total_croc_bytes = sum(os.path.getsize(f) for f in plan.croc_local_files)
+        croc_timeout = 600 + total_croc_bytes // (1024 * 1024)
+        
         if transfer_mode == "ssh":
             # For SSH: croc receive happens on the CONTAINER, then SCP to target
             croc_scp = croc_manager.generate_croc_scp_commands(
@@ -658,6 +663,7 @@ def prepare_files_with_croc(
                 ssh_user=ssh_user,
                 ssh_private_key=ssh_private_key,
                 ssh_password=ssh_password,
+                timeout=croc_timeout,
             )
             plan.croc_container_pre_commands = croc_install + "\n" + croc_scp
         else:
@@ -665,6 +671,7 @@ def prepare_files_with_croc(
             croc_recv = croc_manager.generate_croc_receive_commands(
                 code=plan.croc_code,
                 file_transfers=croc_transfer_info,
+                timeout=croc_timeout,
             )
             plan.croc_init_commands = croc_install + "\n" + croc_recv
     
@@ -728,6 +735,9 @@ _config = {
     "verbose": False,
     "container_idle_timeout": 7200,
 }
+
+# Loaded config file data (for runtime profile resolution)
+_loaded_config: dict = {}
 
 
 # Persistent container session state
@@ -875,11 +885,12 @@ def _remove_container_from_state(env_id: str):
     _write_state(state)
 
 
-def get_torque_client(torque_url=None, torque_token=None, torque_space=None) -> TorqueClient:
+def get_torque_client(torque_url=None, torque_token=None, torque_space=None, config=None) -> TorqueClient:
     """Create a Torque client with current configuration, with optional per-call overrides."""
-    url = torque_url or _config["torque_url"]
-    token = torque_token or _config["torque_token"]
-    space = torque_space or _config["torque_space"]
+    cfg = config or _config
+    url = torque_url or cfg["torque_url"]
+    token = torque_token or cfg["torque_token"]
+    space = torque_space or cfg["torque_space"]
     if not url:
         raise ValueError("Torque URL not configured. Set TORQUE_URL or use --torque-url")
     if not token:
@@ -891,9 +902,9 @@ def get_torque_client(torque_url=None, torque_token=None, torque_space=None) -> 
         base_url=url,
         token=token,
         space=space,
-        default_agent=_config["default_agent"],
-        init_commands=_config["init_commands"],
-        finally_commands=_config["finally_commands"],
+        default_agent=cfg["default_agent"],
+        init_commands=cfg["init_commands"],
+        finally_commands=cfg["finally_commands"],
     )
 
 
@@ -1004,6 +1015,10 @@ docker restart/stop/kill, systemctl restart docker, reboot, shutdown, init 0/6
                         "type": "string",
                         "description": "DO NOT set unless the user explicitly provides this value or asks you to change it. Overrides the pre-configured Torque space name.",
                     },
+                    "profile": {
+                        "type": "string",
+                        "description": "Configuration profile name to apply. Profiles pre-configure connection settings, SSH targets, and other options. Use list_profiles to see available profiles.",
+                    },
                 },
                 "required": [],
             },
@@ -1071,6 +1086,10 @@ Use `upload_files` to send local files/content to the target before running the 
                     "torque_space": {
                         "type": "string",
                         "description": "DO NOT set unless the user explicitly provides this value or asks you to change it. Overrides the pre-configured Torque space name.",
+                    },
+                    "profile": {
+                        "type": "string",
+                        "description": "Configuration profile name to apply. Profiles pre-configure connection settings, SSH targets, and other options. Use list_profiles to see available profiles.",
                     },
                 },
                 "required": [],
@@ -1155,6 +1174,10 @@ Use `upload_files` to send local files/content to the target before running the 
                     "torque_space": {
                         "type": "string",
                         "description": "DO NOT set unless the user explicitly provides this value or asks you to change it. Overrides the pre-configured Torque space name.",
+                    },
+                    "profile": {
+                        "type": "string",
+                        "description": "Configuration profile name to apply. Profiles pre-configure connection settings, SSH targets, and other options. Use list_profiles to see available profiles.",
                     },
                 },
                 "required": [],
@@ -1247,6 +1270,10 @@ systemctl restart docker, reboot, shutdown, init 0/6""",
                         "type": "string",
                         "description": "DO NOT set unless the user explicitly provides this value or asks you to change it. Overrides the pre-configured Torque space name.",
                     },
+                    "profile": {
+                        "type": "string",
+                        "description": "Configuration profile name to apply. Profiles pre-configure connection settings, SSH targets, and other options. Use list_profiles to see available profiles.",
+                    },
                 },
                 "required": ["command"],
             },
@@ -1325,6 +1352,10 @@ After restart: pass previous `environment_id` to reconnect.""",
                         "type": "string",
                         "description": "DO NOT set unless the user explicitly provides this value or asks you to change it. Overrides the pre-configured Torque space name.",
                     },
+                    "profile": {
+                        "type": "string",
+                        "description": "Configuration profile name to apply. Profiles pre-configure connection settings, SSH targets, and other options. Use list_profiles to see available profiles.",
+                    },
                 },
                 "required": ["command"],
             },
@@ -1392,6 +1423,10 @@ Only for unreachable internal network targets. For local network/VMs, use termin
                         "type": "string",
                         "description": "DO NOT set unless the user explicitly provides this value or asks you to change it. Overrides the pre-configured Torque space name.",
                     },
+                    "profile": {
+                        "type": "string",
+                        "description": "Configuration profile name to apply. Profiles pre-configure connection settings, SSH targets, and other options. Use list_profiles to see available profiles.",
+                    },
                 },
                 "required": ["command"],
             },
@@ -1429,6 +1464,15 @@ Use `wait` to avoid tight polling. Typical: wait=10, repeat until completed.""",
                 "required": ["environment_id"],
             },
         ),
+        Tool(
+            name="list_profiles",
+            description="""List all available configuration profiles. Profiles pre-configure connection settings (Torque URL, agent, SSH target, etc.) so you don't have to specify them on every call. Use a profile by passing its name as the 'profile' parameter to any execution tool.""",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        ),
     ]
 
 
@@ -1436,23 +1480,41 @@ Use `wait` to avoid tight polling. Typical: wait=10, repeat until completed.""",
 async def call_tool(name: str, arguments: dict):
     """Handle tool calls."""
     
+    # Handle list_profiles (no profile resolution needed)
+    if name == "list_profiles":
+        return await handle_list_profiles()
+    
+    # Resolve profile for execution tools: inject profile values into arguments
+    # and create an effective_config overlay for config-only keys
+    effective_config = _config
+    profile_name = arguments.pop("profile", None)
+    if profile_name and _loaded_config:
+        try:
+            profile_values = config_module.resolve_profile(_loaded_config, profile_name)
+            # Inject tool-argument-mappable values (host, user, private_key, etc.)
+            arguments = config_module.inject_profile_into_arguments(arguments, profile_values)
+            # Create effective config with config-only values (init_commands, etc.)
+            effective_config = config_module.apply_profile_to_config(_config, profile_values)
+        except ValueError as e:
+            return [TextContent(type="text", text=f"Error: {str(e)}")]
+    
     if name == "run_on_tunneled_ssh":
-        return await handle_run_on_tunneled_ssh(arguments)
+        return await handle_run_on_tunneled_ssh(arguments, effective_config)
     
     elif name == "run_on_tunneled_persistent_container":
-        return await handle_run_on_tunneled_persistent_container(arguments)
+        return await handle_run_on_tunneled_persistent_container(arguments, effective_config)
     
     elif name == "run_on_tunneled_disposable_container":
-        return await handle_run_on_tunneled_disposable_container(arguments)
+        return await handle_run_on_tunneled_disposable_container(arguments, effective_config)
     
     elif name == "run_on_tunneled_ssh_async":
-        return await handle_run_on_tunneled_ssh_async(arguments)
+        return await handle_run_on_tunneled_ssh_async(arguments, effective_config)
     
     elif name == "run_on_tunneled_persistent_container_async":
-        return await handle_run_on_tunneled_persistent_container_async(arguments)
+        return await handle_run_on_tunneled_persistent_container_async(arguments, effective_config)
     
     elif name == "run_on_tunneled_disposable_container_async":
-        return await handle_run_on_tunneled_disposable_container_async(arguments)
+        return await handle_run_on_tunneled_disposable_container_async(arguments, effective_config)
     
     elif name == "get_execution_status":
         return await handle_get_execution_status(arguments)
@@ -1464,12 +1526,37 @@ async def call_tool(name: str, arguments: dict):
         return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
 
-async def handle_run_on_tunneled_ssh(arguments: dict):
+async def handle_list_profiles():
+    """Return the list of available configuration profiles."""
+    if not _loaded_config:
+        return [TextContent(type="text", text="No configuration file found. Create ~/.torque-tunnel/config.yaml to define profiles.")]
+    
+    profiles = config_module.list_profiles(_loaded_config)
+    if not profiles:
+        return [TextContent(type="text", text="No profiles defined in configuration file. Add a 'profiles' section to your config.yaml.")]
+    
+    lines = ["**Available Profiles:**\n"]
+    for p in profiles:
+        desc = f" — {p['description']}" if p['description'] else ""
+        extends = f" (extends: {p['extends']})" if p['extends'] else ""
+        overrides = ", ".join(p['overrides']) if p['overrides'] else "(none)"
+        lines.append(f"- **{p['name']}**{desc}{extends}\n  Overrides: {overrides}")
+    
+    return [TextContent(type="text", text="\n".join(lines))]
+
+
+async def handle_run_on_tunneled_ssh(arguments: dict, config: dict = None):
     """Execute a remote command via SSH, optionally uploading files first."""
-    target_ip = arguments.get("host") or _config["default_target_ip"]
-    ssh_user = arguments.get("user") or _config["default_ssh_user"]
-    private_key_value = arguments.get("private_key") or _config["default_ssh_key"]
-    ssh_password = arguments.get("password") or _config.get("default_ssh_password")
+    config = config or _config
+    target_ip = arguments.get("host") or config["default_target_ip"]
+    ssh_user = arguments.get("user") or config["default_ssh_user"]
+    # SSH auth mutual exclusion: if args specify either auth method, use only args;
+    # only fall back to config defaults when neither is provided in args.
+    private_key_value = arguments.get("private_key")
+    ssh_password = arguments.get("password")
+    if not private_key_value and not ssh_password:
+        private_key_value = config.get("default_ssh_key")
+        ssh_password = config.get("default_ssh_password")
     command = arguments.get("command")
     files = arguments.get("upload_files", [])
     agent = arguments.get("torque_agent")
@@ -1478,12 +1565,12 @@ async def handle_run_on_tunneled_ssh(arguments: dict):
     # Per-call auto_delete overrides global config if specified
     auto_delete = arguments.get("auto_delete")
     if auto_delete is None:
-        auto_delete = _config["auto_delete_environments"]
+        auto_delete = config["auto_delete_environments"]
     
     # Per-call Torque config overrides
-    torque_url = arguments.get("torque_url") or _config["torque_url"]
-    torque_token = arguments.get("torque_token") or _config["torque_token"]
-    torque_space = arguments.get("torque_space") or _config["torque_space"]
+    torque_url = arguments.get("torque_url") or config["torque_url"]
+    torque_token = arguments.get("torque_token") or config["torque_token"]
+    torque_space = arguments.get("torque_space") or config["torque_space"]
     
     # Must have at least command OR files
     if not command and not files:
@@ -1571,9 +1658,9 @@ async def handle_run_on_tunneled_ssh(arguments: dict):
             base_url=torque_url,
             token=torque_token,
             space=torque_space,
-            default_agent=_config["default_agent"],
-            init_commands=_config["init_commands"],
-            finally_commands=_config["finally_commands"],
+            default_agent=config["default_agent"],
+            init_commands=config["init_commands"],
+            finally_commands=config["finally_commands"],
         )
         async with client:
             result = await client.execute_remote_command(
@@ -1670,6 +1757,7 @@ async def _ensure_persistent_container(
     torque_url: Optional[str] = None,
     torque_token: Optional[str] = None,
     torque_space: Optional[str] = None,
+    config: Optional[dict] = None,
 ) -> dict:
     """
     Ensure a persistent container is running and return its connection details.
@@ -1683,7 +1771,8 @@ async def _ensure_persistent_container(
         Dict with 'environment_id', 'container_ip', 'container_id', 'private_key', 'agent'
     """
     global _default_persistent_container_id
-    agent_name = agent or _config["default_agent"]
+    cfg = config or _config
+    agent_name = agent or cfg["default_agent"]
     
     # If a specific environment_id was requested
     if environment_id:
@@ -1692,7 +1781,7 @@ async def _ensure_persistent_container(
             info = _persistent_containers[environment_id]
             # Verify it's still alive (deploying/launching = SSH daemon still running)
             try:
-                async with get_torque_client(torque_url, torque_token, torque_space) as client:
+                async with get_torque_client(torque_url, torque_token, torque_space, config=cfg) as client:
                     env_data = await client.get_environment_status(environment_id)
                     current_state = env_data.get("details", {}).get("state", {}).get("current_state", "")
                     if current_state in ("deploying", "launching"):
@@ -1708,7 +1797,7 @@ async def _ensure_persistent_container(
         else:
             # Not cached - try to fetch details from Torque
             try:
-                async with get_torque_client(torque_url, torque_token, torque_space) as client:
+                async with get_torque_client(torque_url, torque_token, torque_space, config=cfg) as client:
                     env_data = await client.get_environment_status(environment_id)
                     current_state = env_data.get("details", {}).get("state", {}).get("current_state", "")
                     if current_state not in ("deploying", "launching"):
@@ -1738,7 +1827,7 @@ async def _ensure_persistent_container(
             if (info.get("agent") or "") == (agent_name or ""):
                 # Verify it's still alive
                 try:
-                    async with get_torque_client(torque_url, torque_token, torque_space) as client:
+                    async with get_torque_client(torque_url, torque_token, torque_space, config=cfg) as client:
                         env_data = await client.get_environment_status(_default_persistent_container_id)
                         current_state = env_data.get("details", {}).get("state", {}).get("current_state", "")
                         if current_state in ("deploying", "launching"):
@@ -1750,7 +1839,7 @@ async def _ensure_persistent_container(
                 _default_persistent_container_id = None
     
     # Launch a new persistent container  
-    async with get_torque_client(torque_url, torque_token, torque_space) as client:
+    async with get_torque_client(torque_url, torque_token, torque_space, config=cfg) as client:
         env_id = await client.start_persistent_container(agent=agent_name)
         print(f"[torque-tunnel] Launching persistent container (env: {env_id})...", file=sys.stderr, flush=True)
         
@@ -1771,7 +1860,7 @@ async def _ensure_persistent_container(
         return dict(container_entry)
 
 
-async def handle_run_on_tunneled_persistent_container(arguments: dict):
+async def handle_run_on_tunneled_persistent_container(arguments: dict, config: dict = None):
     """Execute a command on a persistent Torque agent container via SSH.
     
     On first call, launches a persistent container with dropbear (SSH server). Subsequent calls
@@ -1780,6 +1869,7 @@ async def handle_run_on_tunneled_persistent_container(arguments: dict):
     
     Reuses the same SSH execution logic as handle_run_on_tunneled_ssh.
     """
+    cfg = config or _config
     command = arguments.get("command")
     files = arguments.get("upload_files", [])
     agent = arguments.get("torque_agent")
@@ -1799,7 +1889,7 @@ async def handle_run_on_tunneled_persistent_container(arguments: dict):
     
     try:
         # Ensure we have a persistent container running
-        container_info = await _ensure_persistent_container(agent=agent, new_container=new_container, environment_id=target_env_id, torque_url=torque_url, torque_token=torque_token, torque_space=torque_space)
+        container_info = await _ensure_persistent_container(agent=agent, new_container=new_container, environment_id=target_env_id, torque_url=torque_url, torque_token=torque_token, torque_space=torque_space, config=cfg)
         container_ip = container_info["container_ip"]
         private_key = container_info["private_key"]
         env_id = container_info["environment_id"]
@@ -1848,7 +1938,7 @@ async def handle_run_on_tunneled_persistent_container(arguments: dict):
                 return [TextContent(type="text", text=f"Error starting croc file transfer: {str(e)}")]
         
         # Reuse the SSH execution logic - SSH from a disposable grain into the persistent container
-        async with get_torque_client(torque_url, torque_token, torque_space) as client:
+        async with get_torque_client(torque_url, torque_token, torque_space, config=cfg) as client:
             result = await client.execute_remote_command(
                 target_ip=container_ip,
                 ssh_user="root",
@@ -1856,7 +1946,7 @@ async def handle_run_on_tunneled_persistent_container(arguments: dict):
                 command=effective_command,
                 agent=agent,
                 timeout=timeout,
-                auto_cleanup=_config["auto_delete_environments"],
+                auto_cleanup=cfg["auto_delete_environments"],
                 log_callback=log_callback,
                 init_commands=init_commands,
                 container_pre_commands=container_pre_commands,
@@ -1870,7 +1960,7 @@ async def handle_run_on_tunneled_persistent_container(arguments: dict):
             
             # Extend the persistent container's idle timeout after each successful command
             try:
-                idle_seconds = _config["container_idle_timeout"]
+                idle_seconds = cfg["container_idle_timeout"]
                 hours = idle_seconds / 3600
                 # Build ISO 8601 duration: PT2H, PT1H30M, etc.
                 if hours == int(hours):
@@ -1891,8 +1981,8 @@ async def handle_run_on_tunneled_persistent_container(arguments: dict):
         else:
             duration_str = "N/A"
         
-        env_url = f"{torque_url or _config['torque_url']}/{torque_space or _config['torque_space']}/environments/{result.environment_id}"
-        agent_name = agent or _config["default_agent"]
+        env_url = f"{torque_url or cfg['torque_url']}/{torque_space or cfg['torque_space']}/environments/{result.environment_id}"
+        agent_name = agent or cfg["default_agent"]
         
         files_summary = ""
         if files_info:
@@ -1948,8 +2038,9 @@ async def handle_run_on_tunneled_persistent_container(arguments: dict):
         await cleanup_croc_resources(croc_process, plan.croc_staging_dir if plan else "")
 
 
-async def handle_run_on_tunneled_disposable_container(arguments: dict):
+async def handle_run_on_tunneled_disposable_container(arguments: dict, config: dict = None):
     """Execute a command on a fresh Torque agent container, optionally uploading files first."""
+    cfg = config or _config
     command = arguments.get("command")
     files = arguments.get("upload_files", [])
     agent = arguments.get("torque_agent")
@@ -2006,12 +2097,12 @@ async def handle_run_on_tunneled_disposable_container(arguments: dict):
             except Exception as e:
                 return [TextContent(type="text", text=f"Error starting croc file transfer: {str(e)}")]
         
-        async with get_torque_client(torque_url, torque_token, torque_space) as client:
+        async with get_torque_client(torque_url, torque_token, torque_space, config=cfg) as client:
             result = await client.execute_local_command(
                 command=effective_command,
                 agent=agent,
                 timeout=timeout,
-                auto_cleanup=_config["auto_delete_environments"],
+                auto_cleanup=cfg["auto_delete_environments"],
                 log_callback=log_callback,
                 init_commands=init_commands,
             )
@@ -2031,8 +2122,8 @@ async def handle_run_on_tunneled_disposable_container(arguments: dict):
             duration_str = "N/A"
         
         # Build environment URL for reference
-        env_url = f"{torque_url or _config['torque_url']}/{torque_space or _config['torque_space']}/environments/{result.environment_id}"
-        agent_name = agent or _config["default_agent"]
+        env_url = f"{torque_url or cfg['torque_url']}/{torque_space or cfg['torque_space']}/environments/{result.environment_id}"
+        agent_name = agent or cfg["default_agent"]
         
         # Build files summary if any were uploaded
         files_summary = ""
@@ -2090,12 +2181,18 @@ async def handle_run_on_tunneled_disposable_container(arguments: dict):
         await cleanup_croc_resources(croc_process, plan.croc_staging_dir if plan else "")
 
 
-async def handle_run_on_tunneled_ssh_async(arguments: dict):
+async def handle_run_on_tunneled_ssh_async(arguments: dict, config: dict = None):
     """Start a remote SSH command without waiting for completion."""
-    target_ip = arguments.get("host") or _config["default_target_ip"]
-    ssh_user = arguments.get("user") or _config["default_ssh_user"]
-    private_key_value = arguments.get("private_key") or _config["default_ssh_key"]
-    ssh_password = arguments.get("password") or _config.get("default_ssh_password")
+    cfg = config or _config
+    target_ip = arguments.get("host") or cfg["default_target_ip"]
+    ssh_user = arguments.get("user") or cfg["default_ssh_user"]
+    # SSH auth mutual exclusion: if args specify either auth method, use only args;
+    # only fall back to config defaults when neither is provided in args.
+    private_key_value = arguments.get("private_key")
+    ssh_password = arguments.get("password")
+    if not private_key_value and not ssh_password:
+        private_key_value = cfg.get("default_ssh_key")
+        ssh_password = cfg.get("default_ssh_password")
     command = arguments.get("command")
     files = arguments.get("upload_files", [])
     agent = arguments.get("torque_agent")
@@ -2158,7 +2255,7 @@ async def handle_run_on_tunneled_ssh_async(arguments: dict):
             except Exception as e:
                 return [TextContent(type="text", text=f"Error starting croc file transfer: {str(e)}")]
         
-        async with get_torque_client(torque_url, torque_token, torque_space) as client:
+        async with get_torque_client(torque_url, torque_token, torque_space, config=cfg) as client:
             environment_id = await client.start_environment(
                 target_ip=target_ip,
                 ssh_user=ssh_user,
@@ -2182,7 +2279,7 @@ async def handle_run_on_tunneled_ssh_async(arguments: dict):
         # Start background streaming of grain log to stderr
         _start_background_streamer(environment_id)
         
-        env_url = f"{torque_url or _config['torque_url']}/{torque_space or _config['torque_space']}/environments/{environment_id}"
+        env_url = f"{torque_url or cfg['torque_url']}/{torque_space or cfg['torque_space']}/environments/{environment_id}"
         
         files_summary = ""
         if files_info:
@@ -2207,12 +2304,13 @@ Use `cancel_execution` with the same environment_id to abort if needed."""
         return [TextContent(type="text", text=f"Error starting async command: {str(e)}")]
 
 
-async def handle_run_on_tunneled_persistent_container_async(arguments: dict):
+async def handle_run_on_tunneled_persistent_container_async(arguments: dict, config: dict = None):
     """Start a command on the persistent container without waiting for completion.
     
     Blocks until the persistent container is up, then launches the command
     asynchronously via SSH from a disposable grain into the persistent container.
     """
+    cfg = config or _config
     command = arguments.get("command")
     files = arguments.get("upload_files", [])
     agent = arguments.get("torque_agent")
@@ -2228,7 +2326,7 @@ async def handle_run_on_tunneled_persistent_container_async(arguments: dict):
     
     try:
         # Ensure persistent container is up (this blocks until ready)
-        container_info = await _ensure_persistent_container(agent=agent, new_container=new_container, environment_id=target_env_id, torque_url=torque_url, torque_token=torque_token, torque_space=torque_space)
+        container_info = await _ensure_persistent_container(agent=agent, new_container=new_container, environment_id=target_env_id, torque_url=torque_url, torque_token=torque_token, torque_space=torque_space, config=cfg)
         container_ip = container_info["container_ip"]
         private_key = container_info["private_key"]
         env_id = container_info["environment_id"]
@@ -2266,7 +2364,7 @@ async def handle_run_on_tunneled_persistent_container_async(arguments: dict):
                 return [TextContent(type="text", text=f"Error starting croc file transfer: {str(e)}")]
         
         # Start the SSH command asynchronously - SSH from disposable grain into persistent container
-        async with get_torque_client(torque_url, torque_token, torque_space) as client:
+        async with get_torque_client(torque_url, torque_token, torque_space, config=cfg) as client:
             environment_id = await client.start_environment(
                 target_ip=container_ip,
                 ssh_user="root",
@@ -2288,7 +2386,7 @@ async def handle_run_on_tunneled_persistent_container_async(arguments: dict):
             
             # Extend the persistent container's idle timeout
             try:
-                idle_seconds = _config["container_idle_timeout"]
+                idle_seconds = cfg["container_idle_timeout"]
                 hours = idle_seconds / 3600
                 if hours == int(hours):
                     duration_str = f"PT{int(hours)}H"
@@ -2304,8 +2402,8 @@ async def handle_run_on_tunneled_persistent_container_async(arguments: dict):
         # Start background streaming of grain log to stderr
         _start_background_streamer(environment_id)
         
-        env_url = f"{torque_url or _config['torque_url']}/{torque_space or _config['torque_space']}/environments/{environment_id}"
-        agent_name = agent or _config["default_agent"]
+        env_url = f"{torque_url or cfg['torque_url']}/{torque_space or cfg['torque_space']}/environments/{environment_id}"
+        agent_name = agent or cfg["default_agent"]
         
         files_summary = ""
         if files_info:
@@ -2330,8 +2428,9 @@ Use `cancel_execution` with the same environment_id to abort if needed."""
         return [TextContent(type="text", text=f"Error starting async command on container: {str(e)}")]
 
 
-async def handle_run_on_tunneled_disposable_container_async(arguments: dict):
+async def handle_run_on_tunneled_disposable_container_async(arguments: dict, config: dict = None):
     """Start a disposable container command without waiting for completion."""
+    cfg = config or _config
     command = arguments.get("command")
     files = arguments.get("upload_files", [])
     agent = arguments.get("torque_agent")
@@ -2372,7 +2471,7 @@ async def handle_run_on_tunneled_disposable_container_async(arguments: dict):
             except Exception as e:
                 return [TextContent(type="text", text=f"Error starting croc file transfer: {str(e)}")]
         
-        async with get_torque_client(torque_url, torque_token, torque_space) as client:
+        async with get_torque_client(torque_url, torque_token, torque_space, config=cfg) as client:
             environment_id = await client.start_local_environment(
                 command=effective_command,
                 agent=agent,
@@ -2391,8 +2490,8 @@ async def handle_run_on_tunneled_disposable_container_async(arguments: dict):
         # Start background streaming of grain log to stderr
         _start_background_streamer(environment_id)
         
-        env_url = f"{torque_url or _config['torque_url']}/{torque_space or _config['torque_space']}/environments/{environment_id}"
-        agent_name = agent or _config["default_agent"]
+        env_url = f"{torque_url or cfg['torque_url']}/{torque_space or cfg['torque_space']}/environments/{environment_id}"
+        agent_name = agent or cfg["default_agent"]
         
         files_summary = ""
         if files_info:
@@ -3310,6 +3409,16 @@ def main():
     # Common arguments parser
     common_parser = argparse.ArgumentParser(add_help=False)
     common_parser.add_argument(
+        "--config",
+        default=os.environ.get("TORQUE_TUNNEL_CONFIG"),
+        help="Path to config YAML file (default: $TORQUE_TUNNEL_CONFIG or ~/.torque-tunnel/config.yaml)",
+    )
+    common_parser.add_argument(
+        "--profile",
+        default=os.environ.get("TORQUE_TUNNEL_PROFILE"),
+        help="Configuration profile name to use (default: $TORQUE_TUNNEL_PROFILE)",
+    )
+    common_parser.add_argument(
         "--torque-url",
         default=os.environ.get("TORQUE_URL"),
         help="Torque base URL (default: $TORQUE_URL)",
@@ -3453,6 +3562,9 @@ PERFORMANCE TIP:
     # serve subcommand (MCP server mode)
     subparsers.add_parser("serve", parents=[common_parser], help="Run as MCP server")
     
+    # profiles subcommand (list configuration profiles)
+    subparsers.add_parser("profiles", parents=[common_parser], help="List available configuration profiles")
+    
     # ssh subcommand (remote command via SSH)
     ssh_parser = subparsers.add_parser("ssh", parents=[common_parser], help="Execute a command on remote server via SSH")
     ssh_parser.add_argument("cmd", nargs='?', help="The shell command to execute (optional if --upload used)")
@@ -3507,20 +3619,52 @@ PERFORMANCE TIP:
     
     args = parser.parse_args()
     
-    # Update global config from common args
-    _config["torque_url"] = args.torque_url
-    _config["torque_token"] = args.torque_token
-    _config["torque_space"] = args.torque_space
-    _config["default_agent"] = args.torque_agent
-    _config["default_ssh_key"] = args.ssh_key
-    _config["default_ssh_password"] = args.ssh_password
-    _config["default_target_ip"] = args.host
-    _config["default_ssh_user"] = args.ssh_user
-    _config["init_commands"] = args.init_commands
-    _config["finally_commands"] = args.finally_commands
-    _config["auto_delete_environments"] = args.auto_delete_environments
-    _config["verbose"] = args.verbose
-    _config["container_idle_timeout"] = args.container_idle_timeout
+    # Load config file and store globally for runtime profile resolution
+    global _loaded_config
+    _loaded_config = config_module.load_config(getattr(args, 'config', None))
+    
+    # Apply config file defaults as base values
+    file_defaults = config_module.get_defaults(_loaded_config)
+    
+    # Apply startup profile (--profile) on top of defaults
+    startup_profile = getattr(args, 'profile', None)
+    if startup_profile and _loaded_config:
+        try:
+            profile_values = config_module.resolve_profile(_loaded_config, startup_profile)
+            file_defaults_with_profile = config_module.apply_profile_to_config(file_defaults, profile_values)
+        except ValueError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        file_defaults_with_profile = file_defaults
+    
+    # Update global config: CLI/env args override profile, which overrides file defaults
+    # For each config key: use argparse value if set (not None/False for booleans), else file default
+    _config["torque_url"] = args.torque_url or file_defaults_with_profile.get("torque_url")
+    _config["torque_token"] = args.torque_token or file_defaults_with_profile.get("torque_token")
+    _config["torque_space"] = args.torque_space or file_defaults_with_profile.get("torque_space")
+    _config["default_agent"] = args.torque_agent or file_defaults_with_profile.get("default_agent")
+    # SSH auth mutual exclusion: if CLI specifies one method, don't fall back to the other from file
+    cli_ssh_key = args.ssh_key
+    cli_ssh_password = args.ssh_password
+    if cli_ssh_key and not cli_ssh_password:
+        _config["default_ssh_key"] = cli_ssh_key
+        _config["default_ssh_password"] = None
+    elif cli_ssh_password and not cli_ssh_key:
+        _config["default_ssh_password"] = cli_ssh_password
+        _config["default_ssh_key"] = None
+    else:
+        # Both or neither from CLI — use file defaults for any gaps
+        _config["default_ssh_key"] = cli_ssh_key or file_defaults_with_profile.get("default_ssh_key")
+        _config["default_ssh_password"] = cli_ssh_password or file_defaults_with_profile.get("default_ssh_password")
+    _config["default_target_ip"] = args.host or file_defaults_with_profile.get("default_target_ip")
+    _config["default_ssh_user"] = args.ssh_user or file_defaults_with_profile.get("default_ssh_user")
+    _config["init_commands"] = args.init_commands or file_defaults_with_profile.get("init_commands")
+    _config["finally_commands"] = args.finally_commands or file_defaults_with_profile.get("finally_commands")
+    # Boolean/numeric: argparse defaults to False/7200, so only override from file if argparse didn't set explicitly
+    _config["auto_delete_environments"] = args.auto_delete_environments or file_defaults_with_profile.get("auto_delete_environments", False)
+    _config["verbose"] = args.verbose or file_defaults_with_profile.get("verbose", False)
+    _config["container_idle_timeout"] = args.container_idle_timeout if args.container_idle_timeout != 7200 else file_defaults_with_profile.get("container_idle_timeout", 7200)
     
     # Warn about missing recommended config (but don't block startup — AI agent can supply at runtime)
     missing = []
@@ -3548,6 +3692,21 @@ PERFORMANCE TIP:
                     server.create_initialization_options(),
                 )
         asyncio.run(run_server())
+    elif args.command == "profiles":
+        # List profiles
+        profiles = config_module.list_profiles(_loaded_config)
+        if not profiles:
+            config_path = config_module.find_config_file(getattr(args, 'config', None))
+            if config_path:
+                print("No profiles defined in configuration file.", file=sys.stderr)
+            else:
+                print("No configuration file found. Create ~/.torque-tunnel/config.yaml to define profiles.", file=sys.stderr)
+            sys.exit(0)
+        for p in profiles:
+            desc = f"  {p['description']}" if p['description'] else ""
+            extends = f"\n    Extends: {p['extends']}" if p['extends'] else ""
+            overrides = ", ".join(p['overrides']) if p['overrides'] else "(none)"
+            print(f"  {p['name']:<20}{desc}{extends}\n{'':20}    Overrides: {overrides}\n")
     else:
         # CLI mode - run the appropriate command
         asyncio.run(cli_dispatch(args))

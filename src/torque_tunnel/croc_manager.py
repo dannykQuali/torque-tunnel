@@ -279,6 +279,7 @@ def _validate_mode(mode: str) -> bool:
 def generate_croc_receive_commands(
     code: str,
     file_transfers: list[dict],
+    timeout: int = 600,
 ) -> str:
     """Generate shell commands to receive files via croc and place them at destinations.
 
@@ -289,6 +290,7 @@ def generate_croc_receive_commands(
             - remote_destination_path: Where the file should end up on the target.
             - mode: Optional file permissions (e.g. "755"). Must match ^[0-7]{3,4}$.
             - is_dir_tar: If True, the file is a gzipped tar of a directory; extract instead of move.
+        timeout: Timeout in seconds for croc receive (default 600s).
 
     Returns:
         Shell commands string.
@@ -298,8 +300,7 @@ def generate_croc_receive_commands(
     commands.append('__CROC_DIR=$(mktemp -d)')
     commands.append('cd "$__CROC_DIR"')
     # Use CROC_SECRET env var (not command-line arg) to avoid leaking code in process list
-    # Timeout after 120s to avoid infinite hangs if sender is unreachable
-    commands.append(f'timeout 120 bash -c \'CROC_SECRET="{code}" croc --yes --overwrite\'')
+    commands.append(f'timeout {timeout} bash -c \'CROC_SECRET="{code}" croc --yes --overwrite\'')
     commands.append('__CROC_RC=$?')
     commands.append('if [ $__CROC_RC -ne 0 ]; then')
     commands.append('  echo "ERROR: croc file receive failed (exit code: $__CROC_RC)" >&2')
@@ -342,6 +343,7 @@ def generate_croc_scp_commands(
     ssh_user: str,
     ssh_private_key: str = "",
     ssh_password: str = "",
+    timeout: int = 600,
 ) -> str:
     """Generate shell commands to receive files via croc on the CONTAINER, then SCP to SSH target.
 
@@ -358,6 +360,7 @@ def generate_croc_scp_commands(
         ssh_user: SSH username.
         ssh_private_key: SSH private key content (PEM format).
         ssh_password: SSH password (alternative to key).
+        timeout: Timeout in seconds for croc receive (default 600s).
 
     Returns:
         Shell commands string to run on the agent container (not on the target).
@@ -395,8 +398,7 @@ def generate_croc_scp_commands(
     # Receive files via croc
     commands.append('__CROC_DIR=$(mktemp -d)')
     commands.append('cd "$__CROC_DIR"')
-    # Timeout after 120s to avoid infinite hangs if sender is unreachable
-    commands.append(f'timeout 120 bash -c \'CROC_SECRET="{code}" croc --yes --overwrite\'')
+    commands.append(f'timeout {timeout} bash -c \'CROC_SECRET="{code}" croc --yes --overwrite\'')
     commands.append('__CROC_RC=$?')
     commands.append('if [ $__CROC_RC -ne 0 ]; then')
     commands.append('  echo "ERROR: croc file receive failed (exit code: $__CROC_RC)" >&2')
@@ -423,6 +425,7 @@ def generate_croc_scp_commands(
                 f"{scp_prefix} ssh {ssh_opts} {scp_auth} {pubkey_opt} {ssh_target} "
                 f"'mkdir -p '\"'\"'{escaped_dest}'\"'\"' && tar xzf - -C '\"'\"'{escaped_dest}'\"'\"'' "
                 f'< "$__CROC_DIR/"\'{escaped_croc_name}\''
+                f' || {{ echo "ERROR: Failed to transfer directory to {dest} on target" >&2; exit 1; }}'
             )
         else:
             # Create remote directory if needed
@@ -431,12 +434,14 @@ def generate_croc_scp_commands(
                 commands.append(
                     f"{scp_prefix} ssh {ssh_opts} {scp_auth} {pubkey_opt} {ssh_target} "
                     f"\"mkdir -p '{escaped_dir}'\""
+                    f' || {{ echo "ERROR: Failed to create directory {dest_dir} on target" >&2; exit 1; }}'
                 )
 
             # SCP the file
             commands.append(
                 f'{scp_prefix} scp {ssh_opts} {scp_auth} {pubkey_opt} '
                 f'"$__CROC_DIR/"\'{escaped_croc_name}\' {ssh_target}:\'{escaped_dest}\''
+                f' || {{ echo "ERROR: SCP failed for {dest}" >&2; exit 1; }}'
             )
 
         # Set permissions
