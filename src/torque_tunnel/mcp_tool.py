@@ -2992,33 +2992,50 @@ async def cli_dispatch(args):
                     print(f"Error: {e}", file=sys.stderr)
                     sys.exit(1)
             
-            # Process file uploads
+            # Process file uploads (with croc for large files)
             init_commands = None
+            container_pre_commands = None
+            plan = None
+            croc_process = None
             if uploads:
-                file_deploy_commands, file_errors = prepare_files_deployment(uploads)
-                if file_errors:
+                plan = prepare_files_with_croc(
+                    uploads, transfer_mode="ssh",
+                    target_ip=target_ip, ssh_user=ssh_user,
+                    ssh_private_key=ssh_key, ssh_password=ssh_password,
+                )
+                if plan.errors:
                     print("Error preparing files:", file=sys.stderr)
-                    for e in file_errors:
+                    for e in plan.errors:
                         print(f"  - {e}", file=sys.stderr)
                     sys.exit(1)
-                if file_deploy_commands:
-                    init_commands = file_deploy_commands
+                if plan.inline_commands:
+                    init_commands = plan.inline_commands
+                if plan.croc_container_pre_commands:
+                    container_pre_commands = plan.croc_container_pre_commands
             
             effective_command = cmd or "echo 'Files deployed successfully'"
             
-            async with get_torque_client() as client:
-                result = await client.execute_remote_command(
-                    target_ip=target_ip,
-                    ssh_user=ssh_user,
-                    ssh_private_key=ssh_key,
-                    command=effective_command,
-                    agent=agent,
-                    timeout=timeout,
-                    auto_cleanup=_config["auto_delete_environments"],
-                    log_callback=cli_log_callback(""),
-                    init_commands=init_commands,
-                    ssh_password=ssh_password,
-                )
+            try:
+                # Start croc send locally if needed
+                if plan is not None and plan.needs_croc:
+                    croc_process = await execute_with_croc(plan)
+                
+                async with get_torque_client() as client:
+                    result = await client.execute_remote_command(
+                        target_ip=target_ip,
+                        ssh_user=ssh_user,
+                        ssh_private_key=ssh_key,
+                        command=effective_command,
+                        agent=agent,
+                        timeout=timeout,
+                        auto_cleanup=_config["auto_delete_environments"],
+                        log_callback=cli_log_callback(""),
+                        init_commands=init_commands,
+                        ssh_password=ssh_password,
+                        container_pre_commands=container_pre_commands,
+                    )
+            finally:
+                await cleanup_croc_resources(croc_process, plan.croc_staging_dir if plan else "")
             
             if output_json:
                 print(json_module.dumps({
@@ -3174,50 +3191,67 @@ async def cli_dispatch(args):
                     print(f"Error setting up persistent container: {e}", file=sys.stderr)
                     sys.exit(1)
                 
-                # Process file uploads
+                # Process file uploads (with croc for large files)
                 init_commands = None
+                container_pre_commands = None
+                plan = None
+                croc_process = None
                 if uploads:
-                    file_deploy_commands, file_errors = prepare_files_deployment(uploads)
-                    if file_errors:
+                    plan = prepare_files_with_croc(
+                        uploads, transfer_mode="ssh",
+                        target_ip=container_ip, ssh_user="root",
+                        ssh_private_key=private_key,
+                    )
+                    if plan.errors:
                         print("Error preparing files:", file=sys.stderr)
-                        for e in file_errors:
+                        for e in plan.errors:
                             print(f"  - {e}", file=sys.stderr)
                         sys.exit(1)
-                    if file_deploy_commands:
+                    if plan.inline_commands:
                         global_init = _config.get("init_commands") or ""
-                        init_commands = (file_deploy_commands + "\n" + global_init) if global_init else file_deploy_commands
+                        init_commands = (plan.inline_commands + "\n" + global_init) if global_init else plan.inline_commands
+                    if plan.croc_container_pre_commands:
+                        container_pre_commands = plan.croc_container_pre_commands
                 
                 effective_command = cmd or "echo 'Files deployed successfully'"
                 
                 print(f"Persistent Container: {used_env_id}", file=sys.stderr)
                 
-                async with get_torque_client() as client:
-                    result = await client.execute_remote_command(
-                        target_ip=container_ip,
-                        ssh_user="root",
-                        ssh_private_key=private_key,
-                        command=effective_command,
-                        agent=agent,
-                        timeout=timeout,
-                        auto_cleanup=_config["auto_delete_environments"],
-                        log_callback=cli_log_callback(""),
-                        init_commands=init_commands,
-                    )
+                try:
+                    # Start croc send locally if needed
+                    if plan is not None and plan.needs_croc:
+                        croc_process = await execute_with_croc(plan)
                     
-                    # Extend idle timeout
-                    try:
-                        idle_seconds = _config["container_idle_timeout"]
-                        hours = idle_seconds / 3600
-                        if hours == int(hours):
-                            duration_str = f"PT{int(hours)}H"
-                        else:
-                            total_minutes = int(idle_seconds / 60)
-                            h = total_minutes // 60
-                            m = total_minutes % 60
-                            duration_str = f"PT{h}H{m}M" if h else f"PT{m}M"
-                        await client.extend_environment(used_env_id, duration=duration_str)
-                    except Exception:
-                        pass
+                    async with get_torque_client() as client:
+                        result = await client.execute_remote_command(
+                            target_ip=container_ip,
+                            ssh_user="root",
+                            ssh_private_key=private_key,
+                            command=effective_command,
+                            agent=agent,
+                            timeout=timeout,
+                            auto_cleanup=_config["auto_delete_environments"],
+                            log_callback=cli_log_callback(""),
+                            init_commands=init_commands,
+                            container_pre_commands=container_pre_commands,
+                        )
+                    
+                        # Extend idle timeout
+                        try:
+                            idle_seconds = _config["container_idle_timeout"]
+                            hours = idle_seconds / 3600
+                            if hours == int(hours):
+                                duration_str = f"PT{int(hours)}H"
+                            else:
+                                total_minutes = int(idle_seconds / 60)
+                                h = total_minutes // 60
+                                m = total_minutes % 60
+                                duration_str = f"PT{h}H{m}M" if h else f"PT{m}M"
+                            await client.extend_environment(used_env_id, duration=duration_str)
+                        except Exception:
+                            pass
+                finally:
+                    await cleanup_croc_resources(croc_process, plan.croc_staging_dir if plan else "")
                 
                 if output_json:
                     print(json_module.dumps({
@@ -3249,29 +3283,44 @@ async def cli_dispatch(args):
                 print("Error: Must provide a command or --upload files (or both).", file=sys.stderr)
                 sys.exit(1)
             
-            # Process file uploads
+            # Process file uploads (with croc for large files)
             init_commands = None
+            plan = None
+            croc_process = None
             if uploads:
-                file_deploy_commands, file_errors = prepare_files_deployment(uploads)
-                if file_errors:
+                plan = prepare_files_with_croc(uploads, transfer_mode="container")
+                if plan.errors:
                     print("Error preparing files:", file=sys.stderr)
-                    for e in file_errors:
+                    for e in plan.errors:
                         print(f"  - {e}", file=sys.stderr)
                     sys.exit(1)
-                if file_deploy_commands:
-                    init_commands = file_deploy_commands
+                # Combine croc init + inline commands for container target
+                combined = []
+                if plan.croc_init_commands:
+                    combined.append(plan.croc_init_commands)
+                if plan.inline_commands:
+                    combined.append(plan.inline_commands)
+                if combined:
+                    init_commands = "\n".join(combined)
             
             effective_command = cmd or "echo 'Files deployed successfully'"
             
-            async with get_torque_client() as client:
-                result = await client.execute_local_command(
-                    command=effective_command,
-                    agent=agent,
-                    timeout=timeout,
-                    auto_cleanup=_config["auto_delete_environments"],
-                    log_callback=cli_log_callback(""),
-                    init_commands=init_commands,
-                )
+            try:
+                # Start croc send locally if needed
+                if plan is not None and plan.needs_croc:
+                    croc_process = await execute_with_croc(plan)
+                
+                async with get_torque_client() as client:
+                    result = await client.execute_local_command(
+                        command=effective_command,
+                        agent=agent,
+                        timeout=timeout,
+                        auto_cleanup=_config["auto_delete_environments"],
+                        log_callback=cli_log_callback(""),
+                        init_commands=init_commands,
+                    )
+            finally:
+                await cleanup_croc_resources(croc_process, plan.croc_staging_dir if plan else "")
             
             if output_json:
                 print(json_module.dumps({
