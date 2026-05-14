@@ -45,6 +45,10 @@ REMOTE_INSTALL_CHUNKS = 7
 # How long to wait for croc to register with the relay before launching the remote receive
 CROC_SEND_STARTUP_SECONDS = 3
 
+# How long the croc receive retry loop waits between attempts.
+# Croc exits immediately when no sender room exists; this controls the retry interval.
+CROC_RECEIVE_RETRY_SECONDS = 5
+
 
 def _get_cache_dir() -> Path:
     """Get platform-appropriate cache directory for the croc binary."""
@@ -529,3 +533,249 @@ async def cleanup_croc_send(process: Optional[asyncio.subprocess.Process]) -> No
             await process.wait()
     except ProcessLookupError:
         pass  # Process already gone
+
+
+# --- Download (remote→local) support ---
+
+
+def generate_croc_send_commands(
+    code: str,
+    file_infos: list[dict],
+    timeout: int = 300,
+) -> str:
+    """Generate shell commands to send files from the container/target to local via croc.
+
+    Used for container-target and local-executor downloads. Files are staged into
+    a temp dir with unique names, then sent via croc to the local machine which
+    runs ``croc receive`` in the background.
+
+    Args:
+        code: The croc secret code (2048-bit).
+        file_infos: List of dicts, each with:
+            - remote_source_path: Path on the container to download.
+            - croc_filename: Uniquely-prefixed filename for staging.
+        timeout: Timeout in seconds for croc send (default 300s).
+            Croc may hang after 100% transfer through proxy relays;
+            this timeout ensures the environment doesn't get stuck.
+
+    Returns:
+        Shell commands string.
+    """
+    commands = []
+    commands.append("# === Croc file download (send to local) ===")
+    commands.append('__DL_DIR=$(mktemp -d)')
+
+    for fi in file_infos:
+        src = fi["remote_source_path"]
+        croc_name = fi["croc_filename"]
+        escaped_src = _shell_escape_single(src)
+        escaped_name = _shell_escape_single(croc_name)
+        # cp -r works for both files and directories
+        commands.append(
+            f"cp -r '{escaped_src}' \"$__DL_DIR/\"'{escaped_name}'"
+            f" || {{ echo 'WARNING: Failed to stage {escaped_src} for download' >&2; }}"
+        )
+
+    # croc send all files from the staging directory
+    commands.append('cd "$__DL_DIR"')
+    commands.append(f'export CROC_SECRET="{code}"')
+
+    croc_names = [f"'{_shell_escape_single(fi['croc_filename'])}'" for fi in file_infos]
+    files_arg = " ".join(croc_names)
+
+    # -k 5: if SIGTERM is ignored, SIGKILL after 5 seconds
+    # Croc sometimes hangs after 100% transfer when going through a proxy relay
+    commands.append(f'timeout -k 5 {timeout} croc send --no-local {files_arg}')
+    commands.append('__DL_RC=$?')
+    commands.append('unset CROC_SECRET')
+    commands.append('cd /')
+    commands.append('rm -rf "$__DL_DIR"')
+    # Exit codes 124 (timeout SIGTERM) and 137 (SIGKILL) are expected when croc hangs
+    # after a successful transfer - the data was already sent to the receiver
+    commands.append('if [ $__DL_RC -ne 0 ] && [ $__DL_RC -ne 124 ] && [ $__DL_RC -ne 137 ]; then')
+    commands.append('  echo "WARNING: croc file download failed (exit code: $__DL_RC)" >&2')
+    commands.append('fi')
+    commands.append("# === End croc file download ===")
+    return "\n".join(commands)
+
+
+def generate_croc_scp_download_commands(
+    code: str,
+    file_infos: list[dict],
+    target_ip: str,
+    ssh_user: str,
+    ssh_private_key: str = "",
+    ssh_password: str = "",
+    timeout: int = 300,
+) -> str:
+    """Generate shell commands to SCP files from SSH target to container, then croc send to local.
+
+    Used for SSH-target downloads:
+    1. SCP files from the SSH target to a temp dir on the container
+    2. croc send the files from the container to the local machine
+
+    Args:
+        code: The croc secret code.
+        file_infos: List of dicts with remote_source_path and croc_filename.
+        target_ip: SSH target IP/hostname.
+        ssh_user: SSH username.
+        ssh_private_key: SSH private key content (PEM format).
+        ssh_password: SSH password (alternative to key).
+        timeout: Timeout in seconds for croc send (default 300s).
+            Croc may hang after 100% transfer through proxy relays;
+            this timeout ensures the environment doesn't get stuck.
+
+    Returns:
+        Shell commands string to run on the agent container.
+    """
+    commands = []
+    commands.append("# === SCP download from target + croc send to local ===")
+
+    escaped_target = _shell_escape_single(target_ip)
+    escaped_user = _shell_escape_single(ssh_user)
+    ssh_target = f"'{escaped_user}'@'{escaped_target}'"
+
+    # Set up SSH auth for SCP
+    scp_prefix = ""
+    scp_auth = ""
+    if ssh_private_key:
+        commands.append('__DL_KEY=$(mktemp)')
+        commands.append("cat << '__DL_KEYEOF' > \"$__DL_KEY\"")
+        commands.append(ssh_private_key)
+        commands.append("__DL_KEYEOF")
+        commands.append('chmod 600 "$__DL_KEY"')
+        scp_auth = '-i "$__DL_KEY"'
+    elif ssh_password:
+        escaped_pw = _shell_escape_single(ssh_password)
+        commands.append("if ! command -v sshpass &>/dev/null; then")
+        commands.append("  apt-get install -y -qq sshpass >/dev/null 2>&1 \\")
+        commands.append("    || { apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq sshpass >/dev/null 2>&1; }")
+        commands.append("fi")
+        scp_prefix = f"sshpass -p '{escaped_pw}'"
+    else:
+        raise ValueError("Either ssh_private_key or ssh_password is required for SCP download")
+
+    pubkey_opt = "" if ssh_private_key else "-o PubkeyAuthentication=no"
+    ssh_opts = "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
+
+    # Create staging directory and SCP each file/dir from target
+    commands.append('__DL_DIR=$(mktemp -d)')
+
+    for fi in file_infos:
+        src = fi["remote_source_path"]
+        croc_name = fi["croc_filename"]
+        escaped_src = _shell_escape_single(src)
+        escaped_name = _shell_escape_single(croc_name)
+        # scp -r works for both files and directories
+        commands.append(
+            f'{scp_prefix} scp -r {ssh_opts} {scp_auth} {pubkey_opt} '
+            f'{ssh_target}:\'{escaped_src}\' "$__DL_DIR/"\'{escaped_name}\''
+            f" || {{ echo 'WARNING: SCP download failed for {escaped_src}' >&2; }}"
+        )
+
+    # croc send all staged files to local
+    commands.append('cd "$__DL_DIR"')
+    commands.append(f'export CROC_SECRET="{code}"')
+
+    croc_names = [f"'{_shell_escape_single(fi['croc_filename'])}'" for fi in file_infos]
+    files_arg = " ".join(croc_names)
+
+    commands.append(f'timeout -k 5 {timeout} croc send --no-local {files_arg}')
+    commands.append('__DL_RC=$?')
+    commands.append('unset CROC_SECRET')
+    commands.append('cd /')
+
+    # Cleanup
+    if ssh_private_key:
+        commands.append('rm -f "$__DL_KEY"')
+    commands.append('rm -rf "$__DL_DIR"')
+
+    commands.append('if [ $__DL_RC -ne 0 ] && [ $__DL_RC -ne 124 ] && [ $__DL_RC -ne 137 ]; then')
+    commands.append('  echo "WARNING: croc file download failed (exit code: $__DL_RC)" >&2')
+    commands.append('fi')
+    commands.append("# === End SCP download + croc send ===")
+    return "\n".join(commands)
+
+
+async def start_croc_receive(
+    croc_path: Path,
+    code: str,
+    receive_dir: str,
+    timeout: int = 1800,
+) -> asyncio.subprocess.Process:
+    """Start croc receive as a background process with automatic retry.
+
+    Croc receive exits immediately when no sender room exists on the relay.
+    Since the receiver must start BEFORE the remote environment runs (which
+    creates the sender), this function wraps croc in a retry loop that keeps
+    trying every CROC_RECEIVE_RETRY_SECONDS until the sender appears or
+    the timeout expires.
+
+    Files are saved to receive_dir (croc writes to cwd).
+
+    Args:
+        croc_path: Path to local croc binary.
+        code: The croc secret code.
+        receive_dir: Directory where received files will be saved.
+        timeout: Maximum seconds to keep retrying (default 1800 = 30 min).
+
+    Returns:
+        The asyncio subprocess Process handle (a Python wrapper process that
+        internally retries croc). Kill this process to abort all retries.
+    """
+    # Build a small Python script that retries croc until it succeeds.
+    # Using sys.executable ensures cross-platform compatibility.
+    # repr() handles Windows backslashes in paths safely.
+    #
+    # Key design choices:
+    # - On first attempt, use --overwrite in case stale files exist from prior runs.
+    # - After each attempt, check if ANY files appeared in receive_dir.
+    #   If files exist, stop retrying even if croc exited non-zero — the sender
+    #   may hang after 100% transfer (proxy/relay issues) causing croc to exit
+    #   with error, but the data is already written.
+    # - On retries (no files received yet), keep using --overwrite.
+    retry_script = (
+        "import subprocess, os, sys, time\n"
+        f"croc_path = {str(croc_path)!r}\n"
+        f"receive_dir = {receive_dir!r}\n"
+        f"code = {code!r}\n"
+        f"timeout = {timeout}\n"
+        f"retry_interval = {CROC_RECEIVE_RETRY_SECONDS}\n"
+        "env = os.environ.copy()\n"
+        "env['CROC_SECRET'] = code\n"
+        "deadline = time.monotonic() + timeout\n"
+        "while time.monotonic() < deadline:\n"
+        "    result = subprocess.run(\n"
+        "        [croc_path, '--yes', '--overwrite'],\n"
+        "        cwd=receive_dir,\n"
+        "        env=env,\n"
+        "        stdin=subprocess.DEVNULL,\n"
+        "        stdout=subprocess.DEVNULL,\n"
+        "        stderr=subprocess.DEVNULL,\n"
+        "    )\n"
+        "    if result.returncode == 0:\n"
+        "        sys.exit(0)\n"
+        "    # Check if files appeared — sender may hang after transfer completes\n"
+        "    if any(f for f in os.listdir(receive_dir) if not f.startswith('.')):\n"
+        "        sys.exit(0)\n"
+        "    time.sleep(retry_interval)\n"
+        "sys.exit(1)\n"
+    )
+
+    process = await asyncio.create_subprocess_exec(
+        sys.executable, "-c", retry_script,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+
+    # Brief pause to ensure the wrapper process started
+    await asyncio.sleep(1)
+
+    # Check if it crashed during startup (e.g. syntax error in script)
+    if process.returncode is not None:
+        raise RuntimeError(
+            f"croc receive wrapper exited immediately with code {process.returncode}"
+        )
+
+    return process

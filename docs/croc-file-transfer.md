@@ -6,6 +6,7 @@ torque-tunnel uses [croc](https://github.com/schollz/croc) for transferring file
 
 ## When Croc is Used
 
+### Uploads
 Files are automatically routed through croc when their **compressed size** exceeds **300KB** (~307,200 bytes). Files below this threshold continue to use the existing inline base64 approach via Torque API payloads.
 
 This threshold was determined empirically:
@@ -13,9 +14,12 @@ This threshold was determined empirically:
 - Shell grain hangs at ~450KB payloads
 - 300KB provides a safe margin
 
+### Downloads
+Downloads **always** use croc regardless of file size. There is no inline alternative for downloads since the remote file content cannot be embedded in API responses reliably.
+
 ## Architecture
 
-### Transfer Modes
+### Upload Transfer Modes
 
 **Container targets** (disposable/persistent):
 ```
@@ -29,7 +33,7 @@ Local machine --[croc relay]--> Agent container --[SCP]--> SSH target
 ```
 Croc install + receive + SCP commands run on the agent container via the `container_pre_commands` blueprint mechanism, before the SSH connection to the target.
 
-### Flow
+### Upload Flow
 
 1. `prepare_files_with_croc()` splits files into inline (small) and croc (large) groups
 2. For croc files: creates a staging directory with uniquely-named copies/tars
@@ -38,12 +42,37 @@ Croc install + receive + SCP commands run on the agent container via the `contai
 5. The Torque environment starts, and the remote side runs `croc receive`
 6. After execution, the croc process and staging directory are cleaned up
 
+### Download Transfer Modes
+
+**Container targets** (disposable/persistent):
+```
+Agent container --[croc relay]--> Local machine
+```
+Container stages files with `cp -r` to a temp dir, then runs `croc send`. Local machine runs `croc receive` in background.
+
+**SSH targets**:
+```
+SSH target --[SCP]--> Agent container --[croc relay]--> Local machine
+```
+Container SCPs files from SSH target to a temp dir, then runs `croc send`. Local machine runs `croc receive` in background.
+
+### Download Flow
+
+1. `prepare_download_with_croc()` creates a `DownloadPlan` with croc code, receive dir, and file mappings
+2. Generates shell commands for the remote side (croc install + `cp -r`/SCP + `croc send`)
+3. `execute_download_receive()` starts `croc receive` locally in background (connects to relay, waits for sender)
+4. The Torque environment runs the main command, then finally commands, then download commands
+5. After the environment completes, `finalize_download()` moves received files from temp dir to final local destinations
+6. `cleanup_download_resources()` removes the temp receive dir and kills the croc process
+
 ### Async Handlers
 
-For async tools (`run_on_tunneled_ssh_async`, etc.), the croc send process is tracked in `_croc_async_state[environment_id]` and cleaned up when:
-- `get_execution_status` detects a terminal status
+For async tools (`run_on_tunneled_ssh_async`, etc.), the croc send process (uploads) and croc receive process (downloads) are tracked in `_croc_async_state[environment_id]` and cleaned up when:
+- `get_execution_status` detects a terminal status (also finalizes downloads and includes results in output)
 - `cancel_execution` is called
 - An error occurs during environment startup
+
+Download results for async executions are stored in `_download_results[environment_id]` and included in the `get_execution_status` response.
 
 ## Security
 
@@ -85,10 +114,11 @@ For async tools (`run_on_tunneled_ssh_async`, etc.), the croc send process is tr
 
 | File | Purpose |
 |---|---|
-| `src/torque_tunnel/croc_manager.py` | Cross-platform croc binary management, code generation, shell command generation |
-| `src/torque_tunnel/mcp_tool.py` | `FileDeploymentPlan`, `prepare_files_with_croc()`, `execute_with_croc()`, handler integration |
-| `blueprints/remote-shell-executor.yaml` | Added `container_pre_commands_b64` input for pre-SSH croc transfers |
-| `src/torque_tunnel/torque_client.py` | Added `container_pre_commands` parameter to `start_environment()` and `execute_remote_command()` |
+| `src/torque_tunnel/croc_manager.py` | Cross-platform croc binary management, code generation, shell command generation (upload + download) |
+| `src/torque_tunnel/mcp_tool.py` | `FileDeploymentPlan`, `DownloadPlan`, prepare/execute/finalize/cleanup helpers, handler integration |
+| `blueprints/remote-shell-executor.yaml` | `container_pre_commands_b64` for pre-SSH croc uploads, `download_commands_b64` for post-SSH croc downloads |
+| `blueprints/local-shell-executor.yaml` | `download_commands_b64` for post-command croc downloads on containers |
+| `src/torque_tunnel/torque_client.py` | `container_pre_commands` and `download_commands` parameters |
 
 ## Testing
 
@@ -102,8 +132,13 @@ Tests cover:
 - Mode validation
 - Shell escaping
 - Remote install script generation
-- Receive command generation (files, directories, modes, error handling)
-- SCP command generation (key auth, password auth, directory tar piping)
-- `prepare_files_with_croc()` (inline decisions, croc decisions, mixed, staging dir)
-- Cleanup functions (process termination, staging dir removal)
+- Upload: receive command generation (files, directories, modes, error handling)
+- Upload: SCP command generation (key auth, password auth, directory tar piping)
+- Upload: `prepare_files_with_croc()` (inline decisions, croc decisions, mixed, staging dir)
+- Download: `generate_croc_send_commands()` (staging, cleanup, error handling)
+- Download: `generate_croc_scp_download_commands()` (key/password auth, staging, cleanup)
+- Download: `prepare_download_with_croc()` (container/ssh modes, file mappings, unique codes/dirs)
+- Download: `finalize_download()` (move files/dirs, create parent dirs, overwrite, missing files)
+- Download: `cleanup_download_resources()` (cleanup process and temp dir)
+- Download: `parse_downloads()` (CLI arg parsing, Windows drive letters)
 - Edge cases (empty files, missing paths, duplicate basenames, special characters)

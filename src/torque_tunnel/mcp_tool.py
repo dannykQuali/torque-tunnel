@@ -11,6 +11,7 @@ import os
 import re
 import shutil
 import sys
+import time
 import asyncio
 import argparse
 import tempfile
@@ -719,6 +720,202 @@ async def cleanup_croc_resources(
         shutil.rmtree(staging_dir, ignore_errors=True)
 
 
+# --- Download (remote→local) support ---
+
+
+@dataclass
+class DownloadPlan:
+    """Result of preparing download instructions for remote→local file transfer via croc."""
+    # Shell commands to run on the container/target AFTER the main command (croc send)
+    download_commands: str = ""
+    # The croc secret code (needed to start local croc receive)
+    croc_code: str = ""
+    # Local directory where croc receive will save files
+    croc_receive_dir: str = ""
+    # Mapping from croc_filename → local_destination_path for post-receive file placement
+    file_mappings: list[dict] = field(default_factory=list)
+    # Whether download is needed
+    needs_download: bool = False
+    # Errors during preparation
+    errors: list[str] = field(default_factory=list)
+    # File info strings for output reporting
+    files_info: list[str] = field(default_factory=list)
+
+
+def prepare_download_with_croc(
+    files: list[dict],
+    transfer_mode: str = "container",
+    target_ip: str = "",
+    ssh_user: str = "",
+    ssh_private_key: str = "",
+    ssh_password: str = "",
+) -> DownloadPlan:
+    """Prepare download plan for remote→local file transfer via croc.
+    
+    Generates shell commands to run on the remote side (croc send) and
+    prepares the local side (croc receive directory and file mappings).
+    
+    Args:
+        files: List of dicts with remote_source_path and local_destination_path.
+        transfer_mode: "container" for disposable containers (files on container),
+                       "ssh" for SSH targets (SCP from target to container, then croc send).
+        target_ip: SSH target IP (only for transfer_mode="ssh").
+        ssh_user: SSH user (only for transfer_mode="ssh").
+        ssh_private_key: SSH private key (only for transfer_mode="ssh").
+        ssh_password: SSH password (only for transfer_mode="ssh").
+    
+    Returns:
+        DownloadPlan with download commands and croc receive info.
+    """
+    plan = DownloadPlan()
+    
+    if not files:
+        return plan
+    
+    plan.needs_download = True
+    plan.croc_code = croc_manager.generate_croc_code()
+    
+    # Create local receive directory
+    receive_dir = tempfile.mkdtemp(prefix="torque_dl_")
+    plan.croc_receive_dir = receive_dir
+    
+    # Build file info list for croc
+    file_infos = []
+    for i, file_spec in enumerate(files):
+        remote_path = file_spec["remote_source_path"]
+        local_path = file_spec["local_destination_path"]
+        basename = os.path.basename(remote_path.rstrip("/\\"))
+        croc_filename = f"_croc_dl_{i}_{basename}"
+        
+        file_infos.append({
+            "remote_source_path": remote_path,
+            "croc_filename": croc_filename,
+        })
+        plan.file_mappings.append({
+            "croc_filename": croc_filename,
+            "local_destination_path": local_path,
+        })
+        plan.files_info.append(f"  {remote_path} → {local_path}")
+    
+    # Generate croc install + send commands for the remote side
+    croc_install = croc_manager.generate_remote_croc_install_script()
+    
+    if transfer_mode == "ssh":
+        # For SSH: SCP files from target to container, then croc send
+        croc_send = croc_manager.generate_croc_scp_download_commands(
+            code=plan.croc_code,
+            file_infos=file_infos,
+            target_ip=target_ip,
+            ssh_user=ssh_user,
+            ssh_private_key=ssh_private_key,
+            ssh_password=ssh_password,
+        )
+    else:
+        # For containers: croc send directly from the container
+        croc_send = croc_manager.generate_croc_send_commands(
+            code=plan.croc_code,
+            file_infos=file_infos,
+        )
+    
+    plan.download_commands = croc_install + "\n" + croc_send
+    return plan
+
+
+async def execute_download_receive(plan: DownloadPlan) -> asyncio.subprocess.Process:
+    """Start the local croc receive process for a download plan.
+    
+    Must be called BEFORE launching the Torque environment (the receiver
+    connects to the relay and waits for the sender).
+    Caller MUST call cleanup_download_resources() when done.
+    
+    Args:
+        plan: A DownloadPlan with needs_download=True.
+    
+    Returns:
+        The background croc receive process.
+    """
+    croc_path = await croc_manager.ensure_local_croc()
+    process = await croc_manager.start_croc_receive(
+        croc_path=croc_path,
+        code=plan.croc_code,
+        receive_dir=plan.croc_receive_dir,
+    )
+    return process
+
+
+def finalize_download(plan: DownloadPlan) -> tuple[list[str], list[str]]:
+    """Move received croc files to their final local destinations.
+    
+    Called after the environment has completed and croc receive has finished.
+    Retries briefly on file lock errors (e.g. croc still releasing the handle).
+    
+    Args:
+        plan: The DownloadPlan with file_mappings and croc_receive_dir.
+    
+    Returns:
+        Tuple of (successes, errors) lists of strings.
+    """
+    successes = []
+    errors = []
+    
+    for mapping in plan.file_mappings:
+        croc_filename = mapping["croc_filename"]
+        local_dest = mapping["local_destination_path"]
+        received_path = os.path.join(plan.croc_receive_dir, croc_filename)
+        
+        if not os.path.exists(received_path):
+            errors.append(f"File not received: {croc_filename}")
+            continue
+        
+        # Retry move a few times in case croc just released the file handle
+        max_retries = 5
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                # Ensure parent directory exists
+                dest_dir = os.path.dirname(os.path.abspath(local_dest))
+                os.makedirs(dest_dir, exist_ok=True)
+                
+                # Remove existing destination if present
+                if os.path.exists(local_dest):
+                    if os.path.isdir(local_dest):
+                        shutil.rmtree(local_dest)
+                    else:
+                        os.remove(local_dest)
+                
+                # Move received file/directory to final destination
+                shutil.move(received_path, local_dest)
+                successes.append(f"Downloaded: {local_dest}")
+                last_error = None
+                break
+            except PermissionError as e:
+                last_error = e
+                if attempt < max_retries - 1:
+                    time.sleep(1)  # Brief wait for file handle release
+            except Exception as e:
+                last_error = e
+                break  # Non-permission errors don't retry
+        
+        if last_error is not None:
+            errors.append(f"Failed to place {croc_filename} at {local_dest}: {last_error}")
+    
+    return successes, errors
+
+
+async def cleanup_download_resources(
+    dl_process: Optional[asyncio.subprocess.Process] = None,
+    receive_dir: str = "",
+) -> None:
+    """Clean up croc receive process and receive directory.
+    
+    Safe to call with None/empty values.
+    """
+    if dl_process is not None:
+        await croc_manager.cleanup_croc_send(dl_process)  # same cleanup logic
+    if receive_dir and os.path.exists(receive_dir):
+        shutil.rmtree(receive_dir, ignore_errors=True)
+
+
 # Global configuration - set via command line args or environment variables
 _config = {
     "torque_url": None,
@@ -747,7 +944,13 @@ _persistent_containers: dict[str, dict] = {}
 _default_persistent_container_id: Optional[str] = None
 _background_streamers: dict[str, asyncio.Task] = {}  # env_id -> background streaming task
 _streamer_cache: dict[str, dict] = {}  # env_id -> {'env_data': ..., 'status': ..., 'raw_status': ...}
-_croc_async_state: dict[str, dict] = {}  # env_id -> {"process": Process, "staging_dir": str}
+_croc_async_state: dict[str, dict] = {}  # env_id -> {"process": Process, "staging_dir": str, "dl_process": Process, "dl_plan": DownloadPlan}
+_download_results: dict[str, tuple] = {}  # env_id -> (successes, errors) from finalize_download
+
+# How long to wait for croc receive to finish AFTER the Torque environment completes.
+# The croc transfer through relay proxy can take a while to complete even after
+# the environment's croc send finishes.
+CROC_DOWNLOAD_RECEIVE_WAIT_SECONDS = 120
 
 # Terminal statuses that indicate the environment has finished
 _TERMINAL_STATUSES = {
@@ -987,6 +1190,24 @@ docker restart/stop/kill, systemctl restart docker, reboot, shutdown, init 0/6
                             "required": ["remote_destination_path"],
                         },
                     },
+                    "download_files": {
+                        "type": "array",
+                        "description": "Download files/directories from the remote server to your local machine AFTER the command runs. Uses croc for peer-to-peer encrypted transfer.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "remote_source_path": {
+                                    "type": "string",
+                                    "description": "Absolute path on the remote server to a file or directory to download.",
+                                },
+                                "local_destination_path": {
+                                    "type": "string",
+                                    "description": "Absolute path on your local machine where the file/directory will be saved.",
+                                },
+                            },
+                            "required": ["remote_source_path", "local_destination_path"],
+                        },
+                    },
                     "torque_agent": {
                         "type": "string",
                         "description": "DO NOT set unless the user explicitly provides this value or asks you to change it. Overrides the pre-configured Torque agent.",
@@ -1067,6 +1288,24 @@ Use `upload_files` to send local files/content to the target before running the 
                             "required": ["remote_destination_path"],
                         },
                     },
+                    "download_files": {
+                        "type": "array",
+                        "description": "Download files/directories from the container to your local machine AFTER the command runs. Uses croc for peer-to-peer encrypted transfer.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "remote_source_path": {
+                                    "type": "string",
+                                    "description": "Absolute path on the container to a file or directory to download.",
+                                },
+                                "local_destination_path": {
+                                    "type": "string",
+                                    "description": "Absolute path on your local machine where the file/directory will be saved.",
+                                },
+                            },
+                            "required": ["remote_source_path", "local_destination_path"],
+                        },
+                    },
                     "torque_agent": {
                         "type": "string",
                         "description": "DO NOT set unless the user explicitly provides this value or asks you to change it. Overrides the pre-configured Torque agent.",
@@ -1145,6 +1384,24 @@ Use `upload_files` to send local files/content to the target before running the 
                                 },
                             },
                             "required": ["remote_destination_path"],
+                        },
+                    },
+                    "download_files": {
+                        "type": "array",
+                        "description": "Download files/directories from the remote server to your local machine AFTER the command runs. Uses croc for peer-to-peer encrypted transfer.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "remote_source_path": {
+                                    "type": "string",
+                                    "description": "Absolute path on the remote server to a file or directory to download.",
+                                },
+                                "local_destination_path": {
+                                    "type": "string",
+                                    "description": "Absolute path on your local machine where the file/directory will be saved.",
+                                },
+                            },
+                            "required": ["remote_source_path", "local_destination_path"],
                         },
                     },
                     "torque_agent": {
@@ -1246,6 +1503,24 @@ systemctl restart docker, reboot, shutdown, init 0/6""",
                             "required": ["remote_destination_path"],
                         },
                     },
+                    "download_files": {
+                        "type": "array",
+                        "description": "Download files/directories from the remote server to your local machine AFTER the command runs. Uses croc for peer-to-peer encrypted transfer.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "remote_source_path": {
+                                    "type": "string",
+                                    "description": "Absolute path on the remote server to a file or directory to download.",
+                                },
+                                "local_destination_path": {
+                                    "type": "string",
+                                    "description": "Absolute path on your local machine where the file/directory will be saved.",
+                                },
+                            },
+                            "required": ["remote_source_path", "local_destination_path"],
+                        },
+                    },
                     "torque_agent": {
                         "type": "string",
                         "description": "DO NOT set unless the user explicitly provides this value or asks you to change it. Overrides the pre-configured Torque agent.",
@@ -1322,6 +1597,24 @@ After restart: pass previous `environment_id` to reconnect.""",
                                 },
                             },
                             "required": ["remote_destination_path"],
+                        },
+                    },
+                    "download_files": {
+                        "type": "array",
+                        "description": "Download files/directories from the remote server to your local machine AFTER the command runs. Uses croc for peer-to-peer encrypted transfer.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "remote_source_path": {
+                                    "type": "string",
+                                    "description": "Absolute path on the remote server to a file or directory to download.",
+                                },
+                                "local_destination_path": {
+                                    "type": "string",
+                                    "description": "Absolute path on your local machine where the file/directory will be saved.",
+                                },
+                            },
+                            "required": ["remote_source_path", "local_destination_path"],
                         },
                     },
                     "torque_agent": {
@@ -1401,6 +1694,24 @@ Only for unreachable internal network targets. For local network/VMs, use termin
                                 },
                             },
                             "required": ["remote_destination_path"],
+                        },
+                    },
+                    "download_files": {
+                        "type": "array",
+                        "description": "Download files/directories from the container to your local machine AFTER the command runs. Uses croc for peer-to-peer encrypted transfer.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "remote_source_path": {
+                                    "type": "string",
+                                    "description": "Absolute path on the container to a file or directory to download.",
+                                },
+                                "local_destination_path": {
+                                    "type": "string",
+                                    "description": "Absolute path on your local machine where the file/directory will be saved.",
+                                },
+                            },
+                            "required": ["remote_source_path", "local_destination_path"],
                         },
                     },
                     "torque_agent": {
@@ -1634,6 +1945,22 @@ async def handle_run_on_tunneled_ssh(arguments: dict, config: dict = None):
             container_pre_commands = plan.croc_container_pre_commands
         files_info = plan.files_info
     
+    # Process download_files parameter
+    download_files = arguments.get("download_files", [])
+    dl_plan = None
+    dl_process = None
+    if download_files:
+        dl_plan = prepare_download_with_croc(
+            download_files, transfer_mode="ssh",
+            target_ip=target_ip, ssh_user=ssh_user,
+            ssh_private_key=ssh_private_key, ssh_password=ssh_password,
+        )
+        if dl_plan.errors:
+            return [TextContent(
+                type="text",
+                text="Error preparing downloads:\n" + "\n".join(f"- {e}" for e in dl_plan.errors),
+            )]
+    
     # If no command, use a simple echo
     effective_command = command or "echo 'Files deployed successfully'"
     
@@ -1652,6 +1979,13 @@ async def handle_run_on_tunneled_ssh(arguments: dict, config: dict = None):
                 croc_process = await execute_with_croc(plan)
             except Exception as e:
                 return [TextContent(type="text", text=f"Error starting croc file transfer: {str(e)}")]
+        
+        # Start croc receive locally if download is needed (receiver connects to relay first)
+        if dl_plan is not None and dl_plan.needs_download:
+            try:
+                dl_process = await execute_download_receive(dl_plan)
+            except Exception as e:
+                return [TextContent(type="text", text=f"Error starting croc file download receiver: {str(e)}")]
         
         # Create client with per-call or global config
         client = TorqueClient(
@@ -1675,6 +2009,7 @@ async def handle_run_on_tunneled_ssh(arguments: dict, config: dict = None):
                 init_commands=init_commands,
                 ssh_password=ssh_password,
                 container_pre_commands=container_pre_commands,
+                download_commands=dl_plan.download_commands if dl_plan else None,
             )
             
             # Try to get grain log for additional context (especially useful on failures)
@@ -1683,6 +2018,24 @@ async def handle_run_on_tunneled_ssh(arguments: dict, config: dict = None):
                 grain_log = await client.get_grain_log(result.environment_id)
             except Exception:
                 pass
+        
+        # Finalize file downloads if any
+        dl_summary = ""
+        if dl_plan is not None and dl_plan.needs_download:
+            # Wait for croc receive to finish (it should complete when remote croc send finishes)
+            if dl_process is not None and dl_process.returncode is None:
+                try:
+                    await asyncio.wait_for(dl_process.wait(), timeout=CROC_DOWNLOAD_RECEIVE_WAIT_SECONDS)
+                except asyncio.TimeoutError:
+                    pass  # Will be cleaned up in finally
+            dl_successes, dl_errors = finalize_download(dl_plan)
+            parts = []
+            if dl_successes:
+                parts.append("\n".join(f"- {s}" for s in dl_successes))
+            if dl_errors:
+                parts.append("\n".join(f"- WARNING: {e}" for e in dl_errors))
+            if parts:
+                dl_summary = "\n**Files Downloaded:**\n" + "\n".join(parts) + "\n"
         
         # Format execution duration
         if result.execution_duration is not None:
@@ -1703,7 +2056,7 @@ async def handle_run_on_tunneled_ssh(arguments: dict, config: dict = None):
             output_block = format_code_block(result.command_output)
             success_msg = "Command executed successfully" if result.exit_code == 0 else "Command failed"
             output_text = f"""{success_msg} on {target_ip}
-{files_summary}
+{files_summary}{dl_summary}
 **Exit Code:** {result.exit_code}
 
 **Output:**
@@ -1714,7 +2067,7 @@ async def handle_run_on_tunneled_ssh(arguments: dict, config: dict = None):
 **Environment:** {env_url}"""
         else:
             output_text = f"""Command execution failed on {target_ip}
-{files_summary}
+{files_summary}{dl_summary}
 **Status:** {result.status}
 **Error:** {result.error}
 
@@ -1748,6 +2101,7 @@ async def handle_run_on_tunneled_ssh(arguments: dict, config: dict = None):
         return [TextContent(type="text", text=f"Error executing remote command: {str(e)}")]
     finally:
         await cleanup_croc_resources(croc_process, plan.croc_staging_dir if plan else "")
+        await cleanup_download_resources(dl_process, dl_plan.croc_receive_dir if dl_plan else "")
 
 
 async def _ensure_persistent_container(
@@ -1919,6 +2273,22 @@ async def handle_run_on_tunneled_persistent_container(arguments: dict, config: d
             container_pre_commands = plan.croc_container_pre_commands
         files_info = plan.files_info
     
+    # Process download_files parameter
+    download_files = arguments.get("download_files", [])
+    dl_plan = None
+    dl_process = None
+    if download_files:
+        dl_plan = prepare_download_with_croc(
+            download_files, transfer_mode="ssh",
+            target_ip=container_ip, ssh_user="root",
+            ssh_private_key=private_key,
+        )
+        if dl_plan.errors:
+            return [TextContent(
+                type="text",
+                text="Error preparing downloads:\n" + "\n".join(f"- {e}" for e in dl_plan.errors),
+            )]
+    
     effective_command = command or "echo 'Files deployed successfully'"
     
     # Create log streamer for real-time output
@@ -1937,6 +2307,13 @@ async def handle_run_on_tunneled_persistent_container(arguments: dict, config: d
             except Exception as e:
                 return [TextContent(type="text", text=f"Error starting croc file transfer: {str(e)}")]
         
+        # Start croc receive locally if download is needed
+        if dl_plan is not None and dl_plan.needs_download:
+            try:
+                dl_process = await execute_download_receive(dl_plan)
+            except Exception as e:
+                return [TextContent(type="text", text=f"Error starting croc file download receiver: {str(e)}")]
+        
         # Reuse the SSH execution logic - SSH from a disposable grain into the persistent container
         async with get_torque_client(torque_url, torque_token, torque_space, config=cfg) as client:
             result = await client.execute_remote_command(
@@ -1950,6 +2327,7 @@ async def handle_run_on_tunneled_persistent_container(arguments: dict, config: d
                 log_callback=log_callback,
                 init_commands=init_commands,
                 container_pre_commands=container_pre_commands,
+                download_commands=dl_plan.download_commands if dl_plan else None,
             )
             
             grain_log = None
@@ -1975,6 +2353,23 @@ async def handle_run_on_tunneled_persistent_container(arguments: dict, config: d
                 pass  # Non-critical
         
         # Format output (same formatting as handle_run_on_tunneled_ssh)
+        # Finalize file downloads if any
+        dl_summary = ""
+        if dl_plan is not None and dl_plan.needs_download:
+            if dl_process is not None and dl_process.returncode is None:
+                try:
+                    await asyncio.wait_for(dl_process.wait(), timeout=CROC_DOWNLOAD_RECEIVE_WAIT_SECONDS)
+                except asyncio.TimeoutError:
+                    pass
+            dl_successes, dl_errors = finalize_download(dl_plan)
+            parts = []
+            if dl_successes:
+                parts.append("\n".join(f"- {s}" for s in dl_successes))
+            if dl_errors:
+                parts.append("\n".join(f"- WARNING: {e}" for e in dl_errors))
+            if parts:
+                dl_summary = "\n**Files Downloaded:**\n" + "\n".join(parts) + "\n"
+        
         if result.execution_duration is not None:
             duration = result.execution_duration
             duration_str = f"{int(duration // 60)}m {duration % 60:.1f}s" if duration >= 60 else f"{duration:.1f}s"
@@ -1992,7 +2387,7 @@ async def handle_run_on_tunneled_persistent_container(arguments: dict, config: d
             output_block = format_code_block(result.command_output)
             success_msg = "Command executed successfully" if result.exit_code == 0 else "Command failed"
             output_text = f"""{success_msg} on agent `{agent_name}`
-{files_summary}
+{files_summary}{dl_summary}
 **Persistent Container:** {env_id}
 **Exit Code:** {result.exit_code}
 
@@ -2004,7 +2399,7 @@ async def handle_run_on_tunneled_persistent_container(arguments: dict, config: d
 **Environment:** {env_url}"""
         else:
             output_text = f"""Command execution failed on agent `{agent_name}`
-{files_summary}
+{files_summary}{dl_summary}
 **Persistent Container:** {env_id}
 **Status:** {result.status}
 **Error:** {result.error}
@@ -2036,6 +2431,7 @@ async def handle_run_on_tunneled_persistent_container(arguments: dict, config: d
         return [TextContent(type="text", text=f"Error executing command on container: {str(e)}")]
     finally:
         await cleanup_croc_resources(croc_process, plan.croc_staging_dir if plan else "")
+        await cleanup_download_resources(dl_process, dl_plan.croc_receive_dir if dl_plan else "")
 
 
 async def handle_run_on_tunneled_disposable_container(arguments: dict, config: dict = None):
@@ -2078,6 +2474,18 @@ async def handle_run_on_tunneled_disposable_container(arguments: dict, config: d
             init_commands = "\n".join(combined)
         files_info = plan.files_info
     
+    # Process download_files parameter
+    download_files = arguments.get("download_files", [])
+    dl_plan = None
+    dl_process = None
+    if download_files:
+        dl_plan = prepare_download_with_croc(download_files, transfer_mode="container")
+        if dl_plan.errors:
+            return [TextContent(
+                type="text",
+                text="Error preparing downloads:\n" + "\n".join(f"- {e}" for e in dl_plan.errors),
+            )]
+    
     # If no command, use a simple echo
     effective_command = command or "echo 'Files deployed successfully'"
     
@@ -2097,6 +2505,13 @@ async def handle_run_on_tunneled_disposable_container(arguments: dict, config: d
             except Exception as e:
                 return [TextContent(type="text", text=f"Error starting croc file transfer: {str(e)}")]
         
+        # Start croc receive locally if download is needed
+        if dl_plan is not None and dl_plan.needs_download:
+            try:
+                dl_process = await execute_download_receive(dl_plan)
+            except Exception as e:
+                return [TextContent(type="text", text=f"Error starting croc file download receiver: {str(e)}")]
+        
         async with get_torque_client(torque_url, torque_token, torque_space, config=cfg) as client:
             result = await client.execute_local_command(
                 command=effective_command,
@@ -2105,6 +2520,7 @@ async def handle_run_on_tunneled_disposable_container(arguments: dict, config: d
                 auto_cleanup=cfg["auto_delete_environments"],
                 log_callback=log_callback,
                 init_commands=init_commands,
+                download_commands=dl_plan.download_commands if dl_plan else None,
             )
             
             # Try to get grain log for additional context (especially useful on failures)
@@ -2113,6 +2529,23 @@ async def handle_run_on_tunneled_disposable_container(arguments: dict, config: d
                 grain_log = await client.get_grain_log(result.environment_id)
             except Exception:
                 pass
+        
+        # Finalize file downloads if any
+        dl_summary = ""
+        if dl_plan is not None and dl_plan.needs_download:
+            if dl_process is not None and dl_process.returncode is None:
+                try:
+                    await asyncio.wait_for(dl_process.wait(), timeout=CROC_DOWNLOAD_RECEIVE_WAIT_SECONDS)
+                except asyncio.TimeoutError:
+                    pass
+            dl_successes, dl_errors = finalize_download(dl_plan)
+            parts = []
+            if dl_successes:
+                parts.append("\n".join(f"- {s}" for s in dl_successes))
+            if dl_errors:
+                parts.append("\n".join(f"- WARNING: {e}" for e in dl_errors))
+            if parts:
+                dl_summary = "\n**Files Downloaded:**\n" + "\n".join(parts) + "\n"
         
         # Format execution duration
         if result.execution_duration is not None:
@@ -2134,7 +2567,7 @@ async def handle_run_on_tunneled_disposable_container(arguments: dict, config: d
             output_block = format_code_block(result.command_output)
             success_msg = "Command executed successfully" if result.exit_code == 0 else "Command failed"
             output_text = f"""{success_msg} on agent `{agent_name}`
-{files_summary}
+{files_summary}{dl_summary}
 **Exit Code:** {result.exit_code}
 
 **Output:**
@@ -2145,7 +2578,7 @@ async def handle_run_on_tunneled_disposable_container(arguments: dict, config: d
 **Environment:** {env_url}"""
         else:
             output_text = f"""Command execution failed on agent `{agent_name}`
-{files_summary}
+{files_summary}{dl_summary}
 **Status:** {result.status}
 **Error:** {result.error}
 
@@ -2179,6 +2612,7 @@ async def handle_run_on_tunneled_disposable_container(arguments: dict, config: d
         return [TextContent(type="text", text=f"Error executing command on agent: {str(e)}")]
     finally:
         await cleanup_croc_resources(croc_process, plan.croc_staging_dir if plan else "")
+        await cleanup_download_resources(dl_process, dl_plan.croc_receive_dir if dl_plan else "")
 
 
 async def handle_run_on_tunneled_ssh_async(arguments: dict, config: dict = None):
@@ -2245,6 +2679,19 @@ async def handle_run_on_tunneled_ssh_async(arguments: dict, config: dict = None)
             container_pre_commands = plan.croc_container_pre_commands
         files_info = plan.files_info
     
+    # Process download_files parameter
+    download_files = arguments.get("download_files", [])
+    dl_plan = None
+    dl_process = None
+    if download_files:
+        dl_plan = prepare_download_with_croc(
+            download_files, transfer_mode="ssh",
+            target_ip=target_ip, ssh_user=ssh_user,
+            ssh_private_key=ssh_private_key, ssh_password=ssh_password,
+        )
+        if dl_plan.errors:
+            return [TextContent(type="text", text="Error preparing downloads:\n" + "\n".join(f"- {e}" for e in dl_plan.errors))]
+    
     effective_command = command or "echo 'Files deployed successfully'"
     
     try:
@@ -2254,6 +2701,13 @@ async def handle_run_on_tunneled_ssh_async(arguments: dict, config: dict = None)
                 croc_process = await execute_with_croc(plan)
             except Exception as e:
                 return [TextContent(type="text", text=f"Error starting croc file transfer: {str(e)}")]
+        
+        # Start croc receive locally if download is needed
+        if dl_plan is not None and dl_plan.needs_download:
+            try:
+                dl_process = await execute_download_receive(dl_plan)
+            except Exception as e:
+                return [TextContent(type="text", text=f"Error starting croc file download receiver: {str(e)}")]
         
         async with get_torque_client(torque_url, torque_token, torque_space, config=cfg) as client:
             environment_id = await client.start_environment(
@@ -2266,15 +2720,21 @@ async def handle_run_on_tunneled_ssh_async(arguments: dict, config: dict = None)
                 timeout=timeout,
                 ssh_password=ssh_password,
                 container_pre_commands=container_pre_commands,
+                download_commands=dl_plan.download_commands if dl_plan else None,
             )
         
         # Track croc state for cleanup when execution completes
+        async_state = {}
         if croc_process is not None:
-            _croc_async_state[environment_id] = {
-                "process": croc_process,
-                "staging_dir": plan.croc_staging_dir if plan else "",
-            }
+            async_state["process"] = croc_process
+            async_state["staging_dir"] = plan.croc_staging_dir if plan else ""
             croc_process = None  # Don't clean up in except block
+        if dl_process is not None:
+            async_state["dl_process"] = dl_process
+            async_state["dl_plan"] = dl_plan
+            dl_process = None  # Don't clean up in except block
+        if async_state:
+            _croc_async_state[environment_id] = async_state
         
         # Start background streaming of grain log to stderr
         _start_background_streamer(environment_id)
@@ -2285,11 +2745,15 @@ async def handle_run_on_tunneled_ssh_async(arguments: dict, config: dict = None)
         if files_info:
             files_summary = "\n**Files Queued:**\n" + "\n".join(f"- {f}" for f in files_info) + "\n"
         
+        dl_info = ""
+        if dl_plan is not None and dl_plan.files_info:
+            dl_info = "\n**Downloads Queued:**\n" + "\n".join(f"- {f}" for f in dl_plan.files_info) + "\n"
+        
         # Suggest appropriate wait time based on command content
         suggested_wait = _suggest_wait_time(effective_command)
         
         output_text = f"""Command started on {target_ip} (async)
-{files_summary}
+{files_summary}{dl_info}
 **Environment ID:** {environment_id}
 **Environment:** {env_url}
 
@@ -2301,6 +2765,7 @@ Use `cancel_execution` with the same environment_id to abort if needed."""
     except Exception as e:
         # Clean up croc on error (not tracked for async cleanup)
         await cleanup_croc_resources(croc_process, plan.croc_staging_dir if plan else "")
+        await cleanup_download_resources(dl_process, dl_plan.croc_receive_dir if dl_plan else "")
         return [TextContent(type="text", text=f"Error starting async command: {str(e)}")]
 
 
@@ -2353,6 +2818,19 @@ async def handle_run_on_tunneled_persistent_container_async(arguments: dict, con
             container_pre_commands = plan.croc_container_pre_commands
         files_info = plan.files_info
     
+    # Process download_files parameter
+    download_files = arguments.get("download_files", [])
+    dl_plan = None
+    dl_process = None
+    if download_files:
+        dl_plan = prepare_download_with_croc(
+            download_files, transfer_mode="ssh",
+            target_ip=container_ip, ssh_user="root",
+            ssh_private_key=private_key,
+        )
+        if dl_plan.errors:
+            return [TextContent(type="text", text="Error preparing downloads:\n" + "\n".join(f"- {e}" for e in dl_plan.errors))]
+    
     effective_command = command or "echo 'Files deployed successfully'"
     
     try:
@@ -2362,6 +2840,13 @@ async def handle_run_on_tunneled_persistent_container_async(arguments: dict, con
                 croc_process = await execute_with_croc(plan)
             except Exception as e:
                 return [TextContent(type="text", text=f"Error starting croc file transfer: {str(e)}")]
+        
+        # Start croc receive locally if download is needed
+        if dl_plan is not None and dl_plan.needs_download:
+            try:
+                dl_process = await execute_download_receive(dl_plan)
+            except Exception as e:
+                return [TextContent(type="text", text=f"Error starting croc file download receiver: {str(e)}")]
         
         # Start the SSH command asynchronously - SSH from disposable grain into persistent container
         async with get_torque_client(torque_url, torque_token, torque_space, config=cfg) as client:
@@ -2374,15 +2859,21 @@ async def handle_run_on_tunneled_persistent_container_async(arguments: dict, con
                 init_commands=init_commands,
                 timeout=timeout,
                 container_pre_commands=container_pre_commands,
+                download_commands=dl_plan.download_commands if dl_plan else None,
             )
             
             # Track croc state for cleanup when execution completes
+            async_state = {}
             if croc_process is not None:
-                _croc_async_state[environment_id] = {
-                    "process": croc_process,
-                    "staging_dir": plan.croc_staging_dir if plan else "",
-                }
+                async_state["process"] = croc_process
+                async_state["staging_dir"] = plan.croc_staging_dir if plan else ""
                 croc_process = None  # Don't clean up in except block
+            if dl_process is not None:
+                async_state["dl_process"] = dl_process
+                async_state["dl_plan"] = dl_plan
+                dl_process = None  # Don't clean up in except block
+            if async_state:
+                _croc_async_state[environment_id] = async_state
             
             # Extend the persistent container's idle timeout
             try:
@@ -2409,10 +2900,14 @@ async def handle_run_on_tunneled_persistent_container_async(arguments: dict, con
         if files_info:
             files_summary = "\n**Files Queued:**\n" + "\n".join(f"- {f}" for f in files_info) + "\n"
         
+        dl_info = ""
+        if dl_plan is not None and dl_plan.files_info:
+            dl_info = "\n**Downloads Queued:**\n" + "\n".join(f"- {f}" for f in dl_plan.files_info) + "\n"
+        
         suggested_wait = _suggest_wait_time(effective_command)
         
         output_text = f"""Command started on persistent container (async)
-{files_summary}
+{files_summary}{dl_info}
 **Persistent Container:** {env_id}
 **Environment ID:** {environment_id}
 **Environment:** {env_url}
@@ -2425,6 +2920,7 @@ Use `cancel_execution` with the same environment_id to abort if needed."""
     except Exception as e:
         # Clean up croc on error (not tracked for async cleanup)
         await cleanup_croc_resources(croc_process, plan.croc_staging_dir if plan else "")
+        await cleanup_download_resources(dl_process, dl_plan.croc_receive_dir if dl_plan else "")
         return [TextContent(type="text", text=f"Error starting async command on container: {str(e)}")]
 
 
@@ -2461,6 +2957,15 @@ async def handle_run_on_tunneled_disposable_container_async(arguments: dict, con
             init_commands = "\n".join(combined)
         files_info = plan.files_info
     
+    # Process download_files parameter
+    download_files = arguments.get("download_files", [])
+    dl_plan = None
+    dl_process = None
+    if download_files:
+        dl_plan = prepare_download_with_croc(download_files, transfer_mode="container")
+        if dl_plan.errors:
+            return [TextContent(type="text", text="Error preparing downloads:\n" + "\n".join(f"- {e}" for e in dl_plan.errors))]
+    
     effective_command = command or "echo 'Files deployed successfully'"
     
     try:
@@ -2471,21 +2976,34 @@ async def handle_run_on_tunneled_disposable_container_async(arguments: dict, con
             except Exception as e:
                 return [TextContent(type="text", text=f"Error starting croc file transfer: {str(e)}")]
         
+        # Start croc receive locally if download is needed
+        if dl_plan is not None and dl_plan.needs_download:
+            try:
+                dl_process = await execute_download_receive(dl_plan)
+            except Exception as e:
+                return [TextContent(type="text", text=f"Error starting croc file download receiver: {str(e)}")]
+        
         async with get_torque_client(torque_url, torque_token, torque_space, config=cfg) as client:
             environment_id = await client.start_local_environment(
                 command=effective_command,
                 agent=agent,
                 init_commands=init_commands,
                 timeout=timeout,
+                download_commands=dl_plan.download_commands if dl_plan else None,
             )
         
         # Track croc state for cleanup when execution completes
+        async_state = {}
         if croc_process is not None:
-            _croc_async_state[environment_id] = {
-                "process": croc_process,
-                "staging_dir": plan.croc_staging_dir if plan else "",
-            }
+            async_state["process"] = croc_process
+            async_state["staging_dir"] = plan.croc_staging_dir if plan else ""
             croc_process = None  # Don't clean up in except block
+        if dl_process is not None:
+            async_state["dl_process"] = dl_process
+            async_state["dl_plan"] = dl_plan
+            dl_process = None  # Don't clean up in except block
+        if async_state:
+            _croc_async_state[environment_id] = async_state
         
         # Start background streaming of grain log to stderr
         _start_background_streamer(environment_id)
@@ -2497,10 +3015,14 @@ async def handle_run_on_tunneled_disposable_container_async(arguments: dict, con
         if files_info:
             files_summary = "\n**Files Queued:**\n" + "\n".join(f"- {f}" for f in files_info) + "\n"
         
+        dl_info = ""
+        if dl_plan is not None and dl_plan.files_info:
+            dl_info = "\n**Downloads Queued:**\n" + "\n".join(f"- {f}" for f in dl_plan.files_info) + "\n"
+        
         suggested_wait = _suggest_wait_time(effective_command)
         
         output_text = f"""Command started on agent `{agent_name}` (async)
-{files_summary}
+{files_summary}{dl_info}
 **Environment ID:** {environment_id}
 **Environment:** {env_url}
 
@@ -2512,6 +3034,7 @@ Use `cancel_execution` with the same environment_id to abort if needed."""
     except Exception as e:
         # Clean up croc on error (not tracked for async cleanup)
         await cleanup_croc_resources(croc_process, plan.croc_staging_dir if plan else "")
+        await cleanup_download_resources(dl_process, dl_plan.croc_receive_dir if dl_plan else "")
         return [TextContent(type="text", text=f"Error starting async command: {str(e)}")]
 
 
@@ -2565,6 +3088,19 @@ async def handle_get_execution_status(arguments: dict):
                     croc_state.get("process"),
                     croc_state.get("staging_dir", ""),
                 )
+                # Finalize file downloads if any
+                dl_process = croc_state.get("dl_process")
+                dl_plan = croc_state.get("dl_plan")
+                if dl_plan is not None and dl_plan.needs_download:
+                    if dl_process is not None and dl_process.returncode is None:
+                        try:
+                            await asyncio.wait_for(dl_process.wait(), timeout=CROC_DOWNLOAD_RECEIVE_WAIT_SECONDS)
+                        except asyncio.TimeoutError:
+                            pass
+                    dl_successes, dl_errors = finalize_download(dl_plan)
+                    # Store results for output formatting
+                    _download_results[environment_id] = (dl_successes, dl_errors)
+                    await cleanup_download_resources(dl_process, dl_plan.croc_receive_dir)
         
         # We need a client for extracting outputs, cleanup, and grain log fetching
         async with get_torque_client() as client:
@@ -2594,11 +3130,25 @@ async def handle_get_execution_status(arguments: dict):
                 
                 output_block = format_code_block(command_output)
                 status_msg = "Command completed." if exit_code == 0 else "Command failed."
+                
+                # Include download results if any
+                dl_summary = ""
+                dl_result = _download_results.pop(environment_id, None)
+                if dl_result:
+                    dl_successes, dl_errors = dl_result
+                    parts = []
+                    if dl_successes:
+                        parts.append("\n".join(f"- {s}" for s in dl_successes))
+                    if dl_errors:
+                        parts.append("\n".join(f"- WARNING: {e}" for e in dl_errors))
+                    if parts:
+                        dl_summary = "\n**Files Downloaded:**\n" + "\n".join(parts) + "\n"
+                
                 output_text = f"""{status_msg}
 
 **Status:** {"COMPLETED" if exit_code == 0 else "FAILED"}
 **Exit Code:** {exit_code}
-
+{dl_summary}
 **Output:**
 {output_block}
 
@@ -2796,6 +3346,14 @@ async def handle_cancel_execution(arguments: dict):
             croc_state.get("process"),
             croc_state.get("staging_dir", ""),
         )
+        # Clean up download resources too
+        dl_process = croc_state.get("dl_process")
+        dl_plan = croc_state.get("dl_plan")
+        await cleanup_download_resources(
+            dl_process,
+            dl_plan.croc_receive_dir if dl_plan else "",
+        )
+    _download_results.pop(environment_id, None)
     
     try:
         async with get_torque_client() as client:
@@ -2950,6 +3508,36 @@ async def cli_dispatch(args):
             files.append(file_spec)
         return files
     
+    # Helper to parse --download arguments into download files list
+    def parse_downloads(download_args):
+        """Parse --download arguments into download files list.
+        
+        Format: REMOTE:LOCAL
+        Handles Windows paths with drive letters (e.g., C:\\path\\file.txt) for the LOCAL part.
+        """
+        if not download_args:
+            return []
+        files = []
+        for spec in download_args:
+            parts = spec.split(':')
+            # The REMOTE path is first (Linux, no drive letters)
+            # The LOCAL path may have Windows drive letters
+            # After splitting: [remote, local_part1, local_part2, ...]
+            # If local_part1 is a single letter and local_part2 starts with \ or /, rejoin
+            if len(parts) >= 3 and len(parts[1]) == 1 and parts[1].isalpha():
+                if parts[2].startswith('\\') or parts[2].startswith('/'):
+                    parts = [parts[0], parts[1] + ':' + parts[2]] + parts[3:]
+            
+            if len(parts) < 2:
+                print(f"Error: Invalid download spec '{spec}'. Use REMOTE:LOCAL", file=sys.stderr)
+                sys.exit(1)
+            file_spec = {
+                'remote_source_path': parts[0],
+                'local_destination_path': parts[1],
+            }
+            files.append(file_spec)
+        return files
+    
     try:
         if args.command == "ssh":
             # SSH command execution (with optional file uploads)
@@ -2962,10 +3550,11 @@ async def cli_dispatch(args):
             allow_dangerous_commands = getattr(args, 'allow_dangerous_commands', False)
             output_json = getattr(args, 'json', False)
             uploads = parse_uploads(getattr(args, 'upload', None))
+            downloads = parse_downloads(getattr(args, 'download', None))
             cmd = getattr(args, 'cmd', None)
             
-            # Must have command or uploads
-            if not cmd and not uploads:
+            # Must have command or uploads or downloads
+            if not cmd and not uploads and not downloads:
                 print("Error: Must provide a command or --upload files (or both).", file=sys.stderr)
                 sys.exit(1)
             
@@ -3015,10 +3604,28 @@ async def cli_dispatch(args):
             
             effective_command = cmd or "echo 'Files deployed successfully'"
             
+            # Prepare download plan
+            dl_plan = None
+            dl_process = None
+            if downloads:
+                dl_plan = prepare_download_with_croc(
+                    downloads, transfer_mode="ssh",
+                    target_ip=target_ip, ssh_user=ssh_user,
+                    ssh_private_key=ssh_key, ssh_password=ssh_password,
+                )
+                if dl_plan.errors:
+                    print("Download preparation warnings:", file=sys.stderr)
+                    for e in dl_plan.errors:
+                        print(f"  - {e}", file=sys.stderr)
+            
             try:
-                # Start croc send locally if needed
+                # Start croc send locally if needed (uploads)
                 if plan is not None and plan.needs_croc:
                     croc_process = await execute_with_croc(plan)
+                
+                # Start croc receive locally if needed (downloads)
+                if dl_plan is not None and dl_plan.needs_download:
+                    dl_process = await execute_download_receive(dl_plan)
                 
                 async with get_torque_client() as client:
                     result = await client.execute_remote_command(
@@ -3033,21 +3640,41 @@ async def cli_dispatch(args):
                         init_commands=init_commands,
                         ssh_password=ssh_password,
                         container_pre_commands=container_pre_commands,
+                        download_commands=dl_plan.download_commands if dl_plan and dl_plan.needs_download else None,
                     )
             finally:
                 await cleanup_croc_resources(croc_process, plan.croc_staging_dir if plan else "")
             
+            # Finalize downloads
+            dl_successes = []
+            dl_errors = []
+            if dl_plan and dl_plan.needs_download and dl_process:
+                try:
+                    await dl_process.wait()
+                    dl_successes, dl_errors = finalize_download(dl_plan)
+                except Exception as e:
+                    dl_errors.append(f"Download finalization error: {e}")
+                finally:
+                    await cleanup_download_resources(dl_process, dl_plan.croc_receive_dir)
+            
             if output_json:
-                print(json_module.dumps({
+                result_dict = {
                     "status": result.status,
                     "exit_code": result.exit_code,
                     "output": result.command_output,
                     "error": result.error,
                     "environment_id": result.environment_id,
-                }))
+                }
+                if dl_successes or dl_errors:
+                    result_dict["downloads"] = {"successes": dl_successes, "errors": dl_errors}
+                print(json_module.dumps(result_dict))
             else:
                 if result.status == "completed":
                     print(result.command_output or "", end='')
+                    for s in dl_successes:
+                        print(f"Downloaded: {s}", file=sys.stderr)
+                    for e in dl_errors:
+                        print(f"Download warning: {e}", file=sys.stderr)
                     sys.exit(result.exit_code or 0)
                 else:
                     print(f"Error: {result.error}", file=sys.stderr)
@@ -3059,6 +3686,7 @@ async def cli_dispatch(args):
             timeout = getattr(args, 'timeout', None)
             output_json = getattr(args, 'json', False)
             uploads = parse_uploads(getattr(args, 'upload', None))
+            downloads = parse_downloads(getattr(args, 'download', None))
             cmd = getattr(args, 'cmd', None)
             env_id = getattr(args, 'env_id', None)
             new_container = getattr(args, 'new', False)
@@ -3164,9 +3792,9 @@ async def cli_dispatch(args):
                 
             else:
                 # Execute a command on persistent container
-                # Must have command or uploads
-                if not cmd and not uploads:
-                    print("Error: Must provide a command, --upload files, or a sub-action (create, list, release).", file=sys.stderr)
+                # Must have command or uploads or downloads
+                if not cmd and not uploads and not downloads:
+                    print("Error: Must provide a command, --upload files, --download files, or a sub-action (create, list, release).", file=sys.stderr)
                     sys.exit(1)
                 
                 # Determine which container to use
@@ -3215,12 +3843,30 @@ async def cli_dispatch(args):
                 
                 effective_command = cmd or "echo 'Files deployed successfully'"
                 
+                # Prepare download plan
+                dl_plan = None
+                dl_process = None
+                if downloads:
+                    dl_plan = prepare_download_with_croc(
+                        downloads, transfer_mode="ssh",
+                        target_ip=container_ip, ssh_user="root",
+                        ssh_private_key=private_key,
+                    )
+                    if dl_plan.errors:
+                        print("Download preparation warnings:", file=sys.stderr)
+                        for e in dl_plan.errors:
+                            print(f"  - {e}", file=sys.stderr)
+                
                 print(f"Persistent Container: {used_env_id}", file=sys.stderr)
                 
                 try:
-                    # Start croc send locally if needed
+                    # Start croc send locally if needed (uploads)
                     if plan is not None and plan.needs_croc:
                         croc_process = await execute_with_croc(plan)
+                    
+                    # Start croc receive locally if needed (downloads)
+                    if dl_plan is not None and dl_plan.needs_download:
+                        dl_process = await execute_download_receive(dl_plan)
                     
                     async with get_torque_client() as client:
                         result = await client.execute_remote_command(
@@ -3234,6 +3880,7 @@ async def cli_dispatch(args):
                             log_callback=cli_log_callback(""),
                             init_commands=init_commands,
                             container_pre_commands=container_pre_commands,
+                            download_commands=dl_plan.download_commands if dl_plan and dl_plan.needs_download else None,
                         )
                     
                         # Extend idle timeout
@@ -3253,18 +3900,37 @@ async def cli_dispatch(args):
                 finally:
                     await cleanup_croc_resources(croc_process, plan.croc_staging_dir if plan else "")
                 
+                # Finalize downloads
+                dl_successes = []
+                dl_errors = []
+                if dl_plan and dl_plan.needs_download and dl_process:
+                    try:
+                        await dl_process.wait()
+                        dl_successes, dl_errors = finalize_download(dl_plan)
+                    except Exception as e:
+                        dl_errors.append(f"Download finalization error: {e}")
+                    finally:
+                        await cleanup_download_resources(dl_process, dl_plan.croc_receive_dir)
+                
                 if output_json:
-                    print(json_module.dumps({
+                    result_dict = {
                         "status": result.status,
                         "exit_code": result.exit_code,
                         "output": result.command_output,
                         "error": result.error,
                         "environment_id": result.environment_id,
                         "persistent_container_id": used_env_id,
-                    }))
+                    }
+                    if dl_successes or dl_errors:
+                        result_dict["downloads"] = {"successes": dl_successes, "errors": dl_errors}
+                    print(json_module.dumps(result_dict))
                 else:
                     if result.status == "completed":
                         print(result.command_output or "", end='')
+                        for s in dl_successes:
+                            print(f"Downloaded: {s}", file=sys.stderr)
+                        for e in dl_errors:
+                            print(f"Download warning: {e}", file=sys.stderr)
                         sys.exit(result.exit_code or 0)
                     else:
                         print(f"Error: {result.error}", file=sys.stderr)
@@ -3276,11 +3942,12 @@ async def cli_dispatch(args):
             timeout = getattr(args, 'timeout', None)
             output_json = getattr(args, 'json', False)
             uploads = parse_uploads(getattr(args, 'upload', None))
+            downloads = parse_downloads(getattr(args, 'download', None))
             cmd = getattr(args, 'cmd', None)
             
-            # Must have command or uploads
-            if not cmd and not uploads:
-                print("Error: Must provide a command or --upload files (or both).", file=sys.stderr)
+            # Must have command or uploads or downloads
+            if not cmd and not uploads and not downloads:
+                print("Error: Must provide a command or --upload/--download files (or both).", file=sys.stderr)
                 sys.exit(1)
             
             # Process file uploads (with croc for large files)
@@ -3305,10 +3972,26 @@ async def cli_dispatch(args):
             
             effective_command = cmd or "echo 'Files deployed successfully'"
             
+            # Prepare download plan
+            dl_plan = None
+            dl_process = None
+            if downloads:
+                dl_plan = prepare_download_with_croc(
+                    downloads, transfer_mode="container",
+                )
+                if dl_plan.errors:
+                    print("Download preparation warnings:", file=sys.stderr)
+                    for e in dl_plan.errors:
+                        print(f"  - {e}", file=sys.stderr)
+            
             try:
-                # Start croc send locally if needed
+                # Start croc send locally if needed (uploads)
                 if plan is not None and plan.needs_croc:
                     croc_process = await execute_with_croc(plan)
+                
+                # Start croc receive locally if needed (downloads)
+                if dl_plan is not None and dl_plan.needs_download:
+                    dl_process = await execute_download_receive(dl_plan)
                 
                 async with get_torque_client() as client:
                     result = await client.execute_local_command(
@@ -3318,21 +4001,41 @@ async def cli_dispatch(args):
                         auto_cleanup=_config["auto_delete_environments"],
                         log_callback=cli_log_callback(""),
                         init_commands=init_commands,
+                        download_commands=dl_plan.download_commands if dl_plan and dl_plan.needs_download else None,
                     )
             finally:
                 await cleanup_croc_resources(croc_process, plan.croc_staging_dir if plan else "")
             
+            # Finalize downloads
+            dl_successes = []
+            dl_errors = []
+            if dl_plan and dl_plan.needs_download and dl_process:
+                try:
+                    await dl_process.wait()
+                    dl_successes, dl_errors = finalize_download(dl_plan)
+                except Exception as e:
+                    dl_errors.append(f"Download finalization error: {e}")
+                finally:
+                    await cleanup_download_resources(dl_process, dl_plan.croc_receive_dir)
+            
             if output_json:
-                print(json_module.dumps({
+                result_dict = {
                     "status": result.status,
                     "exit_code": result.exit_code,
                     "output": result.command_output,
                     "error": result.error,
                     "environment_id": result.environment_id,
-                }))
+                }
+                if dl_successes or dl_errors:
+                    result_dict["downloads"] = {"successes": dl_successes, "errors": dl_errors}
+                print(json_module.dumps(result_dict))
             else:
                 if result.status == "completed":
                     print(result.command_output or "", end='')
+                    for s in dl_successes:
+                        print(f"Downloaded: {s}", file=sys.stderr)
+                    for e in dl_errors:
+                        print(f"Download warning: {e}", file=sys.stderr)
                     sys.exit(result.exit_code or 0)
                 else:
                     print(f"Error: {result.error}", file=sys.stderr)
@@ -3561,9 +4264,14 @@ Examples:
   torque-tunnel ssh --upload ./script.sh:/tmp/script.sh:755 "bash /tmp/script.sh"
   torque-tunnel ssh --upload ./config.yaml:/etc/app/config.yaml --upload ./data:/var/data "cat /etc/app/config.yaml"
 
+  # CLI mode - download files after running a command
+  torque-tunnel ssh --download /var/log/app.log:./app.log "echo done"
+  torque-tunnel ssh --download /opt/results:/tmp/results "run-test-suite"
+
   # CLI mode - run on a persistent Torque agent container
   torque-tunnel persistent-container "curl https://example.com"
   torque-tunnel persistent-container --upload ./test.py:/tmp/test.py "python /tmp/test.py"
+  torque-tunnel persistent-container --download /tmp/output.csv:./output.csv "generate-report"
 
   # CLI mode - run on a fresh disposable container
   torque-tunnel disposable-container "curl https://example.com"
@@ -3582,6 +4290,13 @@ UPLOAD FORMAT:
   REMOTE = destination path on target
   MODE   = optional file permissions (e.g., 755) - default: 644 for files
   Directories are transferred via tar archive.
+
+DOWNLOAD FORMAT:
+  --download REMOTE:LOCAL
+  REMOTE = path to file or directory on the remote target
+  LOCAL  = destination path on local machine
+  Files are always transferred via croc (peer-to-peer encrypted).
+  Download occurs after the main command and finally commands complete.
 
 DANGEROUS COMMANDS (may kill the Torque agent):
   docker restart, docker stop, docker kill, docker rm
@@ -3625,6 +4340,8 @@ PERFORMANCE TIP:
     ssh_parser.add_argument("--json", "-j", action="store_true", help="Output as JSON")
     ssh_parser.add_argument("--upload", action="append", metavar="LOCAL:REMOTE[:MODE]",
                               help="Upload local file/dir to remote path (can be repeated)")
+    ssh_parser.add_argument("--download", action="append", metavar="REMOTE:LOCAL",
+                              help="Download remote file/dir to local path after command runs (can be repeated)")
     
     # persistent-container subcommand (run on persistent Torque agent container)
     pc_parser = subparsers.add_parser("persistent-container", parents=[common_parser],
@@ -3636,6 +4353,8 @@ PERFORMANCE TIP:
     pc_parser.add_argument("--json", "-j", action="store_true", help="Output as JSON")
     pc_parser.add_argument("--upload", action="append", metavar="LOCAL:REMOTE[:MODE]",
                              help="Upload local file/dir to container (can be repeated)")
+    pc_parser.add_argument("--download", action="append", metavar="REMOTE:LOCAL",
+                             help="Download file/dir from container to local path after command runs (can be repeated)")
     pc_parser.add_argument("--all", action="store_true", help="Release all containers (used with 'release' action)")
 
     # disposable-container subcommand (run on fresh Torque agent container)
@@ -3646,6 +4365,8 @@ PERFORMANCE TIP:
     dc_parser.add_argument("--json", "-j", action="store_true", help="Output as JSON")
     dc_parser.add_argument("--upload", action="append", metavar="LOCAL:REMOTE[:MODE]",
                              help="Upload local file/dir to container (can be repeated)")
+    dc_parser.add_argument("--download", action="append", metavar="REMOTE:LOCAL",
+                             help="Download file/dir from container to local path after command runs (can be repeated)")
     
     # read subcommand
     read_parser = subparsers.add_parser("read", parents=[common_parser], help="Read a file from remote server")

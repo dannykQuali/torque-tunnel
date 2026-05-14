@@ -127,6 +127,7 @@ class TorqueClient:
         timeout: Optional[int] = None,
         ssh_password: Optional[str] = None,
         container_pre_commands: Optional[str] = None,
+        download_commands: Optional[str] = None,
     ) -> str:
         """
         Start a new environment to execute remote command.
@@ -144,6 +145,8 @@ class TorqueClient:
             ssh_password: SSH password for authentication. Use this OR ssh_private_key.
             container_pre_commands: Optional commands to run on the container BEFORE SSH
                 (e.g., croc file receive + SCP to target). Only used by remote-shell-executor.
+            download_commands: Optional commands to run on the container AFTER the main command
+                completes (e.g., SCP from target + croc send to local for file downloads).
             
         Returns:
             Environment ID
@@ -190,6 +193,8 @@ class TorqueClient:
             inputs["finally_commands_b64"] = base64.b64encode(gzip.compress(effective_finally.encode())).decode()
         if container_pre_commands:
             inputs["container_pre_commands_b64"] = base64.b64encode(gzip.compress(container_pre_commands.encode())).decode()
+        if download_commands:
+            inputs["download_commands_b64"] = base64.b64encode(gzip.compress(download_commands.encode())).decode()
         
         payload = {
             "blueprint_name": self.BLUEPRINT_NAME,
@@ -219,6 +224,7 @@ class TorqueClient:
         environment_name: Optional[str] = None,
         init_commands: Optional[str] = None,
         timeout: Optional[int] = None,
+        download_commands: Optional[str] = None,
     ) -> str:
         """
         Start a new environment to execute command locally on the agent container.
@@ -229,6 +235,8 @@ class TorqueClient:
             environment_name: Optional name for the environment
             init_commands: Optional commands to run before the main command (prepended to global init_commands)
             timeout: Optional timeout override in seconds (overrides instance default)
+            download_commands: Optional commands to run after execution completes
+                (e.g., croc send to local for file downloads).
             
         Returns:
             Environment ID
@@ -267,6 +275,8 @@ class TorqueClient:
             inputs["init_commands_b64"] = base64.b64encode(gzip.compress(combined_init.encode())).decode()
         if self.finally_commands:
             inputs["finally_commands_b64"] = base64.b64encode(gzip.compress(self.finally_commands.encode())).decode()
+        if download_commands:
+            inputs["download_commands_b64"] = base64.b64encode(gzip.compress(download_commands.encode())).decode()
         
         payload = {
             "blueprint_name": self.LOCAL_BLUEPRINT_NAME,
@@ -717,6 +727,7 @@ class TorqueClient:
         finally_commands: Optional[str] = None,
         ssh_password: Optional[str] = None,
         container_pre_commands: Optional[str] = None,
+        download_commands: Optional[str] = None,
     ) -> EnvironmentResult:
         """
         Execute a remote command and wait for result.
@@ -755,6 +766,7 @@ class TorqueClient:
             finally_commands=finally_commands,
             ssh_password=ssh_password,
             container_pre_commands=container_pre_commands,
+            download_commands=download_commands,
         )
         
         result = None
@@ -784,6 +796,7 @@ class TorqueClient:
         timeout: Optional[int] = None,
         log_callback: Optional[Callable[[str], Awaitable[None]]] = None,
         init_commands: Optional[str] = None,
+        download_commands: Optional[str] = None,
     ) -> EnvironmentResult:
         """
         Execute a command locally on the Torque agent container.
@@ -798,6 +811,8 @@ class TorqueClient:
             timeout: Optional timeout override in seconds
             log_callback: Optional async callback for streaming log updates
             init_commands: Optional commands to run before the main command
+            download_commands: Optional commands to run after execution completes
+                (e.g., croc send to local for file downloads).
             
         Returns:
             EnvironmentResult with command output
@@ -806,6 +821,7 @@ class TorqueClient:
             command=command,
             agent=agent,
             init_commands=init_commands,
+            download_commands=download_commands,
         )
         
         result = None

@@ -23,6 +23,10 @@ inputs:
     type: string
     description: Gzip-compressed and base64-encoded finally commands (optional)
     default: ""
+  download_commands_b64:
+    type: string
+    description: Gzip-compressed and base64-encoded commands to run after execution completes (e.g., croc send to local)
+    default: ""
 
 outputs:
   command_output:
@@ -131,6 +135,27 @@ grains:
                 
                 # Run main logic - errors go to output file, stdout is already captured inside
                 __run_main 2>> "$OUTPUT_FILE"
+                
+                # Run download commands if provided (after main execution + finally, before exports)
+                __DL_CMDS=$(mktemp)
+                echo '{{ .inputs.download_commands_b64 }}' | base64 -d | gzip -d > "$__DL_CMDS" 2>/dev/null || true
+                if [ -s "$__DL_CMDS" ]; then
+                  echo "=== Running download commands ==="
+                  # Re-source init commands so proxy/env vars are available for downloads
+                  # (init ran inside __run_main's subprocess, exports didn't propagate back)
+                  __DL_INIT=$(mktemp)
+                  echo '{{ .inputs.init_commands_b64 }}' | base64 -d | gzip -d > "$__DL_INIT" 2>/dev/null || true
+                  if [ -s "$__DL_INIT" ]; then
+                    . "$__DL_INIT"
+                  fi
+                  rm -f "$__DL_INIT" 2>/dev/null || true
+                  bash "$__DL_CMDS"
+                  __DL_CMD_RC=$?
+                  if [ $__DL_CMD_RC -ne 0 ]; then
+                    echo "WARNING: Download commands failed (exit code: $__DL_CMD_RC)" >&2
+                  fi
+                fi
+                rm -f "$__DL_CMDS" 2>/dev/null || true
                 
                 # Always export outputs - this section MUST be reached
                 COMMAND_OUTPUT_B64=$(base64 < "$OUTPUT_FILE" 2>/dev/null | tr -d '\n' || echo "")
