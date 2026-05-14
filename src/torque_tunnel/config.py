@@ -50,7 +50,7 @@ PROFILE_TO_TOOL_ARG = {
 VALID_CONFIG_KEYS = set(CONFIG_KEY_MAP.keys())
 
 # Metadata-only keys in profiles (not config values)
-_PROFILE_META_KEYS = {"description", "extends"}
+_PROFILE_META_KEYS = {"description", "extends", "show_values"}
 
 # SSH auth mutual exclusion: (yaml_key_a, yaml_key_b) — when one is set at a
 # more concrete level, the other inherited from a less concrete level is cleared.
@@ -158,13 +158,21 @@ def resolve_profile(config: dict, profile_name: str) -> dict:
     return _resolve_profile_chain(config, profile_name)
 
 
+def get_default_profile_name(config: dict) -> str | None:
+    """Get the default_profile name from config, if set."""
+    return config.get("default_profile")
+
+
 def get_defaults(config: dict) -> dict:
-    """Get the 'default' section from config, mapped to internal _config keys."""
-    defaults = config.get("default", {})
+    """Get top-level config values mapped to internal _config keys.
+
+    Reads recognized keys directly from the top level of the config dict,
+    skipping non-config keys like 'profiles' and 'default_profile'.
+    """
     result = {}
     for yaml_key, config_key in CONFIG_KEY_MAP.items():
-        if yaml_key in defaults:
-            result[config_key] = defaults[yaml_key]
+        if yaml_key in config:
+            result[config_key] = config[yaml_key]
     return result
 
 
@@ -228,16 +236,32 @@ def inject_profile_into_arguments(arguments: dict, profile_values: dict) -> dict
 def list_profiles(config: dict) -> list[dict]:
     """List all available profiles with descriptions and overridden keys.
 
-    Returns list of dicts with keys: 'name', 'description', 'extends', 'overrides'.
+    Returns list of dicts with keys: 'name', 'description', 'extends', 'overrides', 'show_values', 'values'.
     """
     profiles = config.get("profiles", {})
     result = []
     for name, profile in profiles.items():
+        override_keys = sorted(k for k in profile if k not in _PROFILE_META_KEYS)
         entry = {
             "name": name,
             "description": profile.get("description", ""),
             "extends": profile.get("extends"),
-            "overrides": sorted(k for k in profile if k not in _PROFILE_META_KEYS),
+            "overrides": override_keys,
+            "show_values": profile.get("show_values", False),
+            "values": {k: profile[k] for k in override_keys},
         }
         result.append(entry)
     return result
+
+
+def get_top_level_defaults(config: dict) -> dict:
+    """Get the top-level config values (YAML key names) that serve as base defaults.
+
+    Returns a dict of {yaml_key: value} for recognized config keys found at the top level.
+    """
+    return {k: config[k] for k in VALID_CONFIG_KEYS if k in config}
+
+
+def get_top_level_show_values(config: dict) -> bool:
+    """Get the top-level show_values setting (default False)."""
+    return config.get("show_values", False)

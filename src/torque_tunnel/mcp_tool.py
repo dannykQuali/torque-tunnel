@@ -1777,7 +1777,7 @@ Use `wait` to avoid tight polling. Typical: wait=10, repeat until completed.""",
         ),
         Tool(
             name="list_profiles",
-            description="""List all available configuration profiles. Profiles pre-configure connection settings (Torque URL, agent, SSH target, etc.) so you don't have to specify them on every call. Use a profile by passing its name as the 'profile' parameter to any execution tool.""",
+            description="""List all available configuration profiles and base configuration. Profiles pre-configure connection settings (Torque URL, agent, SSH target, etc.) so you don't have to specify them on every call. Use a profile by passing its name as the 'profile' parameter to any execution tool.""",
             inputSchema={
                 "type": "object",
                 "properties": {},
@@ -1838,20 +1838,43 @@ async def call_tool(name: str, arguments: dict):
 
 
 async def handle_list_profiles():
-    """Return the list of available configuration profiles."""
+    """Return the list of available configuration profiles with base config."""
     if not _loaded_config:
         return [TextContent(type="text", text="No configuration file found. Create ~/.torque-tunnel/config.yaml to define profiles.")]
     
+    lines = []
+    
+    # Show base configuration
+    top_defaults = config_module.get_top_level_defaults(_loaded_config)
+    if top_defaults:
+        show_base_values = config_module.get_top_level_show_values(_loaded_config)
+        lines.append("**Base configuration:**")
+        if show_base_values:
+            for key in sorted(top_defaults):
+                lines.append(f"  {key}: {top_defaults[key]}")
+        else:
+            lines.append(f"  {', '.join(sorted(top_defaults))}")
+        lines.append("")
+    
+    # Show profiles
+    default_profile = config_module.get_default_profile_name(_loaded_config)
     profiles = config_module.list_profiles(_loaded_config)
     if not profiles:
-        return [TextContent(type="text", text="No profiles defined in configuration file. Add a 'profiles' section to your config.yaml.")]
+        lines.append("No profiles defined. Add a 'profiles' section to your config.yaml.")
+        return [TextContent(type="text", text="\n".join(lines))]
     
-    lines = ["**Available Profiles:**\n"]
+    lines.append("**Profiles:**")
     for p in profiles:
+        default_marker = " (default)" if p['name'] == default_profile else ""
         desc = f" — {p['description']}" if p['description'] else ""
         extends = f" (extends: {p['extends']})" if p['extends'] else ""
-        overrides = ", ".join(p['overrides']) if p['overrides'] else "(none)"
-        lines.append(f"- **{p['name']}**{desc}{extends}\n  Overrides: {overrides}")
+        lines.append(f"- **{p['name']}**{default_marker}{desc}{extends}")
+        if p['show_values']:
+            for key in p['overrides']:
+                lines.append(f"  {key}: {p['values'][key]}")
+        else:
+            overrides = ", ".join(p['overrides']) if p['overrides'] else "(none)"
+            lines.append(f"  Overrides: {overrides}")
     
     return [TextContent(type="text", text="\n".join(lines))]
 
@@ -4396,8 +4419,10 @@ PERFORMANCE TIP:
     # Apply config file defaults as base values
     file_defaults = config_module.get_defaults(_loaded_config)
     
-    # Apply startup profile (--profile) on top of defaults
+    # Apply startup profile (--profile or default_profile from config) on top of defaults
     startup_profile = getattr(args, 'profile', None)
+    if not startup_profile and _loaded_config:
+        startup_profile = config_module.get_default_profile_name(_loaded_config)
     if startup_profile and _loaded_config:
         try:
             profile_values = config_module.resolve_profile(_loaded_config, startup_profile)

@@ -22,18 +22,16 @@ from torque_tunnel import config as config_module
 def sample_config():
     """A full sample config dict (as if loaded from YAML)."""
     return {
-        "default": {
-            "torque_url": "https://default.example.com",
-            "torque_token": "default-token",
-            "torque_space": "default-space",
-            "torque_agent": "default-agent",
-            "ssh_user": "root",
-            "ssh_key": "/default/key.pem",
-            "host": "10.0.0.1",
-            "init_commands": "export FOO=bar",
-            "auto_delete_environments": False,
-            "container_idle_timeout": 7200,
-        },
+        "torque_url": "https://default.example.com",
+        "torque_token": "default-token",
+        "torque_space": "default-space",
+        "torque_agent": "default-agent",
+        "ssh_user": "root",
+        "ssh_key": "/default/key.pem",
+        "host": "10.0.0.1",
+        "init_commands": "export FOO=bar",
+        "auto_delete_environments": False,
+        "container_idle_timeout": 7200,
         "profiles": {
             "lab-base": {
                 "description": "Base profile for lab machines",
@@ -93,7 +91,7 @@ def config_file(sample_config, tmp_path):
 class TestLoadConfig:
     def test_load_from_explicit_path(self, config_file, sample_config):
         result = config_module.load_config(str(config_file))
-        assert result["default"]["torque_url"] == sample_config["default"]["torque_url"]
+        assert result["torque_url"] == sample_config["torque_url"]
         assert "profiles" in result
 
     def test_load_missing_explicit_path_returns_empty(self, tmp_path):
@@ -110,7 +108,7 @@ class TestLoadConfig:
     def test_load_from_env_var(self, config_file, monkeypatch, sample_config):
         monkeypatch.setenv("TORQUE_TUNNEL_CONFIG", str(config_file))
         result = config_module.load_config()
-        assert result["default"]["torque_url"] == sample_config["default"]["torque_url"]
+        assert result["torque_url"] == sample_config["torque_url"]
 
     def test_load_from_default_path(self, sample_config, monkeypatch, tmp_path):
         monkeypatch.delenv("TORQUE_TUNNEL_CONFIG", raising=False)
@@ -119,7 +117,7 @@ class TestLoadConfig:
             yaml.dump(sample_config, f)
         monkeypatch.setattr(config_module, "_default_config_path", lambda: config_path)
         result = config_module.load_config()
-        assert result["default"]["torque_url"] == sample_config["default"]["torque_url"]
+        assert result["torque_url"] == sample_config["torque_url"]
 
     def test_load_empty_yaml_returns_empty(self, tmp_path):
         path = tmp_path / "empty.yaml"
@@ -205,7 +203,7 @@ class TestResolveProfile:
             config_module.resolve_profile(config, "anything")
 
     def test_no_profiles_section(self):
-        config = {"default": {"torque_url": "https://example.com"}}
+        config = {"torque_url": "https://example.com"}
         with pytest.raises(ValueError, match="not found"):
             config_module.resolve_profile(config, "anything")
 
@@ -227,12 +225,12 @@ class TestGetDefaults:
         assert result["init_commands"] == "export FOO=bar"
 
     def test_missing_keys_not_included(self):
-        config = {"default": {"torque_url": "https://example.com"}}
+        config = {"torque_url": "https://example.com"}
         result = config_module.get_defaults(config)
         assert "torque_url" in result
         assert "torque_token" not in result
 
-    def test_no_default_section(self):
+    def test_empty_config(self):
         result = config_module.get_defaults({})
         assert result == {}
 
@@ -363,6 +361,66 @@ class TestListProfiles:
         # Metadata keys excluded
         assert "description" not in lab_base["overrides"]
         assert "extends" not in lab_base["overrides"]
+        assert "show_values" not in lab_base["overrides"]
+
+    def test_show_values_defaults_to_false(self, sample_config):
+        result = config_module.list_profiles(sample_config)
+        for p in result:
+            assert p["show_values"] is False
+
+    def test_show_values_true_in_profile(self):
+        config = {
+            "profiles": {
+                "visible": {
+                    "show_values": True,
+                    "torque_url": "https://example.com",
+                    "torque_token": "tok123",
+                },
+                "hidden": {
+                    "torque_url": "https://other.com",
+                },
+            }
+        }
+        result = config_module.list_profiles(config)
+        visible = next(p for p in result if p["name"] == "visible")
+        hidden = next(p for p in result if p["name"] == "hidden")
+        assert visible["show_values"] is True
+        assert hidden["show_values"] is False
+        # show_values not in overrides
+        assert "show_values" not in visible["overrides"]
+
+    def test_values_dict_included(self):
+        config = {
+            "profiles": {
+                "p1": {
+                    "description": "test",
+                    "torque_url": "https://example.com",
+                    "host": "10.0.0.1",
+                }
+            }
+        }
+        result = config_module.list_profiles(config)
+        p1 = result[0]
+        assert p1["values"] == {"host": "10.0.0.1", "torque_url": "https://example.com"}
+
+    def test_values_excludes_metadata(self):
+        config = {
+            "profiles": {
+                "p1": {
+                    "description": "desc",
+                    "extends": "other",
+                    "show_values": True,
+                    "torque_url": "https://example.com",
+                },
+                "other": {"host": "1.2.3.4"},
+            }
+        }
+        result = config_module.list_profiles(config)
+        p1 = next(p for p in result if p["name"] == "p1")
+        assert "description" not in p1["values"]
+        assert "extends" not in p1["values"]
+        assert "show_values" not in p1["values"]
+        assert "torque_url" in p1["values"]
 
     def test_empty_config(self):
         result = config_module.list_profiles({})
@@ -374,13 +432,28 @@ class TestListProfiles:
 
 
 # ============================================================================
+# get_top_level_show_values
+# ============================================================================
+
+class TestGetTopLevelShowValues:
+    def test_defaults_to_false(self):
+        assert config_module.get_top_level_show_values({}) is False
+
+    def test_returns_true_when_set(self):
+        assert config_module.get_top_level_show_values({"show_values": True}) is True
+
+    def test_returns_false_when_explicitly_false(self):
+        assert config_module.get_top_level_show_values({"show_values": False}) is False
+
+
+# ============================================================================
 # Integration: full resolution chain
 # ============================================================================
 
 class TestIntegration:
     def test_full_flow_default_plus_profile(self, sample_config):
         """Simulate: config file defaults → profile → apply to config."""
-        # Step 1: Get defaults from config file
+        # Step 1: Get defaults from top-level config keys
         defaults = config_module.get_defaults(sample_config)
         assert defaults["torque_url"] == "https://default.example.com"
 
@@ -577,3 +650,53 @@ class TestSshAuthMutualExclusion:
         result = config_module.resolve_profile(cfg, "child")
         assert result["ssh_key"] == "/parent/key.pem"
         assert result["host"] == "10.0.0.2"
+
+
+# ============================================================================
+# get_default_profile_name
+# ============================================================================
+
+class TestGetDefaultProfileName:
+    def test_returns_profile_name_when_set(self):
+        config = {"default_profile": "jarvis", "profiles": {"jarvis": {"torque_url": "https://jarvis.io"}}}
+        assert config_module.get_default_profile_name(config) == "jarvis"
+
+    def test_returns_none_when_not_set(self):
+        config = {"default": {"torque_url": "https://example.com"}}
+        assert config_module.get_default_profile_name(config) is None
+
+    def test_returns_none_for_empty_config(self):
+        assert config_module.get_default_profile_name({}) is None
+
+    def test_returns_none_for_empty_string(self):
+        config = {"default_profile": ""}
+        assert config_module.get_default_profile_name(config) == ""
+
+    def test_empty_string_skipped_in_startup_logic(self):
+        """Empty string is falsy, so startup code won't try to resolve it."""
+        config = {"default_profile": "", "torque_url": "https://example.com"}
+        profile_name = config_module.get_default_profile_name(config)
+        # Simulates the `if startup_profile and _loaded_config:` guard
+        assert not profile_name
+
+    def test_default_profile_integrates_with_resolve(self):
+        """default_profile value can be used to resolve a profile."""
+        config = {
+            "default_profile": "my-profile",
+            "ssh_user": "root",
+            "host": "10.0.0.1",
+            "profiles": {
+                "my-profile": {
+                    "torque_url": "https://my.server.com",
+                    "torque_token": "my-token",
+                    "torque_space": "my-space",
+                    "torque_agent": "my-agent",
+                }
+            }
+        }
+        profile_name = config_module.get_default_profile_name(config)
+        profile_values = config_module.resolve_profile(config, profile_name)
+        defaults = config_module.get_defaults(config)
+        effective = config_module.apply_profile_to_config(defaults, profile_values)
+        assert effective["torque_url"] == "https://my.server.com"
+        assert effective["default_ssh_user"] == "root"
