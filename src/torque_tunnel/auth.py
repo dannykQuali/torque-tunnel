@@ -100,7 +100,7 @@ class TorqueAuthServer:
         self._last_heartbeat = time.monotonic()
 
         url = f"http://127.0.0.1:{port}/"
-        print(f"Opening browser for Torque login: {url}", file=sys.stderr)
+        print(f"Opening browser for Torque setup: {url}", file=sys.stderr)
         webbrowser.open(url)
 
         try:
@@ -109,8 +109,8 @@ class TorqueAuthServer:
             )
         except asyncio.TimeoutError:
             raise TimeoutError(
-                f"Login flow timed out after {self.timeout}s. "
-                "Please try again with 'login' tool."
+                f"Setup flow timed out after {self.timeout}s. "
+                "Please try again with 'setup' tool."
             )
         finally:
             await self._runner.cleanup()
@@ -133,7 +133,7 @@ class TorqueAuthServer:
             ):
                 self._cancelled = True
                 self._completed.set()
-                print("Browser tab closed — login cancelled.", file=sys.stderr)
+                print("Browser tab closed — setup cancelled.", file=sys.stderr)
                 return
 
     def _create_app(self) -> web.Application:
@@ -172,7 +172,7 @@ class TorqueAuthServer:
         self._check_csrf(request)
         self._cancelled = True
         self._completed.set()
-        print("Login cancelled by user.", file=sys.stderr)
+        print("Setup cancelled by user.", file=sys.stderr)
         return web.json_response({"status": "cancelled"})
 
     async def _handle_list_profiles(self, request: web.Request) -> web.Response:

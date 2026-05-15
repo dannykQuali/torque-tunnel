@@ -1096,11 +1096,11 @@ def get_torque_client(torque_url=None, torque_token=None, torque_space=None, con
     token = torque_token or cfg["torque_token"]
     space = torque_space or cfg["torque_space"]
     if not url:
-        raise ValueError("Torque URL not configured. Set TORQUE_URL or use --torque-url")
+        raise ValueError("Torque URL not configured. Run the 'setup' tool first, or set TORQUE_URL / --torque-url.")
     if not token:
-        raise ValueError("Torque token not configured. Set TORQUE_TOKEN or use --torque-token")
+        raise ValueError("Torque token not configured. Run the 'setup' tool first, or set TORQUE_TOKEN / --torque-token.")
     if not space:
-        raise ValueError("Torque space not configured. Set TORQUE_SPACE or use --torque-space")
+        raise ValueError("Torque space not configured. Run the 'setup' tool first, or set TORQUE_SPACE / --torque-space.")
     
     return TorqueClient(
         base_url=url,
@@ -1786,8 +1786,8 @@ Use `wait` to avoid tight polling. Typical: wait=10, repeat until completed.""",
             },
         ),
         Tool(
-            name="login",
-            description="""Interactively login to Torque and configure space/agent. Opens a browser window where the user can authenticate with email/password or paste an existing token, then select account, space, and agent. The selections are saved to the config file for future use. Use this when torque_token is missing or needs to be refreshed.""",
+            name="setup",
+            description="""Interactively set up a Torque connection profile. Opens a browser window where the user can authenticate with email/password or paste an existing token, select account/space/agent, and optionally reuse an existing profile. The selections are saved to the config file for future use. Use this when torque_token is missing, needs to be refreshed, or when the user wants to configure a new profile.""",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -1797,7 +1797,7 @@ Use `wait` to avoid tight polling. Typical: wait=10, repeat until completed.""",
                     },
                     "profile": {
                         "type": "string",
-                        "description": "Save login results to this profile instead of top-level config.",
+                        "description": "Save results to this profile instead of top-level config.",
                     },
                 },
             },
@@ -1813,9 +1813,9 @@ async def call_tool(name: str, arguments: dict):
     if name == "list_profiles":
         return await handle_list_profiles()
 
-    # Handle login (no profile resolution needed)
-    if name == "login":
-        return await handle_login(arguments)
+    # Handle setup (no profile resolution needed)
+    if name == "setup":
+        return await handle_setup(arguments)
     
     # Resolve profile for execution tools: inject profile values into arguments
     # and create an effective_config overlay for config-only keys
@@ -1901,8 +1901,8 @@ async def handle_list_profiles():
     return [TextContent(type="text", text="\n".join(lines))]
 
 
-async def handle_login(arguments: dict):
-    """Handle the login tool — open browser for interactive Torque login."""
+async def handle_setup(arguments: dict):
+    """Handle the setup tool — open browser for interactive Torque setup."""
     global _loaded_config
     profile_name = arguments.get("profile")
 
@@ -1929,10 +1929,10 @@ async def handle_login(arguments: dict):
     except TimeoutError as e:
         return [TextContent(type="text", text=f"Error: {e}")]
     except Exception as e:
-        return [TextContent(type="text", text=f"Error during login: {e}")]
+        return [TextContent(type="text", text=f"Error during setup: {e}")]
 
     if result is None:
-        return [TextContent(type="text", text="Login cancelled.")]
+        return [TextContent(type="text", text="Setup cancelled.")]
 
     # Reload config after save
     _loaded_config = config_module.load_config(str(config_path) if config_path else None)
@@ -1942,7 +1942,7 @@ async def handle_login(arguments: dict):
             _config[key] = value
 
     # Build summary
-    parts = [f"Login successful! Configuration saved."]
+    parts = [f"Setup complete! Configuration saved."]
     if result.account:
         parts.append(f"Account: {result.account}")
     parts.append(f"Space: {result.space}")
@@ -4425,8 +4425,8 @@ PERFORMANCE TIP:
     # profiles subcommand (list configuration profiles)
     subparsers.add_parser("profiles", parents=[common_parser], help="List available configuration profiles")
     
-    # login subcommand (interactive Torque login)
-    subparsers.add_parser("login", parents=[common_parser], help="Login to Torque interactively (opens browser)")
+    # setup subcommand (interactive Torque setup)
+    subparsers.add_parser("setup", parents=[common_parser], help="Set up Torque connection interactively (opens browser)")
 
     # ssh subcommand (remote command via SSH)
     ssh_parser = subparsers.add_parser("ssh", parents=[common_parser], help="Execute a command on remote server via SSH")
@@ -4578,8 +4578,8 @@ PERFORMANCE TIP:
             extends = f"\n    Extends: {p['extends']}" if p['extends'] else ""
             overrides = ", ".join(p['overrides']) if p['overrides'] else "(none)"
             print(f"  {p['name']:<20}{desc}{extends}\n{'':20}    Overrides: {overrides}\n")
-    elif args.command == "login":
-        # Interactive login
+    elif args.command == "setup":
+        # Interactive setup
         torque_url = _config.get("torque_url")
         profile_name = getattr(args, 'profile', None)
         if profile_name and _loaded_config:
@@ -4590,7 +4590,7 @@ PERFORMANCE TIP:
                 pass
         config_path = config_module.find_config_file(getattr(args, 'config', None))
 
-        async def run_login():
+        async def run_setup():
             auth_server = auth_module.TorqueAuthServer(
                 torque_url=torque_url or None,
                 config_path=str(config_path) if config_path else None,
@@ -4598,16 +4598,16 @@ PERFORMANCE TIP:
             )
             result = await auth_server.run()
             if result is None:
-                print("Login cancelled.", file=sys.stderr)
+                print("Setup cancelled.", file=sys.stderr)
                 return
-            print(f"\nLogin successful!")
+            print(f"\nSetup complete!")
             if result.account:
                 print(f"  Account: {result.account}")
             print(f"  Space:   {result.space}")
             if result.agent:
                 print(f"  Agent:   {result.agent}")
 
-        asyncio.run(run_login())
+        asyncio.run(run_setup())
     else:
         # CLI mode - run the appropriate command
         asyncio.run(cli_dispatch(args))
