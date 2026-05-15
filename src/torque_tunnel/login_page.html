@@ -268,6 +268,7 @@
 </div>
 
 <script>
+const BASE_PATH = window.location.pathname.replace(/\/$/, '');
 const INITIAL_TORQUE_URL = "{{TORQUE_URL}}";
 const INITIAL_PROFILE = "{{PROFILE_NAME}}";
 const CSRF = "{{CSRF_TOKEN}}";
@@ -316,13 +317,13 @@ let cachedHasDefaultProfile = false;  // whether config already has a default_pr
 })();
 
 // -- Heartbeat: poll /health so server knows browser is alive --
-fetch('/health').catch(() => {});  // immediate heartbeat on page load
+fetch(BASE_PATH + '/health').catch(() => {});  // immediate heartbeat on page load
 setInterval(() => {
-  fetch('/health').catch(() => {});
+  fetch(BASE_PATH + '/health').catch(() => {});
 }, 3000);
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible') {
-    fetch('/health').catch(() => {});  // heartbeat when tab regains focus
+    fetch(BASE_PATH + '/health').catch(() => {});  // heartbeat when tab regains focus
   }
 });
 
@@ -357,7 +358,7 @@ function hideError(elId) {
 // -- Profile reuse --
 async function loadProfiles() {
   try {
-    const resp = await fetch('/api/profiles');
+    const resp = await fetch(BASE_PATH + '/api/profiles');
     if (!resp.ok) return;
     const data = await resp.json();
     cachedProfiles = data.profiles || [];
@@ -432,7 +433,7 @@ async function useProfile(profileName) {
     hideError('urlError');
     hideError('loginError');
     try {
-      const resp = await fetch('/api/use-profile', {
+      const resp = await fetch(BASE_PATH + '/api/use-profile', {
         method: 'POST',
         headers,
         body: JSON.stringify({profile_name: profileName}),
@@ -472,7 +473,7 @@ async function useProfile(profileName) {
 // -- Cancel --
 async function doCancel() {
   try {
-    await fetch('/api/cancel', { method: 'POST', headers });
+    await fetch(BASE_PATH + '/api/cancel', { method: 'POST', headers });
   } catch (_) {}
   showStep('cancelled');
 }
@@ -534,7 +535,7 @@ async function doLogin() {
   btn.innerHTML = '<span class="spinner"></span>Signing in...';
 
   try {
-    const resp = await fetch('/api/login', {
+    const resp = await fetch(BASE_PATH + '/api/login', {
       method: 'POST',
       headers,
       body: JSON.stringify({
@@ -576,7 +577,7 @@ async function validateToken() {
   if (!token) return;
 
   try {
-    const resp = await fetch('/api/validate-token', {
+    const resp = await fetch(BASE_PATH + '/api/validate-token', {
       method: 'POST',
       headers,
       body: JSON.stringify({token, torque_url: state.torqueUrl}),
@@ -629,8 +630,8 @@ async function afterAuth(token) {
   // Fetch spaces + all agents in parallel
   try {
     const [spacesResp, agentsResp] = await Promise.all([
-      fetch('/api/spaces', { headers: {"Authorization": "Bearer " + token} }),
-      fetch('/api/agents', { headers: {"Authorization": "Bearer " + token} }),
+      fetch(BASE_PATH + '/api/spaces', { headers: {"Authorization": "Bearer " + token} }),
+      fetch(BASE_PATH + '/api/agents', { headers: {"Authorization": "Bearer " + token} }),
     ]);
 
     const spaces = await spacesResp.json();
@@ -745,7 +746,7 @@ function selectSpace(name) {
 // -- Step 4: Agent selection (space-first mode) --
 async function loadSpaceAgents(space) {
   try {
-    const resp = await fetch('/api/spaces/' + encodeURIComponent(space) + '/agents', {
+    const resp = await fetch(BASE_PATH + '/api/spaces/' + encodeURIComponent(space) + '/agents', {
       headers: {"Authorization": "Bearer " + state.shortToken},
     });
     const agents = await resp.json();
@@ -889,7 +890,7 @@ async function saveAndFinish() {
   try {
     // Always generate a fresh long token so each profile gets its own independent token+ID.
     // This ensures revoking one profile's token doesn't affect other profiles.
-    const genResp = await fetch('/api/generate-token', {
+    const genResp = await fetch(BASE_PATH + '/api/generate-token', {
       method: 'POST',
       headers,
       body: JSON.stringify({token: state.shortToken, space: state.space}),
@@ -906,7 +907,7 @@ async function saveAndFinish() {
 
     const description = document.getElementById('descriptionInput').value.trim();
 
-    const resp = await fetch('/api/complete', {
+    const resp = await fetch(BASE_PATH + '/api/complete', {
       method: 'POST',
       headers,
       body: JSON.stringify({

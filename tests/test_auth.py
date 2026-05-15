@@ -370,18 +370,19 @@ class TestTorqueAuthServerApp:
         s = TorqueAuthServer("https://example.com")
         app = s._create_app()
         route_paths = {r.resource.canonical for r in app.router.routes() if hasattr(r, 'resource')}
-        assert "/" in route_paths
-        assert "/health" in route_paths
-        assert "/api/login" in route_paths
-        assert "/api/validate-token" in route_paths
-        assert "/api/spaces" in route_paths
-        assert "/api/spaces/{space}/agents" in route_paths
-        assert "/api/agents" in route_paths
-        assert "/api/generate-token" in route_paths
-        assert "/api/complete" in route_paths
-        assert "/api/cancel" in route_paths
-        assert "/api/profiles" in route_paths
-        assert "/api/use-profile" in route_paths
+        secret = s._url_secret
+        assert f"/{secret}" in route_paths
+        assert f"/{secret}/health" in route_paths
+        assert f"/{secret}/api/login" in route_paths
+        assert f"/{secret}/api/validate-token" in route_paths
+        assert f"/{secret}/api/spaces" in route_paths
+        assert f"/{secret}/api/spaces/{{space}}/agents" in route_paths
+        assert f"/{secret}/api/agents" in route_paths
+        assert f"/{secret}/api/generate-token" in route_paths
+        assert f"/{secret}/api/complete" in route_paths
+        assert f"/{secret}/api/cancel" in route_paths
+        assert f"/{secret}/api/profiles" in route_paths
+        assert f"/{secret}/api/use-profile" in route_paths
 
 
 # ============================================================================
@@ -427,12 +428,41 @@ try:
         """Create an aiohttp test client for the auth server."""
         app = auth_server._create_app()
         async with TestClient(TestServer(app)) as c:
+            c._base = f"/{auth_server._url_secret}"
             yield c
+
+    class TestUrlSecretProtection:
+        """Requests without the correct URL secret should be rejected."""
+
+        @pytest.mark.asyncio
+        async def test_root_without_secret_returns_404(self, client):
+            resp = await client.get("/")
+            assert resp.status == 404
+
+        @pytest.mark.asyncio
+        async def test_health_without_secret_returns_404(self, client):
+            resp = await client.get("/health")
+            assert resp.status == 404
+
+        @pytest.mark.asyncio
+        async def test_api_without_secret_returns_404(self, client, csrf_headers):
+            resp = await client.post("/api/login", json={"email": "a", "password": "b"}, headers=csrf_headers)
+            assert resp.status == 404
+
+        @pytest.mark.asyncio
+        async def test_wrong_secret_returns_404(self, client, csrf_headers):
+            resp = await client.get("/wrong-secret")
+            assert resp.status == 404
+
+        @pytest.mark.asyncio
+        async def test_wrong_secret_api_returns_404(self, client, csrf_headers):
+            resp = await client.post("/wrong-secret/api/login", json={"email": "a", "password": "b"}, headers=csrf_headers)
+            assert resp.status == 404
 
     class TestHealthEndpoint:
         @pytest.mark.asyncio
         async def test_health(self, client):
-            resp = await client.get("/health")
+            resp = await client.get(f"{client._base}/health")
             assert resp.status == 200
             data = await resp.json()
             assert data["status"] == "ok"
@@ -440,7 +470,7 @@ try:
     class TestLoginPage:
         @pytest.mark.asyncio
         async def test_returns_html(self, client):
-            resp = await client.get("/")
+            resp = await client.get(client._base)
             assert resp.status == 200
             text = await resp.text()
             assert "<!DOCTYPE html>" in text
@@ -448,13 +478,13 @@ try:
 
         @pytest.mark.asyncio
         async def test_contains_torque_url(self, client):
-            resp = await client.get("/")
+            resp = await client.get(client._base)
             text = await resp.text()
             assert "https://torque.example.com" in text
 
         @pytest.mark.asyncio
         async def test_contains_csrf_token(self, client, auth_server):
-            resp = await client.get("/")
+            resp = await client.get(client._base)
             text = await resp.text()
             assert auth_server._csrf_token in text
 
@@ -466,7 +496,7 @@ try:
             server = TorqueAuthServer(torque_url=None, config_path=str(config_path))
             app = server._create_app()
             async with TestClient(TestServer(app)) as c:
-                resp = await c.get("/")
+                resp = await c.get(f"/{server._url_secret}")
                 text = await resp.text()
                 assert 'INITIAL_TORQUE_URL = ""' in text
                 assert 'step-url' in text
@@ -474,45 +504,45 @@ try:
         @pytest.mark.asyncio
         async def test_login_step_when_url_provided(self, client):
             """When torque_url is provided, URL step is skipped."""
-            resp = await client.get("/")
+            resp = await client.get(client._base)
             text = await resp.text()
             assert 'INITIAL_TORQUE_URL = "https://torque.example.com"' in text
 
     class TestCsrfProtection:
         @pytest.mark.asyncio
         async def test_login_rejects_bad_csrf(self, client, bad_csrf_headers):
-            resp = await client.post("/api/login", json={"email": "a", "password": "b"}, headers=bad_csrf_headers)
+            resp = await client.post(f"{client._base}/api/login", json={"email": "a", "password": "b"}, headers=bad_csrf_headers)
             assert resp.status == 403
 
         @pytest.mark.asyncio
         async def test_login_rejects_missing_csrf(self, client):
-            resp = await client.post("/api/login", json={"email": "a", "password": "b"})
+            resp = await client.post(f"{client._base}/api/login", json={"email": "a", "password": "b"})
             assert resp.status == 403
 
         @pytest.mark.asyncio
         async def test_validate_token_rejects_bad_csrf(self, client, bad_csrf_headers):
-            resp = await client.post("/api/validate-token", json={"token": "t"}, headers=bad_csrf_headers)
+            resp = await client.post(f"{client._base}/api/validate-token", json={"token": "t"}, headers=bad_csrf_headers)
             assert resp.status == 403
 
         @pytest.mark.asyncio
         async def test_generate_token_rejects_bad_csrf(self, client, bad_csrf_headers):
-            resp = await client.post("/api/generate-token", json={"token": "t", "space": "s"}, headers=bad_csrf_headers)
+            resp = await client.post(f"{client._base}/api/generate-token", json={"token": "t", "space": "s"}, headers=bad_csrf_headers)
             assert resp.status == 403
 
         @pytest.mark.asyncio
         async def test_complete_rejects_bad_csrf(self, client, bad_csrf_headers):
-            resp = await client.post("/api/complete", json={"token": "t", "space": "s"}, headers=bad_csrf_headers)
+            resp = await client.post(f"{client._base}/api/complete", json={"token": "t", "space": "s"}, headers=bad_csrf_headers)
             assert resp.status == 403
 
     class TestLoginEndpoint:
         @pytest.mark.asyncio
         async def test_missing_email(self, client, csrf_headers):
-            resp = await client.post("/api/login", json={"email": "", "password": "p"}, headers=csrf_headers)
+            resp = await client.post(f"{client._base}/api/login", json={"email": "", "password": "p"}, headers=csrf_headers)
             assert resp.status == 400
 
         @pytest.mark.asyncio
         async def test_missing_password(self, client, csrf_headers):
-            resp = await client.post("/api/login", json={"email": "e", "password": ""}, headers=csrf_headers)
+            resp = await client.post(f"{client._base}/api/login", json={"email": "e", "password": ""}, headers=csrf_headers)
             assert resp.status == 400
 
         @pytest.mark.asyncio
@@ -524,7 +554,7 @@ try:
             app = server._create_app()
             async with TestClient(TestServer(app)) as c:
                 resp = await c.post(
-                    "/api/login",
+                    f"/{server._url_secret}/api/login",
                     json={"email": "e", "password": "p"},
                     headers={"Content-Type": "application/json", "X-CSRF-Token": server._csrf_token},
                 )
@@ -546,7 +576,7 @@ try:
             mock_client_cls.return_value = mock_client
 
             resp = await client.post(
-                "/api/login",
+                f"{client._base}/api/login",
                 json={"email": "user@test.com", "password": "pass", "torque_url": "https://torque.example.com"},
                 headers=csrf_headers,
             )
@@ -569,7 +599,7 @@ try:
             mock_client_cls.return_value = mock_client
 
             resp = await client.post(
-                "/api/login",
+                f"{client._base}/api/login",
                 json={"email": "u@t.com", "password": "p", "torque_url": "https://new-server.example.com"},
                 headers=csrf_headers,
             )
@@ -589,7 +619,7 @@ try:
             mock_client_cls.return_value = mock_client
 
             resp = await client.post(
-                "/api/login",
+                f"{client._base}/api/login",
                 json={"email": "user@test.com", "password": "wrong"},
                 headers=csrf_headers,
             )
@@ -600,7 +630,7 @@ try:
     class TestValidateTokenEndpoint:
         @pytest.mark.asyncio
         async def test_missing_token(self, client, csrf_headers):
-            resp = await client.post("/api/validate-token", json={"token": ""}, headers=csrf_headers)
+            resp = await client.post(f"{client._base}/api/validate-token", json={"token": ""}, headers=csrf_headers)
             assert resp.status == 400
 
         @pytest.mark.asyncio
@@ -612,7 +642,7 @@ try:
             app = server._create_app()
             async with TestClient(TestServer(app)) as c:
                 resp = await c.post(
-                    "/api/validate-token",
+                    f"/{server._url_secret}/api/validate-token",
                     json={"token": "some-token"},
                     headers={"Content-Type": "application/json", "X-CSRF-Token": server._csrf_token},
                 )
@@ -634,7 +664,7 @@ try:
             mock_client_cls.return_value = mock_client
 
             resp = await client.post(
-                "/api/validate-token",
+                f"{client._base}/api/validate-token",
                 json={"token": "valid-token"},
                 headers=csrf_headers,
             )
@@ -645,7 +675,7 @@ try:
     class TestGenerateTokenEndpoint:
         @pytest.mark.asyncio
         async def test_missing_fields(self, client, csrf_headers):
-            resp = await client.post("/api/generate-token", json={"token": "t"}, headers=csrf_headers)
+            resp = await client.post(f"{client._base}/api/generate-token", json={"token": "t"}, headers=csrf_headers)
             assert resp.status == 400
 
         @pytest.mark.asyncio
@@ -671,7 +701,7 @@ try:
             mock_client_cls.return_value = mock_client
 
             resp = await client.post(
-                "/api/generate-token",
+                f"{client._base}/api/generate-token",
                 json={"token": "short-tok", "space": "my-space"},
                 headers=csrf_headers,
             )
@@ -682,17 +712,17 @@ try:
     class TestCompleteEndpoint:
         @pytest.mark.asyncio
         async def test_missing_token(self, client, csrf_headers):
-            resp = await client.post("/api/complete", json={"space": "s", "profile_name": "p"}, headers=csrf_headers)
+            resp = await client.post(f"{client._base}/api/complete", json={"space": "s", "profile_name": "p"}, headers=csrf_headers)
             assert resp.status == 400
 
         @pytest.mark.asyncio
         async def test_missing_space(self, client, csrf_headers):
-            resp = await client.post("/api/complete", json={"token": "t", "profile_name": "p"}, headers=csrf_headers)
+            resp = await client.post(f"{client._base}/api/complete", json={"token": "t", "profile_name": "p"}, headers=csrf_headers)
             assert resp.status == 400
 
         @pytest.mark.asyncio
         async def test_missing_profile_name(self, client, csrf_headers):
-            resp = await client.post("/api/complete", json={"token": "t", "space": "s"}, headers=csrf_headers)
+            resp = await client.post(f"{client._base}/api/complete", json={"token": "t", "space": "s"}, headers=csrf_headers)
             assert resp.status == 400
             data = await resp.json()
             assert "profile name" in data["error"].lower()
@@ -700,7 +730,7 @@ try:
         @pytest.mark.asyncio
         async def test_saves_config(self, client, csrf_headers, auth_server, tmp_path):
             resp = await client.post(
-                "/api/complete",
+                f"{client._base}/api/complete",
                 json={
                     "token": "long-token-val",
                     "token_id": "id-456",
@@ -729,7 +759,7 @@ try:
         @pytest.mark.asyncio
         async def test_saves_description_and_init_commands(self, client, csrf_headers, auth_server):
             resp = await client.post(
-                "/api/complete",
+                f"{client._base}/api/complete",
                 json={
                     "token": "tok",
                     "space": "sp",
@@ -749,7 +779,7 @@ try:
         @pytest.mark.asyncio
         async def test_sets_result_and_completed(self, client, csrf_headers, auth_server):
             resp = await client.post(
-                "/api/complete",
+                f"{client._base}/api/complete",
                 json={"token": "tok", "space": "sp", "profile_name": "p", "torque_url": "https://x.com"},
                 headers=csrf_headers,
             )
@@ -763,7 +793,7 @@ try:
         @pytest.mark.asyncio
         async def test_agent_is_optional(self, client, csrf_headers, auth_server):
             resp = await client.post(
-                "/api/complete",
+                f"{client._base}/api/complete",
                 json={"token": "tok", "space": "sp", "profile_name": "p"},
                 headers=csrf_headers,
             )
@@ -774,7 +804,7 @@ try:
         async def test_updates_server_torque_url(self, client, csrf_headers, auth_server):
             """Complete should update the server's torque_url for revocation."""
             resp = await client.post(
-                "/api/complete",
+                f"{client._base}/api/complete",
                 json={
                     "token": "tok",
                     "space": "sp",
@@ -791,7 +821,7 @@ try:
         async def test_set_as_default_true(self, client, csrf_headers, auth_server):
             """When set_as_default is true, default_profile is set in config."""
             resp = await client.post(
-                "/api/complete",
+                f"{client._base}/api/complete",
                 json={
                     "token": "tok",
                     "space": "sp",
@@ -809,7 +839,7 @@ try:
         async def test_set_as_default_false(self, client, csrf_headers, auth_server):
             """When set_as_default is false, default_profile is not set."""
             resp = await client.post(
-                "/api/complete",
+                f"{client._base}/api/complete",
                 json={
                     "token": "tok",
                     "space": "sp",
@@ -840,7 +870,7 @@ try:
             headers = {"Content-Type": "application/json", "X-CSRF-Token": s._csrf_token}
             async with TestClient(TestServer(app)) as c:
                 resp = await c.post(
-                    "/api/complete",
+                    f"/{s._url_secret}/api/complete",
                     json={
                         "token": "tok",
                         "space": "sp",
@@ -857,7 +887,7 @@ try:
     class TestCancelEndpoint:
         @pytest.mark.asyncio
         async def test_cancel_sets_cancelled(self, client, csrf_headers, auth_server):
-            resp = await client.post("/api/cancel", headers=csrf_headers)
+            resp = await client.post(f"{client._base}/api/cancel", headers=csrf_headers)
             assert resp.status == 200
             data = await resp.json()
             assert data["status"] == "cancelled"
@@ -866,7 +896,7 @@ try:
 
         @pytest.mark.asyncio
         async def test_cancel_rejects_bad_csrf(self, client, bad_csrf_headers):
-            resp = await client.post("/api/cancel", headers=bad_csrf_headers)
+            resp = await client.post(f"{client._base}/api/cancel", headers=bad_csrf_headers)
             assert resp.status == 403
 
     class TestHealthHeartbeat:
@@ -874,7 +904,7 @@ try:
         async def test_health_updates_heartbeat(self, client, auth_server):
             import time
             old = auth_server._last_heartbeat
-            await client.get("/health")
+            await client.get(f"{client._base}/health")
             assert auth_server._last_heartbeat >= old
 
     class TestAllAgentsEndpoint:
@@ -895,7 +925,7 @@ try:
             mock_client_cls.return_value = mock_client
 
             resp = await client.get(
-                "/api/agents",
+                f"{client._base}/api/agents",
                 headers={"Authorization": "Bearer tok"},
             )
             assert resp.status == 200
@@ -909,7 +939,7 @@ try:
 
         @pytest.mark.asyncio
         async def test_returns_empty_when_no_profiles(self, client):
-            resp = await client.get("/api/profiles")
+            resp = await client.get(f"{client._base}/api/profiles")
             assert resp.status == 200
             data = await resp.json()
             assert data["profiles"] == []
@@ -931,7 +961,7 @@ try:
             s = TorqueAuthServer(torque_url="https://example.com", config_path=str(config_path))
             app = s._create_app()
             async with TestClient(TestServer(app)) as c:
-                resp = await c.get("/api/profiles")
+                resp = await c.get(f"/{s._url_secret}/api/profiles")
                 assert resp.status == 200
                 data = await resp.json()
                 profiles = data["profiles"]
@@ -949,7 +979,7 @@ try:
             s = TorqueAuthServer(torque_url="https://example.com", config_path="/nonexistent/path.yaml")
             app = s._create_app()
             async with TestClient(TestServer(app)) as c:
-                resp = await c.get("/api/profiles")
+                resp = await c.get(f"/{s._url_secret}/api/profiles")
                 assert resp.status == 200
                 data = await resp.json()
                 assert data == {"profiles": [], "has_default_profile": False}
@@ -968,7 +998,7 @@ try:
             s = TorqueAuthServer(torque_url="https://example.com", config_path=str(config_path))
             app = s._create_app()
             async with TestClient(TestServer(app)) as c:
-                resp = await c.get("/api/profiles")
+                resp = await c.get(f"/{s._url_secret}/api/profiles")
                 data = await resp.json()
                 assert data["has_default_profile"] is True
 
@@ -977,13 +1007,13 @@ try:
 
         @pytest.mark.asyncio
         async def test_missing_profile_name(self, client, csrf_headers):
-            resp = await client.post("/api/use-profile", json={}, headers=csrf_headers)
+            resp = await client.post(f"{client._base}/api/use-profile", json={}, headers=csrf_headers)
             assert resp.status == 400
 
         @pytest.mark.asyncio
         async def test_profile_not_found(self, client, csrf_headers):
             resp = await client.post(
-                "/api/use-profile",
+                f"{client._base}/api/use-profile",
                 json={"profile_name": "nonexistent"},
                 headers=csrf_headers,
             )
@@ -1002,7 +1032,7 @@ try:
             app = s._create_app()
             headers = {"Content-Type": "application/json", "X-CSRF-Token": s._csrf_token}
             async with TestClient(TestServer(app)) as c:
-                resp = await c.post("/api/use-profile", json={"profile_name": "empty"}, headers=headers)
+                resp = await c.post(f"/{s._url_secret}/api/use-profile", json={"profile_name": "empty"}, headers=headers)
                 assert resp.status == 400
                 data = await resp.json()
                 assert "no token" in data["error"]
@@ -1020,7 +1050,7 @@ try:
             app = s._create_app()
             headers = {"Content-Type": "application/json", "X-CSRF-Token": s._csrf_token}
             async with TestClient(TestServer(app)) as c:
-                resp = await c.post("/api/use-profile", json={"profile_name": "no-url"}, headers=headers)
+                resp = await c.post(f"/{s._url_secret}/api/use-profile", json={"profile_name": "no-url"}, headers=headers)
                 assert resp.status == 400
                 data = await resp.json()
                 assert "no torque_url" in data["error"]
@@ -1046,7 +1076,7 @@ try:
                 mock_resp.json.return_value = spaces_response
                 mock_get.return_value = mock_resp
                 async with TestClient(TestServer(app)) as c:
-                    resp = await c.post("/api/use-profile", json={"profile_name": "good"}, headers=headers)
+                    resp = await c.post(f"/{s._url_secret}/api/use-profile", json={"profile_name": "good"}, headers=headers)
                     assert resp.status == 200
                     data = await resp.json()
                     assert data["token"] == "valid-token"
@@ -1074,7 +1104,7 @@ try:
                 mock_resp.status_code = 401
                 mock_get.return_value = mock_resp
                 async with TestClient(TestServer(app)) as c:
-                    resp = await c.post("/api/use-profile", json={"profile_name": "expired"}, headers=headers)
+                    resp = await c.post(f"/{s._url_secret}/api/use-profile", json={"profile_name": "expired"}, headers=headers)
                     assert resp.status == 401
                     data = await resp.json()
                     assert "invalid or expired" in data["error"]
@@ -1082,7 +1112,7 @@ try:
         @pytest.mark.asyncio
         async def test_requires_csrf(self, client, bad_csrf_headers):
             resp = await client.post(
-                "/api/use-profile",
+                f"{client._base}/api/use-profile",
                 json={"profile_name": "test"},
                 headers=bad_csrf_headers,
             )
@@ -1152,7 +1182,7 @@ class TestAuthServerRun:
                 # Find the port from the webbrowser.open call
                 url = mock_open.call_args[0][0]
                 async with session.post(
-                    f"{url}api/complete",
+                    f"{url}/api/complete",
                     json={
                         "token": "test-tok",
                         "space": "test-space",
@@ -1188,7 +1218,7 @@ class TestAuthServerRun:
             async with aiohttp.ClientSession() as session:
                 url = mock_open.call_args[0][0]
                 async with session.post(
-                    f"{url}api/cancel",
+                    f"{url}/api/cancel",
                     headers={"X-CSRF-Token": server._csrf_token},
                 ) as resp:
                     assert resp.status == 200

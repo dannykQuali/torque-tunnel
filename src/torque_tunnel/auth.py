@@ -76,6 +76,7 @@ class TorqueAuthServer:
         self.profile_name = profile_name or ""
         self.timeout = timeout
         self._csrf_token = secrets.token_urlsafe(32)
+        self._url_secret = secrets.token_urlsafe(16)
         self._result: Optional[AuthResult] = None
         self._completed = asyncio.Event()
         self._cancelled = False
@@ -99,7 +100,7 @@ class TorqueAuthServer:
         port = site._server.sockets[0].getsockname()[1]
         self._last_heartbeat = time.monotonic()
 
-        url = f"http://127.0.0.1:{port}/"
+        url = f"http://127.0.0.1:{port}/{self._url_secret}"
         print(f"Opening browser for Torque setup: {url}", file=sys.stderr)
         webbrowser.open(url)
 
@@ -138,18 +139,19 @@ class TorqueAuthServer:
 
     def _create_app(self) -> web.Application:
         app = web.Application()
-        app.router.add_get("/", self._handle_page)
-        app.router.add_get("/health", self._handle_health)
-        app.router.add_post("/api/login", self._handle_login)
-        app.router.add_post("/api/validate-token", self._handle_validate_token)
-        app.router.add_get("/api/spaces", self._handle_list_spaces)
-        app.router.add_get("/api/spaces/{space}/agents", self._handle_list_agents)
-        app.router.add_get("/api/agents", self._handle_list_all_agents)
-        app.router.add_post("/api/generate-token", self._handle_generate_token)
-        app.router.add_post("/api/complete", self._handle_complete)
-        app.router.add_post("/api/cancel", self._handle_cancel)
-        app.router.add_get("/api/profiles", self._handle_list_profiles)
-        app.router.add_post("/api/use-profile", self._handle_use_profile)
+        s = self._url_secret
+        app.router.add_get(f"/{s}", self._handle_page)
+        app.router.add_get(f"/{s}/health", self._handle_health)
+        app.router.add_post(f"/{s}/api/login", self._handle_login)
+        app.router.add_post(f"/{s}/api/validate-token", self._handle_validate_token)
+        app.router.add_get(f"/{s}/api/spaces", self._handle_list_spaces)
+        app.router.add_get(f"/{s}/api/spaces/{{space}}/agents", self._handle_list_agents)
+        app.router.add_get(f"/{s}/api/agents", self._handle_list_all_agents)
+        app.router.add_post(f"/{s}/api/generate-token", self._handle_generate_token)
+        app.router.add_post(f"/{s}/api/complete", self._handle_complete)
+        app.router.add_post(f"/{s}/api/cancel", self._handle_cancel)
+        app.router.add_get(f"/{s}/api/profiles", self._handle_list_profiles)
+        app.router.add_post(f"/{s}/api/use-profile", self._handle_use_profile)
         return app
 
     def _check_csrf(self, request: web.Request) -> None:
