@@ -870,25 +870,22 @@ async function saveAndFinish() {
   btn.innerHTML = '<span class="spinner"></span>Saving...';
 
   try {
-    let longToken = state.isLongToken ? state.shortToken : null;
-    let tokenId = null;
-
-    if (!longToken) {
-      const genResp = await fetch('/api/generate-token', {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({token: state.shortToken, space: state.space}),
-      });
-      const genData = await genResp.json();
-      if (!genResp.ok) {
-        showError('confirmError', genData.error || 'Token generation failed');
-        btn.disabled = false;
-        btn.textContent = 'Save & Finish';
-        return;
-      }
-      longToken = genData.access_token;
-      tokenId = genData.token_id;
+    // Always generate a fresh long token so each profile gets its own independent token+ID.
+    // This ensures revoking one profile's token doesn't affect other profiles.
+    const genResp = await fetch('/api/generate-token', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({token: state.shortToken, space: state.space}),
+    });
+    const genData = await genResp.json();
+    if (!genResp.ok) {
+      showError('confirmError', genData.error || 'Token generation failed');
+      btn.disabled = false;
+      btn.textContent = 'Save & Finish';
+      return;
     }
+    const longToken = genData.access_token;
+    const tokenId = genData.token_id;
 
     const description = document.getElementById('descriptionInput').value.trim();
 
