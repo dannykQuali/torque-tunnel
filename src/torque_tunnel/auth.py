@@ -80,8 +80,8 @@ class TorqueAuthServer:
         self._completed = asyncio.Event()
         self._cancelled = False
         self._last_heartbeat: float = 0.0
-        self._heartbeat_stale_seconds: float = 10.0
-        self._heartbeat_check_interval: float = 3.0
+        self._heartbeat_stale_seconds: float = 30.0
+        self._heartbeat_check_interval: float = 5.0
         self._app: Optional[web.Application] = None
         self._runner: Optional[web.AppRunner] = None
 

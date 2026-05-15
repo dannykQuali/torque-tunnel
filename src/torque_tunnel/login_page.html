@@ -293,10 +293,16 @@ let cachedProfiles = [];  // fetched once from /api/profiles
   loadProfiles();
 })();
 
-// -- Heartbeat: poll /health every 3s so server knows browser is alive --
+// -- Heartbeat: poll /health so server knows browser is alive --
+fetch('/health').catch(() => {});  // immediate heartbeat on page load
 setInterval(() => {
   fetch('/health').catch(() => {});
 }, 3000);
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') {
+    fetch('/health').catch(() => {});  // heartbeat when tab regains focus
+  }
+});
 
 // -- Navigation --
 function showStep(id, pushHistory) {
