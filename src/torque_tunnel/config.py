@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Optional
 
 import yaml
+from ruamel.yaml import YAML as RuamelYAML
 
 
 # Config file YAML keys → internal _config keys
@@ -51,6 +52,9 @@ VALID_CONFIG_KEYS = set(CONFIG_KEY_MAP.keys())
 
 # Metadata-only keys in profiles (not config values)
 _PROFILE_META_KEYS = {"description", "extends", "show_values"}
+
+# Keys managed by the login flow (not regular config values, but stored in YAML)
+_LOGIN_META_KEYS = {"torque_token_id"}
 
 # SSH auth mutual exclusion: (yaml_key_a, yaml_key_b) — when one is set at a
 # more concrete level, the other inherited from a less concrete level is cleared.
@@ -265,3 +269,61 @@ def get_top_level_defaults(config: dict) -> dict:
 def get_top_level_show_values(config: dict) -> bool:
     """Get the top-level show_values setting (default False)."""
     return config.get("show_values", False)
+
+
+def update_config_file(
+    updates: dict[str, object],
+    profile_name: Optional[str] = None,
+    explicit_path: Optional[str] = None,
+) -> Path:
+    """Update config file in-place, preserving comments and formatting.
+
+    Uses ruamel.yaml for round-trip YAML editing.
+
+    Args:
+        updates: Dict of YAML key → value to set (e.g. {"torque_token": "abc", "torque_space": "my-space"}).
+        profile_name: If set, update inside profiles.<profile_name>; otherwise update top-level keys.
+        explicit_path: Explicit config file path. If None, uses standard discovery
+                       (env var / default location). Creates default path if no config file exists.
+
+    Returns:
+        The Path of the updated config file.
+
+    Raises:
+        ValueError: If profile_name is specified but doesn't exist in the config.
+    """
+    path = find_config_file(explicit_path)
+
+    ryaml = RuamelYAML()
+    ryaml.preserve_quotes = True
+    ryaml.width = 4096  # prevent re-wrapping long strings
+
+    if path:
+        with open(path, "r", encoding="utf-8") as f:
+            data = ryaml.load(f)
+        if data is None:
+            data = {}
+    else:
+        # No config file yet — create at default location
+        path = _default_config_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data = {}
+
+    if profile_name:
+        profiles = data.get("profiles")
+        if profiles is None:
+            profiles = {}
+            data["profiles"] = profiles
+        if profile_name not in profiles:
+            profiles[profile_name] = {}
+        target = profiles[profile_name]
+    else:
+        target = data
+
+    for key, value in updates.items():
+        target[key] = value
+
+    with open(path, "w", encoding="utf-8") as f:
+        ryaml.dump(data, f)
+
+    return path

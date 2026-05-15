@@ -1,0 +1,925 @@
+﻿<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Torque Tunnel — Login</title>
+<style>
+  :root { --primary: #1a73e8; --danger: #d93025; --success: #1e8e3e; --warning: #f9ab00; --bg: #f8f9fa; --card: #fff; --border: #dadce0; --text: #202124; --muted: #5f6368; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+  .container { width: 100%; max-width: 520px; padding: 16px; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 32px; margin-bottom: 16px; }
+  h1 { font-size: 22px; margin-bottom: 4px; }
+  .subtitle { color: var(--muted); font-size: 14px; margin-bottom: 24px; }
+  .step { display: none; }
+  .step.active { display: block; }
+  .step-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+  .step-header h2 { font-size: 16px; }
+  label { display: block; font-size: 13px; font-weight: 500; margin-bottom: 4px; color: var(--muted); }
+  input[type="text"], input[type="email"], input[type="password"], textarea, select {
+    width: 100%; padding: 10px 12px; border: 1px solid var(--border); border-radius: 6px; font-size: 14px; margin-bottom: 12px; outline: none; transition: border-color .2s;
+  }
+  select { background: var(--card); }
+  input:focus, textarea:focus, select:focus { border-color: var(--primary); }
+  button { cursor: pointer; padding: 10px 24px; border: none; border-radius: 6px; font-size: 14px; font-weight: 500; transition: background .2s; }
+  .btn-primary { background: var(--primary); color: #fff; }
+  .btn-primary:hover { background: #1557b0; }
+  .btn-primary:disabled { background: #94c4f7; cursor: not-allowed; }
+  .btn-secondary { background: var(--bg); color: var(--text); border: 1px solid var(--border); }
+  .btn-secondary:hover { background: #e8eaed; }
+  .btn-link { background: none; color: var(--primary); padding: 0; text-decoration: underline; font-size: 13px; }
+  .btn-cancel { background: none; color: var(--muted); border: 1px solid var(--border); padding: 8px 16px; }
+  .btn-cancel:hover { background: #fce8e6; color: var(--danger); border-color: var(--danger); }
+  .btn-back { background: none; color: var(--muted); padding: 8px 16px; border: 1px solid var(--border); }
+  .btn-back:hover { background: #e8eaed; }
+  .btn-row { display: flex; gap: 8px; margin-top: 16px; align-items: center; }
+  .btn-row .spacer { flex: 1; }
+  .error { color: var(--danger); font-size: 13px; margin-bottom: 12px; display: none; }
+  .error.show { display: block; }
+  .success-icon { font-size: 48px; text-align: center; margin-bottom: 16px; color: var(--success); }
+  .selector { list-style: none; max-height: 300px; overflow-y: auto; }
+  .selector li { padding: 10px 14px; border: 1px solid var(--border); border-radius: 6px; margin-bottom: 6px; cursor: pointer; display: flex; align-items: center; gap: 10px; transition: background .15s; }
+  .selector li:hover { background: #e8f0fe; }
+  .selector li.selected { border-color: var(--primary); background: #e8f0fe; }
+  .selector li.disabled { opacity: 0.5; cursor: default; }
+  .selector li.disabled:hover { background: transparent; }
+  .selector .agent-name { flex: 1; }
+  .selector .meta { font-size: 12px; color: var(--muted); }
+  .selector .spaces-list { font-size: 11px; color: var(--muted); margin-top: 2px; }
+  .token-section { margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--border); }
+  .summary-table { width: 100%; font-size: 14px; }
+  .summary-table td { padding: 6px 0; vertical-align: top; }
+  .summary-table td:first-child { font-weight: 500; width: 120px; color: var(--muted); }
+  .summary-table input[type="text"], .summary-table textarea { margin-bottom: 0; }
+  .spinner { display: inline-block; width: 16px; height: 16px; border: 2px solid var(--border); border-top-color: var(--primary); border-radius: 50%; animation: spin .6s linear infinite; vertical-align: middle; margin-right: 8px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .loading { pointer-events: none; opacity: .7; }
+  .status-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
+  .status-active { background: var(--success); }
+  .status-tentative { background: var(--warning); }
+  .status-error { background: var(--danger); }
+  .status-unknown { background: var(--border); }
+  .filter-row { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; font-size: 13px; color: var(--muted); }
+  .filter-row input[type="checkbox"] { width: auto; margin: 0; }
+  .mode-toggle { font-size: 13px; margin-bottom: 12px; }
+  .cancelled-icon { font-size: 48px; text-align: center; margin-bottom: 16px; color: var(--muted); }
+  .hint { font-size: 11px; color: var(--muted); margin-top: -8px; margin-bottom: 10px; }
+  .init-cmd-textarea { font-size: 12px; color: var(--fg); background: #f1f3f4; padding: 8px 10px; border-radius: 4px; margin-top: 4px; word-break: break-all; font-family: monospace; width: 100%; min-height: 60px; max-height: 120px; resize: vertical; border: 1px solid var(--border); box-sizing: border-box; }
+  .profile-section { margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--border); }
+  .profile-section h3 { font-size: 13px; color: var(--muted); font-weight: 500; margin-bottom: 8px; }
+  .profile-list { list-style: none; max-height: 200px; overflow-y: auto; }
+  .profile-list li { padding: 8px 12px; border: 1px solid var(--border); border-radius: 6px; margin-bottom: 4px; cursor: pointer; font-size: 13px; transition: background .15s; }
+  .profile-list li:hover { background: #e8f0fe; }
+  .profile-list .profile-name { font-weight: 500; }
+  .profile-list .profile-desc { color: var(--muted); font-size: 12px; margin-left: 4px; }
+  .profile-list .profile-url { color: var(--muted); font-size: 11px; display: block; margin-top: 2px; }
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="card">
+    <h1>Torque Tunnel</h1>
+    <div class="subtitle" id="subtitleLine">Configure your Torque connection</div>
+
+    <!-- Step 0: URL selection (shown when no torque_url was pre-set) -->
+    <div id="step-url" class="step">
+      <div class="step-header"><h2>Torque Server</h2></div>
+      <div id="urlError" class="error"></div>
+      <label for="urlSelect">Select or enter your Torque URL</label>
+      <select id="urlSelect" onchange="onUrlSelectChange()">
+        <option value="https://portal.qtorque.io">https://portal.qtorque.io</option>
+        <option value="https://jarvis.qtorque.io">https://jarvis.qtorque.io</option>
+        <option value="https://review1.qualilabs.net">https://review1.qualilabs.net</option>
+        <option value="https://review2.qualilabs.net">https://review2.qualilabs.net</option>
+        <option value="https://review3.qualilabs.net">https://review3.qualilabs.net</option>
+        <option value="__custom__">Custom URL...</option>
+      </select>
+      <input type="text" id="urlCustom" placeholder="https://your-torque-server.example.com" style="display:none;">
+      <div class="btn-row">
+        <button class="btn-cancel" onclick="doCancel()">Cancel</button>
+        <span class="spacer"></span>
+        <button class="btn-primary" onclick="confirmUrl()">Continue</button>
+      </div>
+      <div id="urlProfileSection" class="profile-section" style="display:none;">
+        <h3>Or use an existing profile</h3>
+        <ul id="urlProfileList" class="profile-list"></ul>
+      </div>
+    </div>
+
+    <!-- Step 1: Login -->
+    <div id="step-login" class="step">
+      <div id="loginError" class="error"></div>
+      <div id="loginForm">
+        <label for="email">Email</label>
+        <input type="email" id="email">
+        <label for="password">Password</label>
+        <input type="text" id="password" autocomplete="off" style="-webkit-text-security:disc; text-security:disc;">
+        <div class="btn-row">
+          <button class="btn-cancel" type="button" onclick="doCancel()">Cancel</button>
+          <span class="spacer"></span>
+          <button class="btn-back" type="button" onclick="goBack('login')">Back</button>
+          <button type="button" class="btn-primary" id="loginBtn" onclick="doLogin()">Sign in</button>
+        </div>
+      </div>
+      <div class="token-section">
+        <button class="btn-link" onclick="toggleTokenPaste()">I already have a token</button>
+        <div id="tokenPaste" style="display:none; margin-top:12px;">
+          <label for="pastedToken">Paste your Torque API token</label>
+          <textarea id="pastedToken" rows="2" placeholder="Bearer token or long token..."></textarea>
+          <button class="btn-primary" onclick="validateToken()">Use this token</button>
+        </div>
+      </div>
+      <div id="loginProfileSection" class="profile-section" style="display:none;">
+        <h3>Or use token from an existing profile</h3>
+        <ul id="loginProfileList" class="profile-list"></ul>
+      </div>
+    </div>
+
+    <!-- Step 2: Account selection (if multiple) -->
+    <div id="step-account" class="step">
+      <div class="step-header"><h2>Select Account</h2></div>
+      <ul id="accountList" class="selector"></ul>
+      <div class="btn-row">
+        <button class="btn-cancel" onclick="doCancel()">Cancel</button>
+        <span class="spacer"></span>
+        <button class="btn-back" onclick="goBack('account')">Back</button>
+      </div>
+    </div>
+
+    <!-- Step 3: Space/Agent selection (mode toggle) -->
+    <div id="step-space" class="step">
+      <div class="step-header"><h2 id="spaceStepTitle">Select Space</h2></div>
+      <div class="mode-toggle">
+        <button class="btn-link" id="modeToggleBtn" onclick="toggleSelectionMode()">Choose by agent instead</button>
+      </div>
+      <div id="spaceError" class="error"></div>
+
+      <!-- Space-first mode -->
+      <div id="spaceMode">
+        <ul id="spaceList" class="selector"></ul>
+      </div>
+
+      <!-- Agent-first mode -->
+      <div id="agentMode" style="display:none;">
+        <div class="filter-row">
+          <input type="checkbox" id="onlineOnlyFilter" checked onchange="renderAllAgents()">
+          <label for="onlineOnlyFilter" style="margin:0; cursor:pointer;">Online only</label>
+          <span style="margin-left:16px;"></span>
+          <input type="checkbox" id="hasSpacesFilter" checked onchange="renderAllAgents()">
+          <label for="hasSpacesFilter" style="margin:0; cursor:pointer;">With spaces only</label>
+        </div>
+        <ul id="allAgentList" class="selector"></ul>
+      </div>
+
+      <div class="btn-row">
+        <button class="btn-cancel" onclick="doCancel()">Cancel</button>
+        <span class="spacer"></span>
+        <button class="btn-back" onclick="goBack('space')">Back</button>
+      </div>
+    </div>
+
+    <!-- Step 4: Agent selection (space-first mode) -->
+    <div id="step-agent" class="step">
+      <div class="step-header"><h2>Select Agent</h2></div>
+      <div id="agentError" class="error"></div>
+      <div class="filter-row">
+        <input type="checkbox" id="onlineOnlyFilterSpace" checked onchange="renderSpaceAgents()">
+        <label for="onlineOnlyFilterSpace" style="margin:0; cursor:pointer;">Online only</label>
+      </div>
+      <ul id="agentList" class="selector"></ul>
+      <div class="btn-row">
+        <button class="btn-cancel" onclick="doCancel()">Cancel</button>
+        <span class="spacer"></span>
+        <button class="btn-back" onclick="goBack('agent')">Back</button>
+        <button class="btn-link" style="padding:10px;" onclick="skipAgent()">Skip agent</button>
+      </div>
+    </div>
+
+    <!-- Step 4b: Space selection for agent-first (if agent in multiple spaces) -->
+    <div id="step-agent-space" class="step">
+      <div class="step-header"><h2>Select Space for Agent</h2></div>
+      <p style="font-size:13px; color:var(--muted); margin-bottom:12px;">
+        Agent <strong id="agentSpaceName"></strong> is available in multiple spaces:
+      </p>
+      <ul id="agentSpaceList" class="selector"></ul>
+      <div class="btn-row">
+        <button class="btn-cancel" onclick="doCancel()">Cancel</button>
+        <span class="spacer"></span>
+        <button class="btn-back" onclick="goBack('agent-space')">Back</button>
+      </div>
+    </div>
+
+    <!-- Step 5: Confirm & Save -->
+    <div id="step-confirm" class="step">
+      <div class="step-header"><h2>Confirm Setup</h2></div>
+      <table class="summary-table" id="summaryTable"></table>
+      <div style="margin-top:16px;">
+        <label for="profileNameInput">Profile name</label>
+        <input type="text" id="profileNameInput" placeholder="e.g. portal, jarvis, review1">
+        <div class="hint">A short name to identify this configuration profile.</div>
+      </div>
+      <div>
+        <label for="descriptionInput">Description <span style="font-weight:normal; color:var(--muted);">(optional)</span></label>
+        <textarea id="descriptionInput" rows="3" placeholder="Describe this connection, e.g.:&#10;- Network/proxy requirements&#10;- Host machine or location&#10;- Purpose (dev, staging, production)"></textarea>
+      </div>
+      <div id="initCommandsPreview" style="display:none; margin-bottom:12px;">
+        <label for="initCommandsInput">Init commands <span style="font-weight:normal; color:var(--muted);">(auto-detected from agent, editable)</span></label>
+        <textarea id="initCommandsInput" class="init-cmd-textarea" rows="3" placeholder="Shell commands to run before each session, e.g. export HTTPS_PROXY=..."></textarea>
+      </div>
+      <div id="confirmError" class="error" style="margin-top:12px;"></div>
+      <div class="btn-row">
+        <button class="btn-cancel" onclick="doCancel()">Cancel</button>
+        <span class="spacer"></span>
+        <button class="btn-back" onclick="goBack('confirm')">Back</button>
+        <button class="btn-primary" id="saveBtn" onclick="saveAndFinish()">Save &amp; Finish</button>
+      </div>
+    </div>
+
+    <!-- Step 6: Done -->
+    <div id="step-done" class="step">
+      <div class="success-icon">&#10003;</div>
+      <h2 style="text-align:center; margin-bottom:8px;">Setup Complete</h2>
+      <p style="text-align:center; color:var(--muted); font-size:14px;">Configuration saved. You can close this tab.</p>
+      <p id="savedPath" style="text-align:center; color:var(--muted); font-size:12px; margin-top:8px;"></p>
+    </div>
+
+    <!-- Step 7: Cancelled -->
+    <div id="step-cancelled" class="step">
+      <div class="cancelled-icon">&#10007;</div>
+      <h2 style="text-align:center; margin-bottom:8px;">Login Cancelled</h2>
+      <p style="text-align:center; color:var(--muted); font-size:14px;">You can close this tab.</p>
+    </div>
+  </div>
+</div>
+
+<script>
+const INITIAL_TORQUE_URL = "{{TORQUE_URL}}";
+const INITIAL_PROFILE = "{{PROFILE_NAME}}";
+const CSRF = "{{CSRF_TOKEN}}";
+const headers = {"Content-Type": "application/json", "X-CSRF-Token": CSRF};
+
+const PROXY_VAR_NAMES = ['HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY', 'http_proxy', 'https_proxy', 'no_proxy'];
+
+let state = {
+  torqueUrl: INITIAL_TORQUE_URL,
+  shortToken: null,
+  longToken: null,
+  tokenId: null,
+  account: null,
+  space: null,
+  agent: null,
+  agentData: null,     // full agent object for env var extraction
+  accounts: {},
+  isLongToken: false,
+  allAgents: [],       // account-level agents cache
+  spaceAgents: [],     // space-level agents cache
+  selectionMode: 'space',  // 'space' or 'agent'
+  stepHistory: [],     // for back navigation
+  initCommands: '',    // extracted proxy init_commands
+};
+
+let cachedProfiles = [];  // fetched once from /api/profiles
+
+// -- Init: decide first step --
+(function init() {
+  if (INITIAL_TORQUE_URL) {
+    document.getElementById('subtitleLine').innerHTML = 'Connect to <strong>' + escHtml(INITIAL_TORQUE_URL) + '</strong>';
+    showStep('login', false);
+  } else {
+    showStep('url', false);
+  }
+  // Fetch profiles in background
+  loadProfiles();
+})();
+
+// -- Heartbeat: poll /health every 3s so server knows browser is alive --
+setInterval(() => {
+  fetch('/health').catch(() => {});
+}, 3000);
+
+// -- Navigation --
+function showStep(id, pushHistory) {
+  if (pushHistory !== false) {
+    const current = document.querySelector('.step.active');
+    if (current) {
+      const curId = current.id.replace('step-', '');
+      if (curId !== id) state.stepHistory.push(curId);
+    }
+  }
+  document.querySelectorAll('.step').forEach(s => s.classList.remove('active'));
+  document.getElementById('step-' + id).classList.add('active');
+}
+
+function goBack(fromStep) {
+  if (state.stepHistory.length === 0) return;
+  const prev = state.stepHistory.pop();
+  showStep(prev, false);
+}
+
+function showError(elId, msg) {
+  const el = document.getElementById(elId);
+  el.textContent = msg;
+  el.classList.add('show');
+}
+function hideError(elId) {
+  document.getElementById(elId).classList.remove('show');
+}
+
+// -- Profile reuse --
+async function loadProfiles() {
+  try {
+    const resp = await fetch('/api/profiles');
+    if (!resp.ok) return;
+    cachedProfiles = await resp.json();
+    renderProfileLists();
+  } catch (_) {}
+}
+
+function renderProfileLists() {
+  // URL step: show all profiles that have a torque_url
+  const urlProfiles = cachedProfiles.filter(p => p.torque_url && p.name.trim());
+  const urlSection = document.getElementById('urlProfileSection');
+  if (urlProfiles.length > 0) {
+    renderProfileUl('urlProfileList', urlProfiles);
+    urlSection.style.display = '';
+  }
+
+  // Login step: show profiles that have a token (matching current URL if set, otherwise all)
+  renderLoginProfiles();
+}
+
+function renderLoginProfiles() {
+  const loginProfiles = cachedProfiles.filter(p => {
+    if (!p.has_token || !p.name.trim()) return false;
+    // If torqueUrl is set, only show profiles for the same server
+    if (state.torqueUrl && p.torque_url) {
+      return p.torque_url.replace(/\/+$/, '') === state.torqueUrl;
+    }
+    return true;
+  });
+  const section = document.getElementById('loginProfileSection');
+  if (loginProfiles.length > 0) {
+    renderProfileUl('loginProfileList', loginProfiles);
+    section.style.display = '';
+  } else {
+    section.style.display = 'none';
+  }
+}
+
+function renderProfileUl(ulId, profiles) {
+  const ul = document.getElementById(ulId);
+  ul.innerHTML = '';
+  profiles.forEach((p, idx) => {
+    const li = document.createElement('li');
+    li.dataset.profileIdx = idx;
+    const nameSpan = document.createElement('span');
+    nameSpan.className = 'profile-name';
+    nameSpan.textContent = p.name;
+    li.appendChild(nameSpan);
+    if (p.description) {
+      const descSpan = document.createElement('span');
+      descSpan.className = 'profile-desc';
+      descSpan.textContent = ' \u2014 ' + p.description;
+      li.appendChild(descSpan);
+    }
+    const urlSpan = document.createElement('span');
+    urlSpan.className = 'profile-url';
+    urlSpan.textContent = (p.torque_url || '') + (p.has_token ? '' : ' (no token)');
+    li.appendChild(urlSpan);
+    li.onclick = () => useProfile(p.name);
+    ul.appendChild(li);
+  });
+}
+
+async function useProfile(profileName) {
+  // Try to use the profile's token via the server
+  const profile = cachedProfiles.find(p => p.name === profileName);
+  if (!profile) return;
+
+  if (profile.has_token && profile.torque_url) {
+    // Both URL and token: validate and skip to space selection
+    hideError('urlError');
+    hideError('loginError');
+    try {
+      const resp = await fetch('/api/use-profile', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({profile_name: profileName}),
+      });
+      const data = await resp.json();
+      if (!resp.ok) {
+        // Token expired/invalid — fall back to login with the URL pre-set
+        const errEl = document.querySelector('.step.active .error');
+        if (errEl) { errEl.textContent = data.error || 'Failed to use profile'; errEl.classList.add('show'); }
+        if (profile.torque_url) {
+          state.torqueUrl = profile.torque_url.replace(/\/+$/, '');
+          document.getElementById('subtitleLine').innerHTML = 'Connect to <strong>' + escHtml(state.torqueUrl) + '</strong>';
+          renderLoginProfiles();
+          showStep('login');
+        }
+        return;
+      }
+      // Success — set state and proceed
+      state.torqueUrl = data.torque_url;
+      state.shortToken = data.token;
+      state.isLongToken = true;
+      document.getElementById('subtitleLine').innerHTML = 'Connect to <strong>' + escHtml(state.torqueUrl) + '</strong>';
+      afterAuth(data.token);
+    } catch (err) {
+      const errEl = document.querySelector('.step.active .error');
+      if (errEl) { errEl.textContent = 'Network error: ' + err.message; errEl.classList.add('show'); }
+    }
+  } else if (profile.torque_url) {
+    // Has URL but no token: set URL and go to login
+    state.torqueUrl = profile.torque_url.replace(/\/+$/, '');
+    document.getElementById('subtitleLine').innerHTML = 'Connect to <strong>' + escHtml(state.torqueUrl) + '</strong>';
+    renderLoginProfiles();
+    showStep('login');
+  }
+}
+
+// -- Cancel --
+async function doCancel() {
+  try {
+    await fetch('/api/cancel', { method: 'POST', headers });
+  } catch (_) {}
+  showStep('cancelled');
+}
+
+// -- Step 0: URL selection --
+function onUrlSelectChange() {
+  const sel = document.getElementById('urlSelect');
+  const custom = document.getElementById('urlCustom');
+  custom.style.display = sel.value === '__custom__' ? '' : 'none';
+}
+
+function confirmUrl() {
+  hideError('urlError');
+  const sel = document.getElementById('urlSelect');
+  let url = sel.value;
+  if (url === '__custom__') {
+    url = document.getElementById('urlCustom').value.trim();
+  }
+  if (!url) {
+    showError('urlError', 'Please enter a Torque URL');
+    return;
+  }
+  // Basic URL validation
+  try { new URL(url); } catch (_) {
+    showError('urlError', 'Please enter a valid URL (e.g. https://portal.qtorque.io)');
+    return;
+  }
+  state.torqueUrl = url.replace(/\/+$/, '');
+  document.getElementById('subtitleLine').innerHTML = 'Connect to <strong>' + escHtml(state.torqueUrl) + '</strong>';
+  renderLoginProfiles();
+  showStep('login');
+}
+
+function toggleTokenPaste() {
+  const el = document.getElementById('tokenPaste');
+  el.style.display = el.style.display === 'none' ? 'block' : 'none';
+}
+
+// -- Step 1: Login --
+// Submit login on Enter key in email/password fields
+document.addEventListener('DOMContentLoaded', () => {
+  for (const id of ['email', 'password']) {
+    document.getElementById(id).addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); doLogin(); }
+    });
+  }
+});
+
+async function doLogin() {
+  hideError('loginError');
+  const email = document.getElementById('email').value.trim();
+  const password = document.getElementById('password').value;
+  if (!email || !password) {
+    showError('loginError', 'Email and password are required');
+    return;
+  }
+  const btn = document.getElementById('loginBtn');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>Signing in...';
+
+  try {
+    const resp = await fetch('/api/login', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        email: email,
+        password: password,
+        torque_url: state.torqueUrl,
+      }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) {
+      showError('loginError', data.error || 'Login failed');
+      return;
+    }
+    state.accounts = data;
+    // Clear password field immediately so the browser won't offer to save it
+    document.getElementById('password').value = '';
+    const aliases = Object.keys(data);
+    if (aliases.length === 0) {
+      showError('loginError', 'No accounts found for this user');
+      return;
+    }
+    if (aliases.length === 1) {
+      selectAccount(aliases[0]);
+    } else {
+      renderAccounts(aliases);
+      showStep('account');
+    }
+  } catch (err) {
+    showError('loginError', 'Network error: ' + err.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Sign in';
+  }
+}
+
+async function validateToken() {
+  hideError('loginError');
+  const token = document.getElementById('pastedToken').value.trim();
+  if (!token) return;
+
+  try {
+    const resp = await fetch('/api/validate-token', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({token, torque_url: state.torqueUrl}),
+    });
+    const data = await resp.json();
+    if (!resp.ok) {
+      showError('loginError', data.error || 'Token validation failed');
+      return;
+    }
+    state.shortToken = token;
+    state.isLongToken = true;
+    afterAuth(token);
+  } catch (err) {
+    showError('loginError', 'Network error: ' + err.message);
+  }
+}
+
+// -- Step 2: Account --
+function renderAccounts(aliases) {
+  const ul = document.getElementById('accountList');
+  ul.innerHTML = '';
+  aliases.forEach(alias => {
+    const li = document.createElement('li');
+    li.textContent = alias;
+    li.onclick = () => selectAccount(alias);
+    ul.appendChild(li);
+  });
+}
+
+function selectAccount(alias) {
+  state.account = alias;
+  state.shortToken = state.accounts[alias].access_token;
+  afterAuth(state.shortToken);
+}
+
+// -- After authentication: load spaces + agents in parallel, show step 3 --
+async function afterAuth(token) {
+  showStep('space');
+  hideError('spaceError');
+  // Clear stale lists immediately before fetching fresh data
+  for (const id of ['spaceList', 'agentList', 'allAgentList', 'agentSpaceList']) {
+    document.getElementById(id).innerHTML = '';
+  }
+  state.selectionMode = 'space';
+  document.getElementById('spaceMode').style.display = '';
+  document.getElementById('agentMode').style.display = 'none';
+  document.getElementById('modeToggleBtn').textContent = 'Choose by agent instead';
+  document.getElementById('spaceStepTitle').textContent = 'Select Space';
+
+  // Fetch spaces + all agents in parallel
+  try {
+    const [spacesResp, agentsResp] = await Promise.all([
+      fetch('/api/spaces', { headers: {"Authorization": "Bearer " + token} }),
+      fetch('/api/agents', { headers: {"Authorization": "Bearer " + token} }),
+    ]);
+
+    const spaces = await spacesResp.json();
+    state.allAgents = [];
+    if (agentsResp.ok) {
+      state.allAgents = await agentsResp.json();
+    }
+
+    if (!spacesResp.ok || !Array.isArray(spaces) || spaces.length === 0) {
+      showError('spaceError', 'No spaces available for this account');
+      return;
+    }
+
+    // Auto-select if only one space
+    if (spaces.length === 1) {
+      selectSpace(spaces[0].name);
+      return;
+    }
+
+    const ul = document.getElementById('spaceList');
+    ul.innerHTML = '';
+    spaces.forEach(s => {
+      const li = document.createElement('li');
+      li.textContent = s.name;
+      li.onclick = () => selectSpace(s.name);
+      ul.appendChild(li);
+    });
+  } catch (err) {
+    showError('spaceError', 'Failed to load data: ' + err.message);
+  }
+}
+
+// -- Selection mode toggle (space-first vs agent-first) --
+function toggleSelectionMode() {
+  if (state.selectionMode === 'space') {
+    state.selectionMode = 'agent';
+    document.getElementById('spaceMode').style.display = 'none';
+    document.getElementById('agentMode').style.display = '';
+    document.getElementById('modeToggleBtn').textContent = 'Choose by space instead';
+    document.getElementById('spaceStepTitle').textContent = 'Select Agent';
+    renderAllAgents();
+  } else {
+    state.selectionMode = 'space';
+    document.getElementById('spaceMode').style.display = '';
+    document.getElementById('agentMode').style.display = 'none';
+    document.getElementById('modeToggleBtn').textContent = 'Choose by agent instead';
+    document.getElementById('spaceStepTitle').textContent = 'Select Space';
+  }
+}
+
+// -- Agent-first: render all agents with status --
+function renderAllAgents() {
+  const ul = document.getElementById('allAgentList');
+  ul.innerHTML = '';
+  const onlineOnly = document.getElementById('onlineOnlyFilter').checked;
+  const hasSpacesOnly = document.getElementById('hasSpacesFilter').checked;
+  let agents = state.allAgents;
+  if (onlineOnly) {
+    agents = agents.filter(a => a.status === 'active');
+  }
+  if (hasSpacesOnly) {
+    agents = agents.filter(a => (a.spaces || []).length > 0);
+  }
+  if (agents.length === 0) {
+    ul.innerHTML = '<li class="disabled">No agents found</li>';
+    return;
+  }
+  agents.forEach(a => {
+    const li = document.createElement('li');
+    li.innerHTML = statusDotHtml(a.status)
+      + '<div class="agent-name">' + escHtml(a.name)
+      + '<div class="spaces-list">Spaces: ' + escHtml((a.spaces || []).join(', ') || 'none') + '</div>'
+      + '</div>'
+      + '<span class="meta">' + escHtml(a.type || '') + '</span>';
+    li.onclick = () => selectAgentFirst(a);
+    ul.appendChild(li);
+  });
+}
+
+function selectAgentFirst(agent) {
+  state.agent = agent.name;
+  state.agentData = agent;
+  const spaces = agent.spaces || [];
+  if (spaces.length === 0) {
+    showError('spaceError', 'This agent is not associated with any space');
+    return;
+  }
+  if (spaces.length === 1) {
+    state.space = spaces[0];
+    showConfirm();
+  } else {
+    // Multiple spaces — let user pick
+    document.getElementById('agentSpaceName').textContent = agent.name;
+    const ul = document.getElementById('agentSpaceList');
+    ul.innerHTML = '';
+    spaces.forEach(sp => {
+      const li = document.createElement('li');
+      li.textContent = sp;
+      li.onclick = () => { state.space = sp; showConfirm(); };
+      ul.appendChild(li);
+    });
+    showStep('agent-space');
+  }
+}
+
+// -- Step 3 space-first: select space, load its agents --
+function selectSpace(name) {
+  state.space = name;
+  loadSpaceAgents(name);
+}
+
+// -- Step 4: Agent selection (space-first mode) --
+async function loadSpaceAgents(space) {
+  try {
+    const resp = await fetch('/api/spaces/' + encodeURIComponent(space) + '/agents', {
+      headers: {"Authorization": "Bearer " + state.shortToken},
+    });
+    const agents = await resp.json();
+    if (!resp.ok || !Array.isArray(agents)) {
+      showStep('agent');
+      showError('agentError', 'Failed to load agents');
+      return;
+    }
+    state.spaceAgents = agents;
+    renderSpaceAgents();
+  } catch (err) {
+    showStep('agent');
+    showError('agentError', 'Failed to load agents: ' + err.message);
+  }
+}
+
+function renderSpaceAgents() {
+  const ul = document.getElementById('agentList');
+  ul.innerHTML = '';
+  hideError('agentError');
+  const onlineOnly = document.getElementById('onlineOnlyFilterSpace').checked;
+  let agents = state.spaceAgents;
+  if (onlineOnly) {
+    agents = agents.filter(a => a.status === 'active');
+  }
+  if (agents.length === 0) {
+    showStep('agent');
+    if (onlineOnly && state.spaceAgents.length > 0) {
+      showError('agentError', 'No online agents in this space. Uncheck the filter to see all.');
+    } else {
+      showError('agentError', 'No agents in this space');
+    }
+    return;
+  }
+  if (agents.length === 1 && onlineOnly) {
+    // Auto-select — skip showing the agent step entirely
+    selectAgent(agents[0]);
+    return;
+  }
+  showStep('agent');
+  agents.forEach(a => {
+    const li = document.createElement('li');
+    li.innerHTML = statusDotHtml(a.status)
+      + '<span class="agent-name">' + escHtml(a.name) + '</span>'
+      + '<span class="meta">' + escHtml(a.type || '') + '</span>';
+    li.onclick = () => selectAgent(a);
+    ul.appendChild(li);
+  });
+}
+
+function selectAgent(agent) {
+  state.agent = agent.name;
+  state.agentData = agent;
+  showConfirm();
+}
+
+function skipAgent() {
+  state.agent = null;
+  state.agentData = null;
+  showConfirm();
+}
+
+// -- Proxy env var extraction --
+function extractProxyEnvVars(agentData) {
+  if (!agentData) return '';
+  const envVars = (agentData.additional_details || {}).runner_settings || {};
+  const vars = envVars.environment_variables || {};
+  const parts = [];
+  PROXY_VAR_NAMES.forEach(name => {
+    if (vars[name]) {
+      parts.push('export ' + name + '=' + vars[name]);
+    }
+  });
+  return parts.join('; ');
+}
+
+// -- Profile name derivation --
+function deriveProfileName() {
+  if (INITIAL_PROFILE) return INITIAL_PROFILE;
+  const parts = [];
+  try {
+    const hostname = new URL(state.torqueUrl).hostname;
+    // First subdomain or first part before '.'
+    const hostParts = hostname.split('.');
+    if (hostParts.length > 0) parts.push(hostParts[0]);
+  } catch (_) {}
+  if (state.space) parts.push(state.space);
+  if (state.agent) parts.push(state.agent);
+  return parts.join('-').toLowerCase().replace(/[^a-z0-9_-]/g, '-').replace(/-{2,}/g, '-');
+}
+
+// -- Step 5: Confirm --
+function showConfirm() {
+  showStep('confirm');
+  hideError('confirmError');
+  const rows = [
+    ['URL', state.torqueUrl],
+    ['Account', state.account || '(default)'],
+    ['Space', state.space],
+    ['Agent', state.agent || '(none)'],
+  ];
+  const table = document.getElementById('summaryTable');
+  table.innerHTML = rows.map(([k, v]) => '<tr><td>' + k + '</td><td>' + escHtml(v) + '</td></tr>').join('');
+
+  // Pre-fill profile name
+  document.getElementById('profileNameInput').value = deriveProfileName();
+
+  // Extract and show proxy init commands
+  state.initCommands = extractProxyEnvVars(state.agentData);
+  const preview = document.getElementById('initCommandsPreview');
+  const initInput = document.getElementById('initCommandsInput');
+  if (state.initCommands) {
+    initInput.value = state.initCommands;
+    preview.style.display = '';
+  } else {
+    initInput.value = '';
+    preview.style.display = '';
+  }
+}
+
+async function saveAndFinish() {
+  hideError('confirmError');
+
+  // Validate profile name
+  const profileName = document.getElementById('profileNameInput').value.trim();
+  if (!profileName) {
+    showError('confirmError', 'Profile name is required');
+    return;
+  }
+
+  const btn = document.getElementById('saveBtn');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>Saving...';
+
+  try {
+    let longToken = state.isLongToken ? state.shortToken : null;
+    let tokenId = null;
+
+    if (!longToken) {
+      const genResp = await fetch('/api/generate-token', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({token: state.shortToken, space: state.space}),
+      });
+      const genData = await genResp.json();
+      if (!genResp.ok) {
+        showError('confirmError', genData.error || 'Token generation failed');
+        btn.disabled = false;
+        btn.textContent = 'Save & Finish';
+        return;
+      }
+      longToken = genData.access_token;
+      tokenId = genData.token_id;
+    }
+
+    const description = document.getElementById('descriptionInput').value.trim();
+
+    const resp = await fetch('/api/complete', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        token: longToken,
+        token_id: tokenId,
+        space: state.space,
+        agent: state.agent,
+        account: state.account,
+        torque_url: state.torqueUrl,
+        profile_name: profileName,
+        description: description || undefined,
+        init_commands: document.getElementById('initCommandsInput').value.trim() || undefined,
+      }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) {
+      showError('confirmError', data.error || 'Save failed');
+      btn.disabled = false;
+      btn.textContent = 'Save & Finish';
+      return;
+    }
+
+    showStep('done');
+    document.getElementById('savedPath').textContent = data.config_path ? ('Saved to: ' + data.config_path) : '';
+  } catch (err) {
+    showError('confirmError', 'Error: ' + err.message);
+    btn.disabled = false;
+    btn.textContent = 'Save & Finish';
+  }
+}
+
+// -- Helpers --
+function statusDotHtml(status) {
+  const cls = status === 'active' ? 'status-active'
+    : status === 'tentative' ? 'status-tentative'
+    : status === 'error' ? 'status-error'
+    : 'status-unknown';
+  const label = status || 'unknown';
+  return '<span class="status-dot ' + cls + '" title="' + escHtml(label) + '"></span>';
+}
+
+function escHtml(str) {
+  const d = document.createElement('div');
+  d.textContent = str || '';
+  return d.innerHTML;
+}
+</script>
+</body>
+</html>

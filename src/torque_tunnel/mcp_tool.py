@@ -31,6 +31,7 @@ from mcp.types import (
 from .torque_client import TorqueClient
 from . import croc_manager
 from . import config as config_module
+from . import auth as auth_module
 
 
 # Shared compiled patterns for filtering grain/execution logs.
@@ -1784,6 +1785,23 @@ Use `wait` to avoid tight polling. Typical: wait=10, repeat until completed.""",
                 "required": [],
             },
         ),
+        Tool(
+            name="login",
+            description="""Interactively login to Torque and configure space/agent. Opens a browser window where the user can authenticate with email/password or paste an existing token, then select account, space, and agent. The selections are saved to the config file for future use. Use this when torque_token is missing or needs to be refreshed.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "torque_url": {
+                        "type": "string",
+                        "description": "Torque URL to authenticate against. Uses the configured URL if not specified.",
+                    },
+                    "profile": {
+                        "type": "string",
+                        "description": "Save login results to this profile instead of top-level config.",
+                    },
+                },
+            },
+        ),
     ]
 
 
@@ -1794,6 +1812,10 @@ async def call_tool(name: str, arguments: dict):
     # Handle list_profiles (no profile resolution needed)
     if name == "list_profiles":
         return await handle_list_profiles()
+
+    # Handle login (no profile resolution needed)
+    if name == "login":
+        return await handle_login(arguments)
     
     # Resolve profile for execution tools: inject profile values into arguments
     # and create an effective_config overlay for config-only keys
@@ -1877,6 +1899,57 @@ async def handle_list_profiles():
             lines.append(f"  Overrides: {overrides}")
     
     return [TextContent(type="text", text="\n".join(lines))]
+
+
+async def handle_login(arguments: dict):
+    """Handle the login tool — open browser for interactive Torque login."""
+    global _loaded_config
+    profile_name = arguments.get("profile")
+
+    # Resolve torque_url: argument > profile > config (may be None — UI will prompt)
+    torque_url = arguments.get("torque_url")
+    if not torque_url and profile_name and _loaded_config:
+        try:
+            pv = config_module.resolve_profile(_loaded_config, profile_name)
+            torque_url = pv.get("torque_url")
+        except ValueError:
+            pass
+    if not torque_url:
+        torque_url = _config.get("torque_url")
+
+    config_path = config_module.find_config_file()
+
+    try:
+        auth_server = auth_module.TorqueAuthServer(
+            torque_url=torque_url or None,
+            config_path=str(config_path) if config_path else None,
+            profile_name=profile_name,
+        )
+        result = await auth_server.run()
+    except TimeoutError as e:
+        return [TextContent(type="text", text=f"Error: {e}")]
+    except Exception as e:
+        return [TextContent(type="text", text=f"Error during login: {e}")]
+
+    if result is None:
+        return [TextContent(type="text", text="Login cancelled.")]
+
+    # Reload config after save
+    _loaded_config = config_module.load_config(str(config_path) if config_path else None)
+    file_defaults = config_module.get_defaults(_loaded_config)
+    for key, value in file_defaults.items():
+        if value is not None:
+            _config[key] = value
+
+    # Build summary
+    parts = [f"Login successful! Configuration saved."]
+    if result.account:
+        parts.append(f"Account: {result.account}")
+    parts.append(f"Space: {result.space}")
+    if result.agent:
+        parts.append(f"Agent: {result.agent}")
+
+    return [TextContent(type="text", text="\n".join(parts))]
 
 
 async def handle_run_on_tunneled_ssh(arguments: dict, config: dict = None):
@@ -4352,6 +4425,9 @@ PERFORMANCE TIP:
     # profiles subcommand (list configuration profiles)
     subparsers.add_parser("profiles", parents=[common_parser], help="List available configuration profiles")
     
+    # login subcommand (interactive Torque login)
+    subparsers.add_parser("login", parents=[common_parser], help="Login to Torque interactively (opens browser)")
+
     # ssh subcommand (remote command via SSH)
     ssh_parser = subparsers.add_parser("ssh", parents=[common_parser], help="Execute a command on remote server via SSH")
     ssh_parser.add_argument("cmd", nargs='?', help="The shell command to execute (optional if --upload used)")
@@ -4502,6 +4578,36 @@ PERFORMANCE TIP:
             extends = f"\n    Extends: {p['extends']}" if p['extends'] else ""
             overrides = ", ".join(p['overrides']) if p['overrides'] else "(none)"
             print(f"  {p['name']:<20}{desc}{extends}\n{'':20}    Overrides: {overrides}\n")
+    elif args.command == "login":
+        # Interactive login
+        torque_url = _config.get("torque_url")
+        profile_name = getattr(args, 'profile', None)
+        if profile_name and _loaded_config:
+            try:
+                pv = config_module.resolve_profile(_loaded_config, profile_name)
+                torque_url = pv.get("torque_url", torque_url)
+            except ValueError:
+                pass
+        config_path = config_module.find_config_file(getattr(args, 'config', None))
+
+        async def run_login():
+            auth_server = auth_module.TorqueAuthServer(
+                torque_url=torque_url or None,
+                config_path=str(config_path) if config_path else None,
+                profile_name=profile_name,
+            )
+            result = await auth_server.run()
+            if result is None:
+                print("Login cancelled.", file=sys.stderr)
+                return
+            print(f"\nLogin successful!")
+            if result.account:
+                print(f"  Account: {result.account}")
+            print(f"  Space:   {result.space}")
+            if result.agent:
+                print(f"  Agent:   {result.agent}")
+
+        asyncio.run(run_login())
     else:
         # CLI mode - run the appropriate command
         asyncio.run(cli_dispatch(args))
