@@ -51,7 +51,7 @@ PROFILE_TO_TOOL_ARG = {
 VALID_CONFIG_KEYS = set(CONFIG_KEY_MAP.keys())
 
 # Metadata-only keys in profiles (not config values)
-_PROFILE_META_KEYS = {"description", "extends", "show_values"}
+_PROFILE_META_KEYS = {"description", "extends", "expose_values"}
 
 # Keys managed by the login flow (not regular config values, but stored in YAML)
 _LOGIN_META_KEYS = {"torque_token_id"}
@@ -240,7 +240,7 @@ def inject_profile_into_arguments(arguments: dict, profile_values: dict) -> dict
 def list_profiles(config: dict) -> list[dict]:
     """List all available profiles with descriptions and overridden keys.
 
-    Returns list of dicts with keys: 'name', 'description', 'extends', 'overrides', 'show_values', 'values'.
+    Returns list of dicts with keys: 'name', 'description', 'extends', 'overrides', 'expose_values', 'values'.
     """
     profiles = config.get("profiles", {})
     result = []
@@ -251,7 +251,7 @@ def list_profiles(config: dict) -> list[dict]:
             "description": profile.get("description", ""),
             "extends": profile.get("extends"),
             "overrides": override_keys,
-            "show_values": profile.get("show_values", False),
+            "expose_values": profile.get("expose_values", False),
             "values": {k: profile[k] for k in override_keys},
         }
         result.append(entry)
@@ -266,9 +266,9 @@ def get_top_level_defaults(config: dict) -> dict:
     return {k: config[k] for k in VALID_CONFIG_KEYS if k in config}
 
 
-def get_top_level_show_values(config: dict) -> bool:
-    """Get the top-level show_values setting (default False)."""
-    return config.get("show_values", False)
+def get_top_level_expose_values(config: dict) -> bool:
+    """Get the top-level expose_values setting (default False)."""
+    return config.get("expose_values", False)
 
 
 def update_config_file(

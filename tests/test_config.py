@@ -361,18 +361,18 @@ class TestListProfiles:
         # Metadata keys excluded
         assert "description" not in lab_base["overrides"]
         assert "extends" not in lab_base["overrides"]
-        assert "show_values" not in lab_base["overrides"]
+        assert "expose_values" not in lab_base["overrides"]
 
-    def test_show_values_defaults_to_false(self, sample_config):
+    def test_expose_values_defaults_to_false(self, sample_config):
         result = config_module.list_profiles(sample_config)
         for p in result:
-            assert p["show_values"] is False
+            assert p["expose_values"] is False
 
-    def test_show_values_true_in_profile(self):
+    def test_expose_values_true_in_profile(self):
         config = {
             "profiles": {
                 "visible": {
-                    "show_values": True,
+                    "expose_values": True,
                     "torque_url": "https://example.com",
                     "torque_token": "tok123",
                 },
@@ -384,10 +384,10 @@ class TestListProfiles:
         result = config_module.list_profiles(config)
         visible = next(p for p in result if p["name"] == "visible")
         hidden = next(p for p in result if p["name"] == "hidden")
-        assert visible["show_values"] is True
-        assert hidden["show_values"] is False
-        # show_values not in overrides
-        assert "show_values" not in visible["overrides"]
+        assert visible["expose_values"] is True
+        assert hidden["expose_values"] is False
+        # expose_values not in overrides
+        assert "expose_values" not in visible["overrides"]
 
     def test_values_dict_included(self):
         config = {
@@ -409,7 +409,7 @@ class TestListProfiles:
                 "p1": {
                     "description": "desc",
                     "extends": "other",
-                    "show_values": True,
+                    "expose_values": True,
                     "torque_url": "https://example.com",
                 },
                 "other": {"host": "1.2.3.4"},
@@ -419,7 +419,7 @@ class TestListProfiles:
         p1 = next(p for p in result if p["name"] == "p1")
         assert "description" not in p1["values"]
         assert "extends" not in p1["values"]
-        assert "show_values" not in p1["values"]
+        assert "expose_values" not in p1["values"]
         assert "torque_url" in p1["values"]
 
     def test_empty_config(self):
@@ -432,18 +432,18 @@ class TestListProfiles:
 
 
 # ============================================================================
-# get_top_level_show_values
+# get_top_level_expose_values
 # ============================================================================
 
-class TestGetTopLevelShowValues:
+class TestGetTopLevelExposeValues:
     def test_defaults_to_false(self):
-        assert config_module.get_top_level_show_values({}) is False
+        assert config_module.get_top_level_expose_values({}) is False
 
     def test_returns_true_when_set(self):
-        assert config_module.get_top_level_show_values({"show_values": True}) is True
+        assert config_module.get_top_level_expose_values({"expose_values": True}) is True
 
     def test_returns_false_when_explicitly_false(self):
-        assert config_module.get_top_level_show_values({"show_values": False}) is False
+        assert config_module.get_top_level_expose_values({"expose_values": False}) is False
 
 
 # ============================================================================

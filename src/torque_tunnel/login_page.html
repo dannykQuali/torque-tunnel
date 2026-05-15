@@ -234,6 +234,13 @@
         </label>
         <div class="hint">When set, this profile is used automatically without specifying --profile.</div>
       </div>
+      <div style="margin-top:8px; margin-bottom:4px;">
+        <label style="display:flex; align-items:center; gap:8px; cursor:pointer; font-weight:normal;">
+          <input type="checkbox" id="exposeValuesToggle">
+          Expose values to agent
+        </label>
+        <div class="hint">When set, the calling AI agent can see this profile's connection details (tokens, URLs, etc.).</div>
+      </div>
       <div id="confirmError" class="error" style="margin-top:12px;"></div>
       <div class="btn-row">
         <button class="btn-cancel" onclick="doCancel()">Cancel</button>
@@ -292,11 +299,18 @@ let cachedHasDefaultProfile = false;  // whether config already has a default_pr
 // -- Init: decide first step --
 (function init() {
   if (INITIAL_TORQUE_URL) {
-    document.getElementById('subtitleLine').innerHTML = 'Connect to <strong>' + escHtml(INITIAL_TORQUE_URL) + '</strong>';
-    showStep('login', false);
-  } else {
-    showStep('url', false);
+    // Pre-select the URL in the dropdown (or set custom)
+    const sel = document.getElementById('urlSelect');
+    const match = Array.from(sel.options).find(o => o.value === INITIAL_TORQUE_URL);
+    if (match) {
+      sel.value = INITIAL_TORQUE_URL;
+    } else {
+      sel.value = '__custom__';
+      document.getElementById('urlCustom').value = INITIAL_TORQUE_URL;
+      document.getElementById('urlCustom').style.display = '';
+    }
   }
+  showStep('url', false);
   // Fetch profiles in background
   loadProfiles();
 })();
@@ -842,6 +856,9 @@ function showConfirm() {
   // Default profile toggle: checked if no default_profile exists yet
   document.getElementById('setDefaultToggle').checked = !cachedHasDefaultProfile;
 
+  // Expose values toggle: default unchecked (opt-in)
+  document.getElementById('exposeValuesToggle').checked = false;
+
   // Extract and show proxy init commands
   state.initCommands = extractProxyEnvVars(state.agentData);
   const preview = document.getElementById('initCommandsPreview');
@@ -903,6 +920,7 @@ async function saveAndFinish() {
         description: description || undefined,
         init_commands: document.getElementById('initCommandsInput').value.trim() || undefined,
         set_as_default: document.getElementById('setDefaultToggle').checked,
+        expose_values: document.getElementById('exposeValuesToggle').checked,
       }),
     });
     const data = await resp.json();

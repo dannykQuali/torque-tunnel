@@ -2005,7 +2005,7 @@ async def handle_list_profiles():
     # Show base configuration
     top_defaults = config_module.get_top_level_defaults(_loaded_config)
     if top_defaults:
-        show_base_values = config_module.get_top_level_show_values(_loaded_config)
+        show_base_values = config_module.get_top_level_expose_values(_loaded_config)
         lines.append("**Base configuration:**")
         if show_base_values:
             for key in sorted(top_defaults):
@@ -2027,7 +2027,7 @@ async def handle_list_profiles():
         desc = f" — {p['description']}" if p['description'] else ""
         extends = f" (extends: {p['extends']})" if p['extends'] else ""
         lines.append(f"- **{p['name']}**{default_marker}{desc}{extends}")
-        if p['show_values']:
+        if p['expose_values']:
             for key in p['overrides']:
                 lines.append(f"  {key}: {p['values'][key]}")
         else:

@@ -36,7 +36,7 @@ default_profile: my-profile
 # ── Display control ─────────────────────────────────────────────────
 # Controls whether the list_profiles tool/command shows values or just
 # key names at this level. Default: false.
-# show_values: true
+# expose_values: true
 
 # ── Named profiles ──────────────────────────────────────────────────
 # Each profile overrides only the keys it specifies, on top of the
@@ -65,7 +65,7 @@ profiles:
     torque_space: different-space
     torque_agent: review2-agent
     # Show this profile's values in list_profiles output
-    show_values: true
+    expose_values: true
 ```
 
 ## Available Keys
@@ -95,7 +95,7 @@ These can appear at the top level and/or inside any profile:
 | Key | Default | Description |
 |-----|---------|-------------|
 | `default_profile` | *(none)* | Profile to apply automatically at startup when no `--profile` is given |
-| `show_values` | `false` | Whether `list_profiles` shows values or just key names for the base configuration |
+| `expose_values` | `false` | Whether `list_profiles` shows values or just key names for the base configuration |
 
 ### Profile metadata keys
 
@@ -105,9 +105,9 @@ These are recognized inside profiles but are not configuration values:
 |-----|-------------|
 | `description` | Human-readable description (shown in `list_profiles` output) |
 | `extends` | Parent profile name for single inheritance |
-| `show_values` | Whether `list_profiles` shows this profile's values or just key names (default: `false`) |
+| `expose_values` | Whether `list_profiles` shows this profile's values or just key names (default: `false`) |
 
-> **Note:** `show_values` is **not** inherited through `extends`. Each level (top-level and each profile) independently controls whether its own values are exposed.
+> **Note:** `expose_values` is **not** inherited through `extends`. Each level (top-level and each profile) independently controls whether its own values are exposed.
 
 ## Resolution Order
 

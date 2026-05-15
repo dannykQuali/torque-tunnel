@@ -414,6 +414,7 @@ class TorqueAuthServer:
         description = body.get("description", "")
         init_commands = body.get("init_commands", "")
         set_as_default = body.get("set_as_default", False)
+        expose_values = body.get("expose_values", False)
 
         if not long_token or not space:
             return web.json_response({"error": "token and space are required"}, status=400)
@@ -434,6 +435,7 @@ class TorqueAuthServer:
             updates["description"] = description
         if init_commands:
             updates["init_commands"] = init_commands
+        updates["expose_values"] = expose_values
 
         # Update self for revocation context
         self.torque_url = torque_url.rstrip("/")
