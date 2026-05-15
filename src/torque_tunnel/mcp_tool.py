@@ -934,8 +934,131 @@ _config = {
     "container_idle_timeout": 7200,
 }
 
+# Default values for _config keys (used to reset removed keys on hot-reload)
+_CONFIG_DEFAULTS = dict(_config)
+
 # Loaded config file data (for runtime profile resolution)
 _loaded_config: dict = {}
+
+# Hot-reload state
+_config_file_path = None          # Path object of the watched config file
+_config_file_mtime: float = 0.0   # Last known mtime
+_cli_overrides: set = set()       # Config keys set via CLI (won't be overwritten on reload)
+_cli_profile: Optional[str] = None          # Profile from --profile CLI arg
+_config_explicit_path: Optional[str] = None  # Config path from --config CLI arg
+_config_error: Optional[str] = None  # Last config load/parse error (None = healthy)
+_default_profile_warning: Optional[str] = None  # Warning when default_profile references a non-existent profile
+
+
+def _reload_config() -> None:
+    """Reload config file and update _config for non-CLI-overridden keys.
+
+    Called by the file watcher and after the setup tool saves.
+    Respects CLI overrides: keys explicitly set via CLI args are never changed.
+    Sets _config_error on failure (tools will refuse to run until fixed).
+    """
+    global _loaded_config, _config_file_path, _config_file_mtime, _config_error, _default_profile_warning
+
+    try:
+        loaded = config_module.load_config(_config_explicit_path)
+    except Exception as e:
+        _config_error = f"Failed to load config file: {e}"
+        _default_profile_warning = None
+        # Update mtime so we don't retry every 2s with the same broken file
+        path = config_module.find_config_file(_config_explicit_path)
+        if path:
+            _config_file_path = path
+            try:
+                _config_file_mtime = path.stat().st_mtime
+            except OSError:
+                pass
+        raise
+
+    _loaded_config = loaded
+
+    # Update file tracking
+    path = config_module.find_config_file(_config_explicit_path)
+    if path:
+        _config_file_path = path
+        try:
+            _config_file_mtime = path.stat().st_mtime
+        except OSError:
+            pass
+
+    # Compute effective file values (defaults + active profile)
+    file_defaults = config_module.get_defaults(_loaded_config)
+
+    profile = _cli_profile
+    is_default_profile = False
+    if profile is None and _loaded_config:
+        profile = config_module.get_default_profile_name(_loaded_config)
+        if profile:
+            is_default_profile = True
+
+    default_profile_warning = None
+    if profile and _loaded_config:
+        try:
+            profile_values = config_module.resolve_profile(_loaded_config, profile)
+            effective = config_module.apply_profile_to_config(file_defaults, profile_values)
+        except ValueError as e:
+            if is_default_profile:
+                # Bad default_profile — soft warning, don't block tools with explicit profile
+                default_profile_warning = f"default_profile in config.yaml: {e}"
+            else:
+                # Bad --profile CLI arg — hard error
+                _config_error = f"Profile resolution failed: {e}"
+                _default_profile_warning = None
+                raise ValueError(_config_error)
+            effective = file_defaults
+    else:
+        effective = file_defaults
+
+    # Update _config: reset non-CLI keys to defaults, then apply file values
+    for key, default_value in _CONFIG_DEFAULTS.items():
+        if key not in _cli_overrides:
+            _config[key] = effective.get(key, default_value)
+
+    # Clear hard errors on successful load; update soft warning
+    _config_error = None
+    _default_profile_warning = default_profile_warning
+
+
+async def _watch_config_file() -> None:
+    """Background task: poll config file for changes and hot-reload."""
+    global _config_file_path, _config_file_mtime, _config_error, _default_profile_warning, _loaded_config
+    while True:
+        await asyncio.sleep(2)
+
+        # If no config file known yet, try to find one (might have been created)
+        if not _config_file_path:
+            path = config_module.find_config_file(_config_explicit_path)
+            if path:
+                _config_file_path = path
+                _config_file_mtime = 0.0  # Force reload on next iteration
+            continue
+
+        try:
+            current_mtime = _config_file_path.stat().st_mtime
+        except OSError:
+            # File was removed/moved/renamed — reset to defaults
+            print(f"Config file {_config_file_path} no longer exists, resetting to defaults.", file=sys.stderr)
+            _config_file_path = None
+            _config_file_mtime = 0.0
+            _loaded_config = {}
+            for key, default_value in _CONFIG_DEFAULTS.items():
+                if key not in _cli_overrides:
+                    _config[key] = default_value
+            _config_error = None
+            _default_profile_warning = None
+            continue
+
+        if current_mtime != _config_file_mtime:
+            try:
+                _reload_config()
+                print(f"Config reloaded from {_config_file_path}", file=sys.stderr)
+            except Exception as e:
+                # _config_error is already set by _reload_config
+                print(f"Config reload failed (tools will fail until fixed): {e}", file=sys.stderr)
 
 
 # Persistent container session state
@@ -1816,11 +1939,19 @@ async def call_tool(name: str, arguments: dict):
     # Handle setup (no profile resolution needed)
     if name == "setup":
         return await handle_setup(arguments)
+
+    # Block execution tools if config file has errors
+    if _config_error:
+        return [TextContent(type="text", text=f"Error: Config file is broken — {_config_error}\nFix the config file or run the 'setup' tool to reconfigure.")]
     
     # Resolve profile for execution tools: inject profile values into arguments
     # and create an effective_config overlay for config-only keys
     effective_config = _config
     profile_name = arguments.pop("profile", None)
+
+    # Block tools that would use the broken default profile (but allow explicit profile)
+    if not profile_name and _default_profile_warning:
+        return [TextContent(type="text", text=f"Error: {_default_profile_warning}\nSpecify a profile explicitly (e.g. profile='cisco-review1') or fix default_profile in config.yaml.")]
     if profile_name and _loaded_config:
         try:
             profile_values = config_module.resolve_profile(_loaded_config, profile_name)
@@ -1861,10 +1992,15 @@ async def call_tool(name: str, arguments: dict):
 
 async def handle_list_profiles():
     """Return the list of available configuration profiles with base config."""
-    if not _loaded_config:
+    if not _config_file_path and not _loaded_config:
         return [TextContent(type="text", text="No configuration file found. Create ~/.torque-tunnel/config.yaml to define profiles.")]
     
     lines = []
+
+    # Warn about broken default_profile
+    if _default_profile_warning:
+        lines.append(f"**Warning:** {_default_profile_warning}")
+        lines.append("")
     
     # Show base configuration
     top_defaults = config_module.get_top_level_defaults(_loaded_config)
@@ -1934,12 +2070,8 @@ async def handle_setup(arguments: dict):
     if result is None:
         return [TextContent(type="text", text="Setup cancelled.")]
 
-    # Reload config after save
-    _loaded_config = config_module.load_config(str(config_path) if config_path else None)
-    file_defaults = config_module.get_defaults(_loaded_config)
-    for key, value in file_defaults.items():
-        if value is not None:
-            _config[key] = value
+    # Reload config immediately (watcher would also pick it up within ~2s)
+    _reload_config()
 
     # Build summary
     parts = [f"Setup complete! Configuration saved."]
@@ -4489,23 +4621,36 @@ PERFORMANCE TIP:
     args = parser.parse_args()
     
     # Load config file and store globally for runtime profile resolution
-    global _loaded_config
-    _loaded_config = config_module.load_config(getattr(args, 'config', None))
+    global _loaded_config, _config_error, _default_profile_warning
+    try:
+        _loaded_config = config_module.load_config(getattr(args, 'config', None))
+    except Exception as e:
+        _config_error = f"Failed to load config file: {e}"
+        print(f"Warning: {_config_error}. Tools will fail until the config is fixed.", file=sys.stderr)
+        _loaded_config = {}
     
     # Apply config file defaults as base values
     file_defaults = config_module.get_defaults(_loaded_config)
     
     # Apply startup profile (--profile or default_profile from config) on top of defaults
     startup_profile = getattr(args, 'profile', None)
+    is_default_profile = False
     if not startup_profile and _loaded_config:
         startup_profile = config_module.get_default_profile_name(_loaded_config)
+        if startup_profile:
+            is_default_profile = True
     if startup_profile and _loaded_config:
         try:
             profile_values = config_module.resolve_profile(_loaded_config, startup_profile)
             file_defaults_with_profile = config_module.apply_profile_to_config(file_defaults, profile_values)
         except ValueError as e:
-            print(f"Error: {e}", file=sys.stderr)
-            sys.exit(1)
+            if is_default_profile:
+                _default_profile_warning = f"default_profile in config.yaml: {e}"
+                print(f"Warning: {_default_profile_warning}. Tools without explicit profile will fail.", file=sys.stderr)
+            else:
+                _config_error = f"Profile resolution failed: {e}"
+                print(f"Warning: {_config_error}. Tools will fail until the config is fixed.", file=sys.stderr)
+            file_defaults_with_profile = file_defaults
     else:
         file_defaults_with_profile = file_defaults
     
@@ -4537,6 +4682,34 @@ PERFORMANCE TIP:
     _config["verbose"] = args.verbose or file_defaults_with_profile.get("verbose", False)
     _config["container_idle_timeout"] = args.container_idle_timeout if args.container_idle_timeout != 7200 else file_defaults_with_profile.get("container_idle_timeout", 7200)
     
+    # Record CLI overrides for hot-reload (these keys won't be changed when config file is reloaded)
+    global _cli_overrides, _cli_profile, _config_explicit_path, _config_file_path, _config_file_mtime
+    _config_explicit_path = getattr(args, 'config', None)
+    _cli_profile = getattr(args, 'profile', None)
+    _cli_overrides.clear()
+    if args.torque_url: _cli_overrides.add("torque_url")
+    if args.torque_token: _cli_overrides.add("torque_token")
+    if args.torque_space: _cli_overrides.add("torque_space")
+    if args.torque_agent: _cli_overrides.add("default_agent")
+    if args.ssh_key or args.ssh_password:
+        _cli_overrides.add("default_ssh_key")
+        _cli_overrides.add("default_ssh_password")
+    if args.host: _cli_overrides.add("default_target_ip")
+    if args.ssh_user: _cli_overrides.add("default_ssh_user")
+    if args.init_commands: _cli_overrides.add("init_commands")
+    if args.finally_commands: _cli_overrides.add("finally_commands")
+    if args.auto_delete_environments: _cli_overrides.add("auto_delete_environments")
+    if args.verbose: _cli_overrides.add("verbose")
+    if args.container_idle_timeout != 7200: _cli_overrides.add("container_idle_timeout")
+    # Track config file for hot-reload watcher
+    cfg_path = config_module.find_config_file(_config_explicit_path)
+    if cfg_path:
+        _config_file_path = cfg_path
+        try:
+            _config_file_mtime = cfg_path.stat().st_mtime
+        except OSError:
+            pass
+    
     # Warn about missing recommended config (but don't block startup — AI agent can supply at runtime)
     missing = []
     if not _config["torque_url"]:
@@ -4556,12 +4729,20 @@ PERFORMANCE TIP:
     if args.command is None or args.command == "serve":
         # Run as MCP server
         async def run_server():
-            async with stdio_server() as (read_stream, write_stream):
-                await server.run(
-                    read_stream,
-                    write_stream,
-                    server.create_initialization_options(),
-                )
+            watcher = asyncio.create_task(_watch_config_file())
+            try:
+                async with stdio_server() as (read_stream, write_stream):
+                    await server.run(
+                        read_stream,
+                        write_stream,
+                        server.create_initialization_options(),
+                    )
+            finally:
+                watcher.cancel()
+                try:
+                    await watcher
+                except asyncio.CancelledError:
+                    pass
         asyncio.run(run_server())
     elif args.command == "profiles":
         # List profiles

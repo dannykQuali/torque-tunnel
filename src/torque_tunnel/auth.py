@@ -69,7 +69,7 @@ class TorqueAuthServer:
         torque_url: Optional[str] = None,
         config_path: Optional[str] = None,
         profile_name: Optional[str] = None,
-        timeout: int = 300,
+        timeout: int = 1800,
     ):
         self.torque_url = torque_url.rstrip("/") if torque_url else ""
         self.config_path = config_path
@@ -176,11 +176,11 @@ class TorqueAuthServer:
         return web.json_response({"status": "cancelled"})
 
     async def _handle_list_profiles(self, request: web.Request) -> web.Response:
-        """Return existing profiles (name, description, torque_url, has_token) for reuse."""
+        """Return existing profiles and whether a default_profile is set."""
         try:
             config = config_module.load_config(self.config_path)
         except Exception:
-            return web.json_response([])
+            return web.json_response({"profiles": [], "has_default_profile": False})
         profiles = config.get("profiles", {})
         result = []
         for name, p in profiles.items():
@@ -190,7 +190,10 @@ class TorqueAuthServer:
                 "torque_url": p.get("torque_url", ""),
                 "has_token": bool(p.get("torque_token")),
             })
-        return web.json_response(result)
+        return web.json_response({
+            "profiles": result,
+            "has_default_profile": bool(config.get("default_profile")),
+        })
 
     async def _handle_use_profile(self, request: web.Request) -> web.Response:
         """Reuse an existing profile's token. Validates it and returns spaces."""
@@ -410,6 +413,7 @@ class TorqueAuthServer:
         profile_name = body.get("profile_name", "") or self.profile_name
         description = body.get("description", "")
         init_commands = body.get("init_commands", "")
+        set_as_default = body.get("set_as_default", False)
 
         if not long_token or not space:
             return web.json_response({"error": "token and space are required"}, status=400)
@@ -445,6 +449,12 @@ class TorqueAuthServer:
                 profile_name=self.profile_name,
                 explicit_path=self.config_path,
             )
+            if set_as_default and self.profile_name:
+                config_module.update_config_file(
+                    {"default_profile": self.profile_name},
+                    profile_name=None,
+                    explicit_path=self.config_path,
+                )
         except Exception as e:
             return web.json_response({"error": f"Failed to save config: {e}"}, status=500)
 

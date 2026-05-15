@@ -221,6 +221,26 @@ class TestUpdateConfigFileProfiles:
         assert data["torque_token"] == "top-level-token"
         assert data["profiles"]["lab"]["torque_token"] == "profile-token"
 
+    def test_new_top_level_key_inserted_before_profiles(self, tmp_config_dir):
+        path = tmp_config_dir / "config.yaml"
+        path.write_text(
+            "torque_url: https://example.com\n"
+            "profiles:\n"
+            "  lab:\n"
+            "    torque_token: tok\n",
+            encoding="utf-8",
+        )
+
+        config_module.update_config_file(
+            {"default_profile": "lab"},
+            explicit_path=str(path),
+        )
+        # Verify key ordering in the raw YAML text
+        raw = path.read_text(encoding="utf-8")
+        dp_pos = raw.index("default_profile:")
+        prof_pos = raw.index("profiles:")
+        assert dp_pos < prof_pos, f"default_profile at {dp_pos} should come before profiles at {prof_pos}"
+
 
 # ============================================================================
 # update_config_file — round-trip preservation
@@ -310,7 +330,7 @@ class TestTorqueAuthServerInit:
 
     def test_default_timeout(self):
         s = TorqueAuthServer("https://example.com")
-        assert s.timeout == 300
+        assert s.timeout == 1800
 
     def test_custom_timeout(self):
         s = TorqueAuthServer("https://example.com", timeout=60)
@@ -767,6 +787,73 @@ try:
             assert auth_server.torque_url == "https://new-url.example.com"
             assert auth_server.profile_name == "p"
 
+        @pytest.mark.asyncio
+        async def test_set_as_default_true(self, client, csrf_headers, auth_server):
+            """When set_as_default is true, default_profile is set in config."""
+            resp = await client.post(
+                "/api/complete",
+                json={
+                    "token": "tok",
+                    "space": "sp",
+                    "profile_name": "my-default",
+                    "torque_url": "https://example.com",
+                    "set_as_default": True,
+                },
+                headers=csrf_headers,
+            )
+            assert resp.status == 200
+            cfg = config_module.load_config(auth_server.config_path)
+            assert cfg["default_profile"] == "my-default"
+
+        @pytest.mark.asyncio
+        async def test_set_as_default_false(self, client, csrf_headers, auth_server):
+            """When set_as_default is false, default_profile is not set."""
+            resp = await client.post(
+                "/api/complete",
+                json={
+                    "token": "tok",
+                    "space": "sp",
+                    "profile_name": "no-default",
+                    "torque_url": "https://example.com",
+                    "set_as_default": False,
+                },
+                headers=csrf_headers,
+            )
+            assert resp.status == 200
+            cfg = config_module.load_config(auth_server.config_path)
+            assert cfg.get("default_profile") is None
+
+        @pytest.mark.asyncio
+        async def test_set_as_default_preserves_existing(self, tmp_path):
+            """When set_as_default is false, existing default_profile is preserved."""
+            config_path = tmp_path / "config.yaml"
+            config_path.write_text(
+                "default_profile: old-prof\n"
+                "profiles:\n"
+                "  old-prof:\n"
+                "    torque_url: https://example.com\n"
+                "    torque_token: old-tok\n",
+                encoding="utf-8",
+            )
+            s = TorqueAuthServer(torque_url="https://example.com", config_path=str(config_path))
+            app = s._create_app()
+            headers = {"Content-Type": "application/json", "X-CSRF-Token": s._csrf_token}
+            async with TestClient(TestServer(app)) as c:
+                resp = await c.post(
+                    "/api/complete",
+                    json={
+                        "token": "tok",
+                        "space": "sp",
+                        "profile_name": "new-prof",
+                        "torque_url": "https://example.com",
+                        "set_as_default": False,
+                    },
+                    headers=headers,
+                )
+                assert resp.status == 200
+                cfg = config_module.load_config(str(config_path))
+                assert cfg["default_profile"] == "old-prof"
+
     class TestCancelEndpoint:
         @pytest.mark.asyncio
         async def test_cancel_sets_cancelled(self, client, csrf_headers, auth_server):
@@ -825,7 +912,8 @@ try:
             resp = await client.get("/api/profiles")
             assert resp.status == 200
             data = await resp.json()
-            assert isinstance(data, list)
+            assert data["profiles"] == []
+            assert data["has_default_profile"] is False
 
         @pytest.mark.asyncio
         async def test_returns_profiles(self, tmp_path):
@@ -846,13 +934,15 @@ try:
                 resp = await c.get("/api/profiles")
                 assert resp.status == 200
                 data = await resp.json()
-                assert len(data) == 2
-                prof1 = next(p for p in data if p["name"] == "my-prof")
+                profiles = data["profiles"]
+                assert len(profiles) == 2
+                prof1 = next(p for p in profiles if p["name"] == "my-prof")
                 assert prof1["description"] == "test profile"
                 assert prof1["torque_url"] == "https://example.com"
                 assert prof1["has_token"] is True
-                prof2 = next(p for p in data if p["name"] == "no-token")
+                prof2 = next(p for p in profiles if p["name"] == "no-token")
                 assert prof2["has_token"] is False
+                assert data["has_default_profile"] is False
 
         @pytest.mark.asyncio
         async def test_returns_empty_when_no_config_file(self):
@@ -862,7 +952,25 @@ try:
                 resp = await c.get("/api/profiles")
                 assert resp.status == 200
                 data = await resp.json()
-                assert data == []
+                assert data == {"profiles": [], "has_default_profile": False}
+
+        @pytest.mark.asyncio
+        async def test_has_default_profile_true_when_set(self, tmp_path):
+            config_path = tmp_path / "config.yaml"
+            config_path.write_text(
+                "default_profile: my-prof\n"
+                "profiles:\n"
+                "  my-prof:\n"
+                "    torque_url: https://example.com\n"
+                "    torque_token: tok\n",
+                encoding="utf-8",
+            )
+            s = TorqueAuthServer(torque_url="https://example.com", config_path=str(config_path))
+            app = s._create_app()
+            async with TestClient(TestServer(app)) as c:
+                resp = await c.get("/api/profiles")
+                data = await resp.json()
+                assert data["has_default_profile"] is True
 
     class TestUseProfileEndpoint:
         """Tests for POST /api/use-profile."""

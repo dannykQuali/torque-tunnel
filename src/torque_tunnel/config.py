@@ -321,7 +321,13 @@ def update_config_file(
         target = data
 
     for key, value in updates.items():
-        target[key] = value
+        if target is data and key not in data and "profiles" in data:
+            # Insert new top-level keys before the "profiles" block
+            keys = list(data.keys())
+            idx = keys.index("profiles")
+            data.insert(idx, key, value)
+        else:
+            target[key] = value
 
     with open(path, "w", encoding="utf-8") as f:
         ryaml.dump(data, f)
