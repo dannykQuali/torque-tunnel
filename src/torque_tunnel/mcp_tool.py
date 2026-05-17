@@ -1990,6 +1990,31 @@ async def call_tool(name: str, arguments: dict):
         return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
 
+def _format_profile_entry(p: dict, default_profile: str | None = None) -> list[str]:
+    """Format a single profile entry for display.
+
+    Args:
+        p: Profile dict with keys from config_module.list_profiles() or auth._build_profile_result():
+           'name', 'description', 'extends', 'overrides', 'expose_values', 'values', and optionally 'is_default'.
+        default_profile: Name of the default profile (from config).
+            If None, falls back to p.get('is_default', False) to determine the marker.
+    Returns:
+        List of formatted lines for this profile.
+    """
+    is_default = (p['name'] == default_profile) if default_profile is not None else p.get('is_default', False)
+    default_marker = " (default)" if is_default else ""
+    desc = f" — {p['description']}" if p['description'] else ""
+    extends = f" (extends: {p['extends']})" if p['extends'] else ""
+    lines = [f"- **{p['name']}**{default_marker}{desc}{extends}"]
+    if p['expose_values']:
+        for key in p['overrides']:
+            lines.append(f"  {key}: {p['values'][key]}")
+    else:
+        overrides = ", ".join(p['overrides']) if p['overrides'] else "(none)"
+        lines.append(f"  Overrides: {overrides}")
+    return lines
+
+
 async def handle_list_profiles():
     """Return the list of available configuration profiles with base config."""
     if not _config_file_path and not _loaded_config:
@@ -2023,16 +2048,7 @@ async def handle_list_profiles():
     
     lines.append("**Profiles:**")
     for p in profiles:
-        default_marker = " (default)" if p['name'] == default_profile else ""
-        desc = f" — {p['description']}" if p['description'] else ""
-        extends = f" (extends: {p['extends']})" if p['extends'] else ""
-        lines.append(f"- **{p['name']}**{default_marker}{desc}{extends}")
-        if p['expose_values']:
-            for key in p['overrides']:
-                lines.append(f"  {key}: {p['values'][key]}")
-        else:
-            overrides = ", ".join(p['overrides']) if p['overrides'] else "(none)"
-            lines.append(f"  Overrides: {overrides}")
+        lines.extend(_format_profile_entry(p, default_profile))
     
     return [TextContent(type="text", text="\n".join(lines))]
 
@@ -2073,15 +2089,11 @@ async def handle_setup(arguments: dict):
     # Reload config immediately (watcher would also pick it up within ~2s)
     _reload_config()
 
-    # Build summary
-    parts = [f"Setup complete! Configuration saved."]
-    if result.account:
-        parts.append(f"Account: {result.account}")
-    parts.append(f"Space: {result.space}")
-    if result.agent:
-        parts.append(f"Agent: {result.agent}")
+    # Build summary using shared formatter (result is a profile dict)
+    lines = ["Setup complete! Configured profile:"]
+    lines.extend(_format_profile_entry(result))
 
-    return [TextContent(type="text", text="\n".join(parts))]
+    return [TextContent(type="text", text="\n".join(lines))]
 
 
 async def handle_run_on_tunneled_ssh(arguments: dict, config: dict = None):
@@ -4781,12 +4793,11 @@ PERFORMANCE TIP:
             if result is None:
                 print("Setup cancelled.", file=sys.stderr)
                 return
-            print(f"\nSetup complete!")
-            if result.account:
-                print(f"  Account: {result.account}")
-            print(f"  Space:   {result.space}")
-            if result.agent:
-                print(f"  Agent:   {result.agent}")
+
+            # Build summary using shared formatter (result is a profile dict)
+            lines = ["\nSetup complete! Configured profile:"]
+            lines.extend(_format_profile_entry(result))
+            print("\n".join(lines))
 
         asyncio.run(run_setup())
     else:

@@ -12,7 +12,6 @@ import secrets
 import sys
 import time
 import webbrowser
-from dataclasses import dataclass
 from typing import Optional
 
 import httpx
@@ -24,16 +23,25 @@ from . import config as config_module
 _LONG_TOKEN_EXPIRES = 2147483647
 
 
-@dataclass
-class AuthResult:
-    """Result of the interactive login flow."""
-    token: str
-    token_id: Optional[str]
-    space: str
-    agent: Optional[str]
-    account: Optional[str]
-    torque_url: Optional[str] = None
+_PROFILE_RESULT_META_KEYS = {"description", "extends", "expose_values"}
 
+
+def _build_profile_result(profile_name: str, updates: dict, *, is_default: bool = False) -> dict:
+    """Build a profile result dict in the same shape as config_module.list_profiles entries.
+
+    Returns dict with keys: 'name', 'description', 'extends', 'overrides',
+    'expose_values', 'values', 'is_default'.
+    """
+    override_keys = sorted(k for k in updates if k not in _PROFILE_RESULT_META_KEYS)
+    return {
+        "name": profile_name,
+        "description": updates.get("description", ""),
+        "extends": updates.get("extends"),
+        "overrides": override_keys,
+        "expose_values": updates.get("expose_values", False),
+        "values": {k: updates[k] for k in override_keys},
+        "is_default": is_default,
+    }
 
 
 def _js_string_escape(s: str) -> str:
@@ -77,7 +85,7 @@ class TorqueAuthServer:
         self.timeout = timeout
         self._csrf_token = secrets.token_urlsafe(32)
         self._url_secret = secrets.token_urlsafe(16)
-        self._result: Optional[AuthResult] = None
+        self._result: Optional[dict] = None
         self._completed = asyncio.Event()
         self._cancelled = False
         self._last_heartbeat: float = 0.0
@@ -86,10 +94,11 @@ class TorqueAuthServer:
         self._app: Optional[web.Application] = None
         self._runner: Optional[web.AppRunner] = None
 
-    async def run(self) -> Optional[AuthResult]:
+    async def run(self) -> Optional[dict]:
         """Start server, open browser, wait for user to complete, return result.
 
-        Returns None if the user cancelled (closed browser tab or clicked Cancel).
+        Returns a profile dict (same shape as config_module.list_profiles entries)
+        or None if the user cancelled.
         """
         self._app = self._create_app()
         self._runner = web.AppRunner(self._app)
@@ -462,13 +471,10 @@ class TorqueAuthServer:
         except Exception as e:
             return web.json_response({"error": f"Failed to save config: {e}"}, status=500)
 
-        self._result = AuthResult(
-            token=long_token,
-            token_id=token_id,
-            space=space,
-            agent=agent,
-            account=account,
-            torque_url=torque_url,
+        self._result = _build_profile_result(
+            self.profile_name,
+            updates,
+            is_default=set_as_default,
         )
         self._completed.set()
 

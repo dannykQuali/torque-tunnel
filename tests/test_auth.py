@@ -15,7 +15,7 @@ import pytest_asyncio
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 from torque_tunnel import config as config_module
-from torque_tunnel.auth import AuthResult, TorqueAuthServer
+from torque_tunnel.auth import TorqueAuthServer, _build_profile_result
 
 
 # ============================================================================
@@ -292,28 +292,44 @@ class TestUpdateConfigFileRoundTrip:
 # ============================================================================
 
 
-class TestAuthResult:
-    """Tests for AuthResult dataclass."""
+class TestBuildProfileResult:
+    """Tests for _build_profile_result helper."""
 
     def test_creates_with_all_fields(self):
-        r = AuthResult(token="t", token_id="id", space="s", agent="a", account="acc", torque_url="https://x.com")
-        assert r.token == "t"
-        assert r.token_id == "id"
-        assert r.space == "s"
-        assert r.agent == "a"
-        assert r.account == "acc"
-        assert r.torque_url == "https://x.com"
+        updates = {
+            "torque_url": "https://x.com",
+            "torque_token": "t",
+            "torque_token_id": "id",
+            "torque_space": "sp",
+            "torque_agent": "agent1",
+            "description": "my profile",
+            "expose_values": True,
+        }
+        r = _build_profile_result("p", updates, is_default=True)
+        assert r["name"] == "p"
+        assert r["description"] == "my profile"
+        assert r["expose_values"] is True
+        assert r["is_default"] is True
+        assert "torque_url" in r["overrides"]
+        assert "torque_token" in r["overrides"]
+        assert r["values"]["torque_url"] == "https://x.com"
+        # Meta keys excluded from overrides
+        assert "description" not in r["overrides"]
+        assert "expose_values" not in r["overrides"]
 
-    def test_allows_optional_none(self):
-        r = AuthResult(token="t", token_id=None, space="s", agent=None, account=None)
-        assert r.token_id is None
-        assert r.agent is None
-        assert r.account is None
-        assert r.torque_url is None
+    def test_minimal_fields(self):
+        updates = {"torque_url": "https://x.com", "torque_token": "t", "torque_space": "sp"}
+        r = _build_profile_result("p", updates)
+        assert r["description"] == ""
+        assert r["extends"] is None
+        assert r["expose_values"] is False
+        assert r["is_default"] is False
+        assert set(r["overrides"]) == {"torque_url", "torque_token", "torque_space"}
 
-    def test_torque_url_defaults_to_none(self):
-        r = AuthResult(token="t", token_id=None, space="s", agent=None, account=None)
-        assert r.torque_url is None
+    def test_overrides_are_sorted(self):
+        updates = {"z_key": "z", "a_key": "a", "m_key": "m"}
+        r = _build_profile_result("p", updates)
+        assert r["overrides"] == ["a_key", "m_key", "z_key"]
 
 
 class TestTorqueAuthServerInit:
@@ -786,9 +802,9 @@ try:
             assert resp.status == 200
             assert auth_server._completed.is_set()
             assert auth_server._result is not None
-            assert auth_server._result.token == "tok"
-            assert auth_server._result.space == "sp"
-            assert auth_server._result.torque_url == "https://x.com"
+            assert auth_server._result["values"]["torque_token"] == "tok"
+            assert auth_server._result["values"]["torque_space"] == "sp"
+            assert auth_server._result["values"]["torque_url"] == "https://x.com"
 
         @pytest.mark.asyncio
         async def test_agent_is_optional(self, client, csrf_headers, auth_server):
@@ -798,7 +814,7 @@ try:
                 headers=csrf_headers,
             )
             assert resp.status == 200
-            assert auth_server._result.agent is None
+            assert "torque_agent" not in auth_server._result["values"]
 
         @pytest.mark.asyncio
         async def test_updates_server_torque_url(self, client, csrf_headers, auth_server):
@@ -1163,7 +1179,7 @@ class TestAuthServerRun:
 
     @pytest.mark.asyncio
     async def test_returns_result_on_completion(self, tmp_path):
-        """Server returns AuthResult when _completed is set."""
+        """Server returns profile dict when _completed is set."""
         config_path = tmp_path / "config.yaml"
         config_path.write_text("torque_url: https://example.com\n", encoding="utf-8")
 
@@ -1202,10 +1218,11 @@ class TestAuthServerRun:
             )
 
         auth_result = result[0]
-        assert isinstance(auth_result, AuthResult)
-        assert auth_result.token == "test-tok"
-        assert auth_result.space == "test-space"
-        assert auth_result.torque_url == "https://example.com"
+        assert isinstance(auth_result, dict)
+        assert auth_result["name"] == "test-profile"
+        assert auth_result["values"]["torque_token"] == "test-tok"
+        assert auth_result["values"]["torque_space"] == "test-space"
+        assert auth_result["values"]["torque_url"] == "https://example.com"
 
     @pytest.mark.asyncio
     async def test_returns_none_on_cancel(self):
