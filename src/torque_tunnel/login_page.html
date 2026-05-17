@@ -883,6 +883,13 @@ async function saveAndFinish() {
     return;
   }
 
+  // Warn if overwriting an existing profile
+  if (cachedProfiles.some(p => p.name === profileName)) {
+    if (!confirm('A profile named "' + profileName + '" already exists. Overwrite it?')) {
+      return;
+    }
+  }
+
   const btn = document.getElementById('saveBtn');
   btn.disabled = true;
   btn.innerHTML = '<span class="spinner"></span>Saving...';
