@@ -1910,7 +1910,7 @@ Use `wait` to avoid tight polling. Typical: wait=10, repeat until completed.""",
         ),
         Tool(
             name="setup",
-            description="""Interactively set up a Torque connection profile. Opens a browser window where the user can authenticate with email/password or paste an existing token, select account/space/agent, and optionally reuse an existing profile. The selections are saved to the config file for future use. Use this when torque_token is missing, needs to be refreshed, or when the user wants to configure a new profile.""",
+            description="""Interactively set up or add a Torque connection profile. Opens a browser window where the user can authenticate with email/password or paste an existing token, select account/space/agent, and optionally reuse an existing profile. The selections are saved to the config file for future use. Use this when torque_token is missing, needs to be refreshed, when the user wants to configure a new profile, or when the user wants to add another profile or agent.""",
             inputSchema={
                 "type": "object",
                 "properties": {
