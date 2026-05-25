@@ -1259,12 +1259,12 @@ Prefer this over running `ssh` from a container - simpler and more efficient.
 **private_key** accepts a file path (e.g., C:\\Users\\you\\.ssh\\id_rsa), raw key content ('-----BEGIN...'), or a base64-encoded key.
 Alternatively, use **password** for password-based SSH authentication (requires sshpass on the agent).
 
-Use `upload_files` to send local files/content to the target before running the command. Order: upload_files → init_commands → command → finally_commands. Use this along with chained commands to minimize calls and overhead and improve performance.
+**FILE TRANSFER:** NEVER manually encode/embed file contents into the command (no base64 encoding, no heredocs, no echo commands to create files). ALWAYS use the `upload_files` parameter instead — it handles compression, large files, and directories automatically. Use `upload_files` with `local_source_path` for existing local files, or `content` for dynamically generated text. Order: upload_files → init_commands → command → finally_commands → download_files.
 
 **DANGEROUS COMMANDS** (may kill our Torque agent if running there):
 docker restart/stop/kill, systemctl restart docker, reboot, shutdown, init 0/6
 
-**PERFORMANCE:** Each call has overhead. Chain commands (`cmd1 && cmd2`) and use `upload_files` for uploads in a single call.""",
+**PERFORMANCE:** Each call has overhead. Chain commands (`cmd1 && cmd2`) and use `upload_files` for file transfers in a single call.""",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -1290,7 +1290,7 @@ docker restart/stop/kill, systemctl restart docker, reboot, shutdown, init 0/6
                     },
                     "upload_files": {
                         "type": "array",
-                        "description": "Upload files from your local machine to the remote server BEFORE the command runs. Each item specifies one file to upload.",
+                        "description": "ALWAYS use this to transfer files instead of encoding file contents into the command. Uploads files from your local machine to the remote server BEFORE the command runs. Each item specifies one file to upload.",
                         "items": {
                             "type": "object",
                             "properties": {
@@ -1300,7 +1300,7 @@ docker restart/stop/kill, systemctl restart docker, reboot, shutdown, init 0/6
                                 },
                                 "content": {
                                     "type": "string",
-                                    "description": "Direct text content to write as a file on the remote server. Use this OR local_source_path, not both.",
+                                    "description": "Direct text content to write as a file on the remote server. Use this for dynamically generated content (scripts, configs, etc.) instead of encoding it into the command. Use this OR local_source_path, not both.",
                                 },
                                 "remote_destination_path": {
                                     "type": "string",
@@ -1378,7 +1378,7 @@ for local network/VMs use regular terminal commands):
 - One-off container command, no state needed → THIS tool (cheaper/faster)
 - Multi-step workflow needing state across calls (install then use a tool, incremental builds, etc.) → run_on_tunneled_persistent_container
 
-Use `upload_files` to send local files/content to the target before running the command. Order: upload_files → init_commands → command → finally_commands. Use this along with chained commands to minimize calls and overhead and improve performance.""",
+**FILE TRANSFER:** NEVER manually encode/embed file contents into the command (no base64 encoding, no heredocs, no echo commands to create files). ALWAYS use the `upload_files` parameter instead — it handles compression, large files, and directories automatically. Use `upload_files` with `local_source_path` for existing local files, or `content` for dynamically generated text. Order: upload_files → init_commands → command → finally_commands → download_files.""",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -1388,7 +1388,7 @@ Use `upload_files` to send local files/content to the target before running the 
                     },
                     "upload_files": {
                         "type": "array",
-                        "description": "Upload files from your local machine to the container BEFORE the command runs. Each item specifies one file to upload.",
+                        "description": "ALWAYS use this to transfer files instead of encoding file contents into the command. Uploads files from your local machine to the container BEFORE the command runs. Each item specifies one file to upload.",
                         "items": {
                             "type": "object",
                             "properties": {
@@ -1398,7 +1398,7 @@ Use `upload_files` to send local files/content to the target before running the 
                                 },
                                 "content": {
                                     "type": "string",
-                                    "description": "Direct text content to write as a file on the container. Use this OR local_source_path, not both.",
+                                    "description": "Direct text content to write as a file on the container. Use this for dynamically generated content (scripts, configs, etc.) instead of encoding it into the command. Use this OR local_source_path, not both.",
                                 },
                                 "remote_destination_path": {
                                     "type": "string",
@@ -1476,7 +1476,7 @@ specific one. Output includes `Persistent Container: <env_id>` - save to target 
 **After restart:** Pass previous `environment_id` to reconnect (works if not expired).
 Without the ID, a new container is created.
 
-Use `upload_files` to send local files/content to the target before running the command. Order: upload_files → init_commands → command → finally_commands. Use this along with chained commands to minimize calls and overhead and improve performance.""",
+**FILE TRANSFER:** NEVER manually encode/embed file contents into the command (no base64 encoding, no heredocs, no echo commands to create files). ALWAYS use the `upload_files` parameter instead — it handles compression, large files, and directories automatically. Use `upload_files` with `local_source_path` for existing local files, or `content` for dynamically generated text. Order: upload_files → init_commands → command → finally_commands → download_files.""",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -1486,7 +1486,7 @@ Use `upload_files` to send local files/content to the target before running the 
                     },
                     "upload_files": {
                         "type": "array",
-                        "description": "Upload files from your local machine to the container BEFORE the command runs. Each item specifies one file to upload.",
+                        "description": "ALWAYS use this to transfer files instead of encoding file contents into the command. Uploads files from your local machine to the container BEFORE the command runs. Each item specifies one file to upload.",
                         "items": {
                             "type": "object",
                             "properties": {
@@ -1496,7 +1496,7 @@ Use `upload_files` to send local files/content to the target before running the 
                                 },
                                 "content": {
                                     "type": "string",
-                                    "description": "Direct text content to write as a file on the container. Use this OR local_source_path, not both.",
+                                    "description": "Direct text content to write as a file on the container. Use this for dynamically generated content (scripts, configs, etc.) instead of encoding it into the command. Use this OR local_source_path, not both.",
                                 },
                                 "remote_destination_path": {
                                     "type": "string",
@@ -1576,6 +1576,8 @@ For local network/VMs, use regular `ssh` in terminal.
 **private_key** accepts a file path, raw key content ('-----BEGIN...'), or a base64-encoded key.
 Alternatively, use **password** for password-based SSH authentication (requires sshpass on the agent).
 
+**FILE TRANSFER:** NEVER manually encode/embed file contents into the command. ALWAYS use the `upload_files` parameter instead.
+
 **DANGEROUS COMMANDS** (may kill our Torque agent if running there): docker restart/stop/kill,
 systemctl restart docker, reboot, shutdown, init 0/6""",
             inputSchema={
@@ -1603,7 +1605,7 @@ systemctl restart docker, reboot, shutdown, init 0/6""",
                     },
                     "upload_files": {
                         "type": "array",
-                        "description": "Upload files from your local machine to the remote server BEFORE the command runs. Each item specifies one file to upload.",
+                        "description": "ALWAYS use this to transfer files instead of encoding file contents into the command. Uploads files from your local machine to the remote server BEFORE the command runs. Each item specifies one file to upload.",
                         "items": {
                             "type": "object",
                             "properties": {
@@ -1613,7 +1615,7 @@ systemctl restart docker, reboot, shutdown, init 0/6""",
                                 },
                                 "content": {
                                     "type": "string",
-                                    "description": "Direct text content to write as a file on the remote server. Use this OR local_source_path, not both.",
+                                    "description": "Direct text content to write as a file on the remote server. Use this for dynamically generated content (scripts, configs, etc.) instead of encoding it into the command. Use this OR local_source_path, not both.",
                                 },
                                 "remote_destination_path": {
                                     "type": "string",
@@ -1699,7 +1701,7 @@ After restart: pass previous `environment_id` to reconnect.""",
                     },
                     "upload_files": {
                         "type": "array",
-                        "description": "Upload files from your local machine to the container BEFORE the command runs. Each item specifies one file to upload.",
+                        "description": "ALWAYS use this to transfer files instead of encoding file contents into the command. Uploads files from your local machine to the container BEFORE the command runs. Each item specifies one file to upload.",
                         "items": {
                             "type": "object",
                             "properties": {
@@ -1709,7 +1711,7 @@ After restart: pass previous `environment_id` to reconnect.""",
                                 },
                                 "content": {
                                     "type": "string",
-                                    "description": "Direct text content to write as a file on the container. Use this OR local_source_path, not both.",
+                                    "description": "Direct text content to write as a file on the container. Use this for dynamically generated content (scripts, configs, etc.) instead of encoding it into the command. Use this OR local_source_path, not both.",
                                 },
                                 "remote_destination_path": {
                                     "type": "string",
@@ -1796,7 +1798,7 @@ Only for unreachable internal network targets. For local network/VMs, use termin
                     },
                     "upload_files": {
                         "type": "array",
-                        "description": "Upload files from your local machine to the container BEFORE the command runs. Each item specifies one file to upload.",
+                        "description": "ALWAYS use this to transfer files instead of encoding file contents into the command. Uploads files from your local machine to the container BEFORE the command runs. Each item specifies one file to upload.",
                         "items": {
                             "type": "object",
                             "properties": {
@@ -1806,7 +1808,7 @@ Only for unreachable internal network targets. For local network/VMs, use termin
                                 },
                                 "content": {
                                     "type": "string",
-                                    "description": "Direct text content to write as a file on the container. Use this OR local_source_path, not both.",
+                                    "description": "Direct text content to write as a file on the container. Use this for dynamically generated content (scripts, configs, etc.) instead of encoding it into the command. Use this OR local_source_path, not both.",
                                 },
                                 "remote_destination_path": {
                                     "type": "string",
