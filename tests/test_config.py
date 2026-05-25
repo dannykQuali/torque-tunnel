@@ -179,10 +179,6 @@ class TestResolveProfile:
         with pytest.raises(ValueError, match="Profile 'nonexistent' not found"):
             config_module.resolve_profile(sample_config, "nonexistent")
 
-    def test_missing_profile_lists_available(self, sample_config):
-        with pytest.raises(ValueError, match="lab-base"):
-            config_module.resolve_profile(sample_config, "nonexistent")
-
     def test_extends_to_missing_parent_raises(self):
         config = {
             "profiles": {

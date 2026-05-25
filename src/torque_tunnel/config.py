@@ -123,11 +123,7 @@ def _resolve_profile_chain(config: dict, profile_name: str, seen: Optional[list]
 
     profiles = config.get("profiles", {})
     if profile_name not in profiles:
-        available = sorted(profiles.keys())
-        raise ValueError(
-            f"Profile '{profile_name}' not found. "
-            f"Available profiles: {', '.join(available) if available else '(none)'}"
-        )
+        raise ValueError(f"Profile '{profile_name}' not found.")
 
     profile = profiles[profile_name]
 

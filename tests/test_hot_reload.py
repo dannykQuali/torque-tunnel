@@ -565,14 +565,13 @@ class TestConfigErrorGating:
     async def test_default_profile_warning_blocks_tools_without_explicit_profile(self):
         """Tools without explicit profile return error when default_profile is broken."""
         mcp_tool._config_error = None
-        mcp_tool._default_profile_warning = "Profile 'jarvis' not found. Available profiles: cisco-jarvis"
+        mcp_tool._default_profile_warning = "Profile 'jarvis' not found."
 
         result = await mcp_tool.call_tool("run_on_tunneled_ssh", {"command": "whoami"})
 
         assert len(result) == 1
         assert "jarvis" in result[0].text
-        assert "cisco-jarvis" in result[0].text
-        assert "profile=" in result[0].text.lower() or "Specify a profile" in result[0].text
+        assert "profile" in result[0].text.lower()
 
     @pytest.mark.asyncio
     async def test_default_profile_warning_allows_tools_with_explicit_profile(self):

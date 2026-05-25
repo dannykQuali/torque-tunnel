@@ -1362,7 +1362,7 @@ docker restart/stop/kill, systemctl restart docker, reboot, shutdown, init 0/6
                     },
                     "profile": {
                         "type": "string",
-                        "description": "Configuration profile name to apply. Profiles pre-configure connection settings, SSH targets, and other options. Use list_profiles to see available profiles.",
+                        "description": "Configuration profile name to use. Omit this parameter (or don't pass it) to use the default profile. Do NOT pass 'default' as the value — that would look for a profile literally named 'default'. Use list_profiles to see available profiles and which one is the default.",
                     },
                 },
                 "required": [],
@@ -1452,7 +1452,7 @@ Use `upload_files` to send local files/content to the target before running the 
                     },
                     "profile": {
                         "type": "string",
-                        "description": "Configuration profile name to apply. Profiles pre-configure connection settings, SSH targets, and other options. Use list_profiles to see available profiles.",
+                        "description": "Configuration profile name to use. Omit this parameter (or don't pass it) to use the default profile. Do NOT pass 'default' as the value — that would look for a profile literally named 'default'. Use list_profiles to see available profiles and which one is the default.",
                     },
                 },
                 "required": [],
@@ -1558,7 +1558,7 @@ Use `upload_files` to send local files/content to the target before running the 
                     },
                     "profile": {
                         "type": "string",
-                        "description": "Configuration profile name to apply. Profiles pre-configure connection settings, SSH targets, and other options. Use list_profiles to see available profiles.",
+                        "description": "Configuration profile name to use. Omit this parameter (or don't pass it) to use the default profile. Do NOT pass 'default' as the value — that would look for a profile literally named 'default'. Use list_profiles to see available profiles and which one is the default.",
                     },
                 },
                 "required": [],
@@ -1671,7 +1671,7 @@ systemctl restart docker, reboot, shutdown, init 0/6""",
                     },
                     "profile": {
                         "type": "string",
-                        "description": "Configuration profile name to apply. Profiles pre-configure connection settings, SSH targets, and other options. Use list_profiles to see available profiles.",
+                        "description": "Configuration profile name to use. Omit this parameter (or don't pass it) to use the default profile. Do NOT pass 'default' as the value — that would look for a profile literally named 'default'. Use list_profiles to see available profiles and which one is the default.",
                     },
                 },
                 "required": ["command"],
@@ -1771,7 +1771,7 @@ After restart: pass previous `environment_id` to reconnect.""",
                     },
                     "profile": {
                         "type": "string",
-                        "description": "Configuration profile name to apply. Profiles pre-configure connection settings, SSH targets, and other options. Use list_profiles to see available profiles.",
+                        "description": "Configuration profile name to use. Omit this parameter (or don't pass it) to use the default profile. Do NOT pass 'default' as the value — that would look for a profile literally named 'default'. Use list_profiles to see available profiles and which one is the default.",
                     },
                 },
                 "required": ["command"],
@@ -1860,7 +1860,7 @@ Only for unreachable internal network targets. For local network/VMs, use termin
                     },
                     "profile": {
                         "type": "string",
-                        "description": "Configuration profile name to apply. Profiles pre-configure connection settings, SSH targets, and other options. Use list_profiles to see available profiles.",
+                        "description": "Configuration profile name to use. Omit this parameter (or don't pass it) to use the default profile. Do NOT pass 'default' as the value — that would look for a profile literally named 'default'. Use list_profiles to see available profiles and which one is the default.",
                     },
                 },
                 "required": ["command"],
@@ -1910,7 +1910,15 @@ Use `wait` to avoid tight polling. Typical: wait=10, repeat until completed.""",
         ),
         Tool(
             name="setup",
-            description="""Interactively set up or add a Torque connection profile. Opens a browser window where the user can authenticate with email/password or paste an existing token, select account/space/agent, and optionally reuse an existing profile. The selections are saved to the config file for future use. Use this when torque_token is missing, needs to be refreshed, when the user wants to configure a new profile, or when the user wants to add another profile or agent.""",
+            description="""Interactively set up or add a Torque connection profile. Opens a browser window where the user can authenticate with email/password or paste an existing token, select account/space/agent, and optionally reuse an existing profile. The selections are saved to the config file for future use.
+
+WHEN TO USE THIS TOOL (always prefer this over searching config files manually):
+- User says "add agent", "add connection", "connect to torque", "set up torque tunnel", "configure torque"
+- torque_token is missing or needs to be refreshed
+- User wants to configure a new profile or add another agent/profile
+- Any request about adding, connecting, or configuring torque-tunnel access
+
+DO NOT search for config files or try to edit them manually — this tool handles everything interactively.""",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -1960,7 +1968,15 @@ async def call_tool(name: str, arguments: dict):
             # Create effective config with config-only values (init_commands, etc.)
             effective_config = config_module.apply_profile_to_config(_config, profile_values)
         except ValueError as e:
-            return [TextContent(type="text", text=f"Error: {str(e)}")]
+            error_parts = [f"Error: {str(e)}"]
+            if profile_name == "default":
+                error_parts.append("**Hint:** To use the default profile, simply omit the 'profile' parameter entirely.")
+            # Append profile listing for context
+            profile_listing = await handle_list_profiles()
+            if profile_listing:
+                error_parts.append("")
+                error_parts.append(profile_listing[0].text)
+            return [TextContent(type="text", text="\n".join(error_parts))]
     
     if name == "run_on_tunneled_ssh":
         return await handle_run_on_tunneled_ssh(arguments, effective_config)
