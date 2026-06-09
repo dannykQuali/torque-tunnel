@@ -4413,91 +4413,144 @@ async def cli_dispatch(args):
         sys.exit(1)
 
 
-def main():
-    """Main entry point - supports both MCP server mode and CLI commands."""
-    
-    # Common arguments parser
+class _DefaultSeedingArgumentParser(argparse.ArgumentParser):
+    """Top-level parser that seeds common-arg defaults into a fresh namespace.
+
+    Why this exists — the argparse subparser clobber:
+    `common_parser` is inherited (via parents=[...]) by BOTH this top-level parser
+    AND every subparser, so they share the SAME action objects. argparse (3.13+)
+    parses the tokens after the subcommand into a FRESH namespace and copies every
+    key back onto the main namespace. If the common args carried real defaults, the
+    subparser would copy its (default None) values back, wiping out any value set by
+    a flag placed BEFORE the subcommand.
+
+    The fix: every common arg uses default=argparse.SUPPRESS (so an omitted arg
+    leaves NO key to copy back), and the real/env defaults are seeded here — ONLY on
+    the top-level namespace, ONLY when the caller didn't pass one. We deliberately do
+    NOT use parser.set_defaults(), because that mutates the shared action.default
+    (defeating SUPPRESS), and the subparsers are created as plain ArgumentParsers so
+    they never seed (and therefore never copy common defaults back).
+    """
+
+    common_defaults: dict = {}
+
+    def parse_known_args(self, args=None, namespace=None):
+        if namespace is None:
+            namespace = argparse.Namespace()
+            for key, value in self.common_defaults.items():
+                setattr(namespace, key, value)
+        return super().parse_known_args(args, namespace)
+
+
+def build_parser():
+    """Build the argparse parser for the CLI.
+
+    Extracted from main() so argument parsing can be unit-tested in isolation
+    (e.g. order-independence of flags) without executing the program.
+    """
+    # Common-arg defaults (env-backed). Seeded onto the top-level namespace by
+    # _DefaultSeedingArgumentParser. See that class for the full rationale; in short,
+    # every common arg below uses default=argparse.SUPPRESS to avoid the argparse
+    # subparser clobber, and these values supply the actual defaults.
+    common_defaults = {
+        "config": os.environ.get("TORQUE_TUNNEL_CONFIG"),
+        "profile": os.environ.get("TORQUE_TUNNEL_PROFILE"),
+        "torque_url": os.environ.get("TORQUE_URL"),
+        "torque_token": os.environ.get("TORQUE_TOKEN"),
+        "torque_space": os.environ.get("TORQUE_SPACE"),
+        "torque_agent": os.environ.get("TORQUE_AGENT"),
+        "ssh_key": os.environ.get("SSH_KEY"),
+        "ssh_password": os.environ.get("SSH_PASSWORD"),
+        "host": os.environ.get("TARGET_HOST"),
+        "ssh_user": os.environ.get("SSH_USER"),
+        "init_commands": os.environ.get("INIT_COMMANDS"),
+        "finally_commands": os.environ.get("FINALLY_COMMANDS"),
+        "auto_delete_environments": os.environ.get("AUTO_DELETE_ENVIRONMENTS", "").lower() in ("true", "1", "yes"),
+        "verbose": False,
+        "container_idle_timeout": int(os.environ.get("CONTAINER_IDLE_TIMEOUT", "7200")),
+    }
     common_parser = argparse.ArgumentParser(add_help=False)
     common_parser.add_argument(
         "--config",
-        default=os.environ.get("TORQUE_TUNNEL_CONFIG"),
+        default=argparse.SUPPRESS,
         help="Path to config YAML file (default: $TORQUE_TUNNEL_CONFIG or ~/.torque-tunnel/config.yaml)",
     )
     common_parser.add_argument(
         "--profile",
-        default=os.environ.get("TORQUE_TUNNEL_PROFILE"),
+        default=argparse.SUPPRESS,
         help="Configuration profile name to use (default: $TORQUE_TUNNEL_PROFILE)",
     )
     common_parser.add_argument(
         "--torque-url",
-        default=os.environ.get("TORQUE_URL"),
+        default=argparse.SUPPRESS,
         help="Torque base URL (default: $TORQUE_URL)",
     )
     common_parser.add_argument(
         "--torque-token",
-        default=os.environ.get("TORQUE_TOKEN"),
+        default=argparse.SUPPRESS,
         help="Torque API token (default: $TORQUE_TOKEN)",
     )
     common_parser.add_argument(
         "--torque-space",
-        default=os.environ.get("TORQUE_SPACE"),
+        default=argparse.SUPPRESS,
         help="Torque space name (default: $TORQUE_SPACE)",
     )
     common_parser.add_argument(
         "--torque-agent",
-        default=os.environ.get("TORQUE_AGENT"),
+        default=argparse.SUPPRESS,
         help="Default Torque agent name (default: $TORQUE_AGENT)",
     )
     common_parser.add_argument(
         "--ssh-key",
-        default=os.environ.get("SSH_KEY"),
+        default=argparse.SUPPRESS,
         help="SSH private key - file path, key content, or base64-encoded key (env: $SSH_KEY)",
     )
     common_parser.add_argument(
         "--ssh-password",
-        default=os.environ.get("SSH_PASSWORD"),
+        default=argparse.SUPPRESS,
         help="SSH password for authentication (env: $SSH_PASSWORD)",
     )
     common_parser.add_argument(
         "--host",
-        default=os.environ.get("TARGET_HOST"),
+        default=argparse.SUPPRESS,
         help="Target server IP/hostname (env: $TARGET_HOST)",
     )
     common_parser.add_argument(
         "--ssh-user",
-        default=os.environ.get("SSH_USER"),
+        default=argparse.SUPPRESS,
         help="SSH username (env: $SSH_USER)",
     )
     common_parser.add_argument(
         "--init-commands",
-        default=os.environ.get("INIT_COMMANDS"),
+        default=argparse.SUPPRESS,
         help="Commands to run before every SSH command",
     )
     common_parser.add_argument(
         "--finally-commands",
-        default=os.environ.get("FINALLY_COMMANDS"),
+        default=argparse.SUPPRESS,
         help="Commands to run after every SSH command",
     )
     common_parser.add_argument(
         "--auto-delete-environments",
         action="store_true",
-        default=os.environ.get("AUTO_DELETE_ENVIRONMENTS", "").lower() in ("true", "1", "yes"),
+        default=argparse.SUPPRESS,
         help="Automatically delete environments after completion",
     )
     common_parser.add_argument(
         "--verbose", "-v",
         action="store_true",
+        default=argparse.SUPPRESS,
         help="Show full output including Torque preamble (default: skip to '=== Beginning of execution ===' marker)",
     )
     common_parser.add_argument(
         "--container-idle-timeout",
         type=int,
-        default=int(os.environ.get("CONTAINER_IDLE_TIMEOUT", "7200")),
+        default=argparse.SUPPRESS,
         help="Idle timeout in seconds for persistent containers before auto-cleanup (default: 7200 = 2 hours, env: $CONTAINER_IDLE_TIMEOUT)",
     )
     
     # Main parser with subcommands - also inherits common args for when no subcommand is given
-    parser = argparse.ArgumentParser(
+    parser = _DefaultSeedingArgumentParser(
         parents=[common_parser],
         description="torque-tunnel - Execute remote commands via Torque (MCP server or CLI)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -4579,7 +4632,27 @@ PERFORMANCE TIP:
         """,
     )
     
-    subparsers = parser.add_subparsers(dest="command", help="Command to run")
+    # Seed the env-backed common defaults onto the top-level namespace only (see
+    # _DefaultSeedingArgumentParser). We attach the dict rather than calling
+    # parser.set_defaults(), because set_defaults mutates the shared action.default
+    # and would defeat the SUPPRESS that prevents the subparser clobber.
+    parser.common_defaults = common_defaults
+    
+    # --allow-dangerous-commands is registered on BOTH the main parser (so it is
+    # accepted BEFORE the subcommand) and on the ssh subparser (so it is accepted
+    # AFTER it) — argparse splits the token stream at the subcommand boundary, so a
+    # flag must exist on whichever parser owns its position. The main-parser copy
+    # uses default=False (the baseline always present in the namespace); the ssh
+    # subparser copy uses default=SUPPRESS so that, when omitted there, it does NOT
+    # overwrite a True already set by the main parser. It is intentionally NOT added
+    # to read/list/*-container, where bypassing the guard is meaningless.
+    parser.add_argument(
+        "--allow-dangerous-commands", action="store_true", default=False,
+        help="Bypass dangerous command warnings for the 'ssh' subcommand (use with extreme caution)",
+    )
+    
+    subparsers = parser.add_subparsers(dest="command", help="Command to run",
+                                       parser_class=argparse.ArgumentParser)
     
     # serve subcommand (MCP server mode)
     subparsers.add_parser("serve", parents=[common_parser], help="Run as MCP server")
@@ -4597,7 +4670,7 @@ PERFORMANCE TIP:
     ssh_parser.add_argument("--key", "-k", help="SSH private key - file path, key content, or base64-encoded key (overrides --ssh-key)")
     ssh_parser.add_argument("--password", help="SSH password for authentication (overrides --ssh-password)")
     ssh_parser.add_argument("--timeout", type=int, help="Timeout in seconds")
-    ssh_parser.add_argument("--allow-dangerous-commands", action="store_true", help="Bypass dangerous command warnings (use with extreme caution)")
+    ssh_parser.add_argument("--allow-dangerous-commands", action="store_true", default=argparse.SUPPRESS, help="Bypass dangerous command warnings (use with extreme caution)")
     ssh_parser.add_argument("--json", "-j", action="store_true", help="Output as JSON")
     ssh_parser.add_argument("--upload", action="append", metavar="LOCAL:REMOTE[:MODE]",
                               help="Upload local file/dir to remote path (can be repeated)")
@@ -4648,6 +4721,12 @@ PERFORMANCE TIP:
     list_parser.add_argument("--all", "-A", action="store_true", help="Show hidden files")
     list_parser.add_argument("--long", "-l", action="store_true", help="Long format with details")
     
+    return parser
+
+
+def main():
+    """Main entry point - supports both MCP server mode and CLI commands."""
+    parser = build_parser()
     args = parser.parse_args()
     
     # Load config file and store globally for runtime profile resolution
