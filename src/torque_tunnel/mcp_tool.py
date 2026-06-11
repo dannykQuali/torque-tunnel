@@ -160,7 +160,8 @@ def check_dangerous_command(command: str) -> str | None:
     """Check if command matches dangerous patterns. Returns warning message if dangerous."""
     cmd_lower = command.lower()
     for pattern in DANGEROUS_PATTERNS:
-        if pattern in cmd_lower:
+        # Use word-boundary match so e.g. "docker rm" doesn't flag "docker rmi"
+        if re.search(r'(?<!\w)' + re.escape(pattern) + r'(?!\w)', cmd_lower):
             return f"""⚠️ **DANGEROUS COMMAND DETECTED** ⚠️
 
 The command `{command}` contains `{pattern}` which can KILL the Torque agent and cause this operation to fail.
