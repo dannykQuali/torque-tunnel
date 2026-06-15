@@ -2129,6 +2129,7 @@ async def handle_run_on_tunneled_ssh(arguments: dict, config: dict = None):
         ssh_password = config.get("default_ssh_password")
     command = arguments.get("command")
     files = arguments.get("upload_files", [])
+    download_files = arguments.get("download_files", [])
     agent = arguments.get("torque_agent")
     allow_dangerous_commands = arguments.get("allow_dangerous_commands", False)
     timeout = arguments.get("timeout")  # Optional timeout override
@@ -2142,19 +2143,19 @@ async def handle_run_on_tunneled_ssh(arguments: dict, config: dict = None):
     torque_token = arguments.get("torque_token") or config["torque_token"]
     torque_space = arguments.get("torque_space") or config["torque_space"]
     
-    # Must have at least command OR files
-    if not command and not files:
+    # Must have at least command OR upload_files OR download_files
+    if not command and not files and not download_files:
         return [TextContent(
             type="text",
-            text="Error: Must provide either 'command' or 'upload_files' (or both).",
+            text="Error: Must provide either 'command', 'upload_files', or 'download_files' (or any combination).",
         )]
-    
+
     if not all([target_ip, ssh_user]):
         return [TextContent(
             type="text",
             text="Error: Missing required parameters. Need host and user (or configure defaults).",
         )]
-    
+
     if not private_key_value and not ssh_password:
         return [TextContent(
             type="text",
@@ -2205,7 +2206,6 @@ async def handle_run_on_tunneled_ssh(arguments: dict, config: dict = None):
         files_info = plan.files_info
     
     # Process download_files parameter
-    download_files = arguments.get("download_files", [])
     dl_plan = None
     dl_process = None
     if download_files:
@@ -2485,6 +2485,7 @@ async def handle_run_on_tunneled_persistent_container(arguments: dict, config: d
     cfg = config or _config
     command = arguments.get("command")
     files = arguments.get("upload_files", [])
+    download_files = arguments.get("download_files", [])
     agent = arguments.get("torque_agent")
     timeout = arguments.get("timeout")
     new_container = arguments.get("new_container", False)
@@ -2493,13 +2494,13 @@ async def handle_run_on_tunneled_persistent_container(arguments: dict, config: d
     torque_token = arguments.get("torque_token")
     torque_space = arguments.get("torque_space")
     
-    # Must have at least command OR files
-    if not command and not files:
+    # Must have at least command OR upload_files OR download_files
+    if not command and not files and not download_files:
         return [TextContent(
             type="text",
-            text="Error: Must provide either 'command' or 'upload_files' (or both).",
+            text="Error: Must provide either 'command', 'upload_files', or 'download_files' (or any combination).",
         )]
-    
+
     try:
         # Ensure we have a persistent container running
         container_info = await _ensure_persistent_container(agent=agent, new_container=new_container, environment_id=target_env_id, torque_url=torque_url, torque_token=torque_token, torque_space=torque_space, config=cfg)
@@ -2533,7 +2534,6 @@ async def handle_run_on_tunneled_persistent_container(arguments: dict, config: d
         files_info = plan.files_info
     
     # Process download_files parameter
-    download_files = arguments.get("download_files", [])
     dl_plan = None
     dl_process = None
     if download_files:
@@ -2698,19 +2698,20 @@ async def handle_run_on_tunneled_disposable_container(arguments: dict, config: d
     cfg = config or _config
     command = arguments.get("command")
     files = arguments.get("upload_files", [])
+    download_files = arguments.get("download_files", [])
     agent = arguments.get("torque_agent")
     timeout = arguments.get("timeout")  # Optional timeout override
     torque_url = arguments.get("torque_url")
     torque_token = arguments.get("torque_token")
     torque_space = arguments.get("torque_space")
-    
-    # Must have at least command OR files
-    if not command and not files:
+
+    # Must have at least command OR upload_files OR download_files
+    if not command and not files and not download_files:
         return [TextContent(
             type="text",
-            text="Error: Must provide either 'command' or 'upload_files' (or both).",
+            text="Error: Must provide either 'command', 'upload_files', or 'download_files' (or any combination).",
         )]
-    
+
     # Process files parameter - generate deployment commands (with croc for large files)
     files_info = []
     init_commands = None
@@ -2734,7 +2735,6 @@ async def handle_run_on_tunneled_disposable_container(arguments: dict, config: d
         files_info = plan.files_info
     
     # Process download_files parameter
-    download_files = arguments.get("download_files", [])
     dl_plan = None
     dl_process = None
     if download_files:
@@ -2888,6 +2888,7 @@ async def handle_run_on_tunneled_ssh_async(arguments: dict, config: dict = None)
         ssh_password = cfg.get("default_ssh_password")
     command = arguments.get("command")
     files = arguments.get("upload_files", [])
+    download_files = arguments.get("download_files", [])
     agent = arguments.get("torque_agent")
     allow_dangerous_commands = arguments.get("allow_dangerous_commands", False)
     timeout = arguments.get("timeout")
@@ -2895,9 +2896,9 @@ async def handle_run_on_tunneled_ssh_async(arguments: dict, config: dict = None)
     torque_token = arguments.get("torque_token")
     torque_space = arguments.get("torque_space")
     
-    if not command and not files:
-        return [TextContent(type="text", text="Error: Must provide either 'command' or 'upload_files' (or both).")]
-    
+    if not command and not files and not download_files:
+        return [TextContent(type="text", text="Error: Must provide either 'command', 'upload_files', or 'download_files' (or any combination).")]
+
     if not all([target_ip, ssh_user]):
         return [TextContent(type="text", text="Error: Missing required parameters. Need host and user (or configure defaults).")]
     
@@ -2939,7 +2940,6 @@ async def handle_run_on_tunneled_ssh_async(arguments: dict, config: dict = None)
         files_info = plan.files_info
     
     # Process download_files parameter
-    download_files = arguments.get("download_files", [])
     dl_plan = None
     dl_process = None
     if download_files:
@@ -3037,6 +3037,7 @@ async def handle_run_on_tunneled_persistent_container_async(arguments: dict, con
     cfg = config or _config
     command = arguments.get("command")
     files = arguments.get("upload_files", [])
+    download_files = arguments.get("download_files", [])
     agent = arguments.get("torque_agent")
     new_container = arguments.get("new_container", False)
     target_env_id = arguments.get("environment_id")
@@ -3045,9 +3046,9 @@ async def handle_run_on_tunneled_persistent_container_async(arguments: dict, con
     torque_token = arguments.get("torque_token")
     torque_space = arguments.get("torque_space")
     
-    if not command and not files:
-        return [TextContent(type="text", text="Error: Must provide either 'command' or 'upload_files' (or both).")]
-    
+    if not command and not files and not download_files:
+        return [TextContent(type="text", text="Error: Must provide either 'command', 'upload_files', or 'download_files' (or any combination).")]
+
     try:
         # Ensure persistent container is up (this blocks until ready)
         container_info = await _ensure_persistent_container(agent=agent, new_container=new_container, environment_id=target_env_id, torque_url=torque_url, torque_token=torque_token, torque_space=torque_space, config=cfg)
@@ -3078,7 +3079,6 @@ async def handle_run_on_tunneled_persistent_container_async(arguments: dict, con
         files_info = plan.files_info
     
     # Process download_files parameter
-    download_files = arguments.get("download_files", [])
     dl_plan = None
     dl_process = None
     if download_files:
@@ -3188,15 +3188,16 @@ async def handle_run_on_tunneled_disposable_container_async(arguments: dict, con
     cfg = config or _config
     command = arguments.get("command")
     files = arguments.get("upload_files", [])
+    download_files = arguments.get("download_files", [])
     agent = arguments.get("torque_agent")
     timeout = arguments.get("timeout")
     torque_url = arguments.get("torque_url")
     torque_token = arguments.get("torque_token")
     torque_space = arguments.get("torque_space")
-    
-    if not command and not files:
-        return [TextContent(type="text", text="Error: Must provide either 'command' or 'upload_files' (or both).")]
-    
+
+    if not command and not files and not download_files:
+        return [TextContent(type="text", text="Error: Must provide either 'command', 'upload_files', or 'download_files' (or any combination).")]
+
     # Process files parameter - generate deployment commands (with croc for large files)
     files_info = []
     init_commands = None
@@ -3217,7 +3218,6 @@ async def handle_run_on_tunneled_disposable_container_async(arguments: dict, con
         files_info = plan.files_info
     
     # Process download_files parameter
-    download_files = arguments.get("download_files", [])
     dl_plan = None
     dl_process = None
     if download_files:
@@ -3814,7 +3814,7 @@ async def cli_dispatch(args):
             
             # Must have command or uploads or downloads
             if not cmd and not uploads and not downloads:
-                print("Error: Must provide a command or --upload files (or both).", file=sys.stderr)
+                print("Error: Must provide a command, --upload files, --download files, or any combination.", file=sys.stderr)
                 sys.exit(1)
             
             if not all([target_ip, ssh_user]):
