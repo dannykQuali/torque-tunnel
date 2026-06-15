@@ -4,12 +4,12 @@
 #
 # Builds the Python virtual environment, installs torque-tunnel, then registers
 # the MCP server with your AI client(s). All arguments are passed through to the
-# `configure` subcommand. With no arguments it auto-detects installed clients
-# and runs the interactive setup. Examples:
+# `register-mcp-client` subcommand. With no arguments it auto-detects installed
+# clients and runs the interactive setup. Examples:
 #
 #   ./scripts/onboard.sh                       # build + auto-detect + setup
 #   ./scripts/onboard.sh --list                # just list supported clients
-#   ./scripts/onboard.sh --client claude-code  # configure one client, no setup
+#   ./scripts/onboard.sh --client claude-code  # register one client, no setup
 #   ./scripts/onboard.sh --all --dry-run       # preview changes for all clients
 #
 # Note: --run-setup opens a browser; on a headless server pass explicit
@@ -38,5 +38,5 @@ if [ "$#" -eq 0 ]; then
     set -- --run-setup
 fi
 
-echo "Configuring AI client(s) ..."
-exec "$VENV_PY" -m torque_tunnel.mcp_tool configure "$@"
+echo "Registering MCP server with AI client(s) ..."
+exec "$VENV_PY" -m torque_tunnel.mcp_tool register-mcp-client "$@"

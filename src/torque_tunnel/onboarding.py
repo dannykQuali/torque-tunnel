@@ -6,6 +6,8 @@ unit-tested Python implementation works on Windows, Linux, and macOS. Thin
 bootstrap scripts (onboard.ps1 / onboard.sh) only build the venv and then call
 the `configure` CLI subcommand, which delegates to the functions below.
 
+The CLI exposes these as the `register-mcp-client` subcommand.
+
 Two config schema families cover every supported client:
   - "mcpServers": Claude Code, Cursor, Windsurf, Claude Desktop
   - "servers":    Copilot / VS Code native MCP
@@ -325,14 +327,14 @@ def merge_entry(
     return MergeResult("", path, status, backup=backup_path, entry=entry)
 
 
-def configure_client(
+def register_client(
     client: str,
     *,
     python: Optional[str] = None,
     dry_run: bool = False,
     system: Optional[str] = None,
 ) -> MergeResult:
-    """Configure a single client. Raises KeyError for an unknown client."""
+    """Register the MCP server with a single client. Raises KeyError if unknown."""
     spec = CLIENTS[client]
     path = config_path(client, system)
     entry = server_entry(spec.family, python)
@@ -341,7 +343,7 @@ def configure_client(
     return result
 
 
-def configure(
+def register_clients(
     clients: Optional[list[str]] = None,
     *,
     all_clients: bool = False,
@@ -349,7 +351,7 @@ def configure(
     dry_run: bool = False,
     system: Optional[str] = None,
 ) -> list[MergeResult]:
-    """Configure one or more clients.
+    """Register the MCP server with one or more clients.
 
     Target selection:
       - explicit `clients` list  → exactly those
@@ -365,5 +367,5 @@ def configure(
 
     results = []
     for name in targets:
-        results.append(configure_client(name, python=python, dry_run=dry_run, system=system))
+        results.append(register_client(name, python=python, dry_run=dry_run, system=system))
     return results

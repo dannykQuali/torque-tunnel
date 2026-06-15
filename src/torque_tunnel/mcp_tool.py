@@ -4665,29 +4665,29 @@ PERFORMANCE TIP:
     # setup subcommand (interactive Torque setup)
     subparsers.add_parser("setup", parents=[common_parser], help="Set up Torque connection interactively (opens browser)")
 
-    # configure subcommand (register this MCP server with AI clients)
-    configure_parser = subparsers.add_parser(
-        "configure",
+    # register-mcp-client subcommand (register this MCP server with AI clients)
+    register_parser = subparsers.add_parser(
+        "register-mcp-client",
         help="Register the torque-tunnel MCP server with AI clients (Claude Code, Copilot, Cursor, ...)",
     )
-    configure_parser.add_argument(
+    register_parser.add_argument(
         "--client", action="append", choices=list(onboarding_module.CLIENTS),
-        help="Client to configure (repeatable). Default: auto-detect installed clients.",
+        help="Client to register with (repeatable). Default: auto-detect installed clients.",
     )
-    configure_parser.add_argument(
-        "--all", action="store_true", help="Configure every supported client, detected or not.",
+    register_parser.add_argument(
+        "--all", action="store_true", help="Register with every supported client, detected or not.",
     )
-    configure_parser.add_argument(
+    register_parser.add_argument(
         "--list", action="store_true", help="List supported clients and which are detected, then exit.",
     )
-    configure_parser.add_argument(
+    register_parser.add_argument(
         "--python", help="Interpreter path to write into client configs (default: the current venv interpreter).",
     )
-    configure_parser.add_argument(
+    register_parser.add_argument(
         "--dry-run", action="store_true", help="Show what would change without writing any files.",
     )
-    configure_parser.add_argument(
-        "--run-setup", action="store_true", help="After configuring, launch the interactive Torque setup (opens browser).",
+    register_parser.add_argument(
+        "--run-setup", action="store_true", help="After registering, launch the interactive Torque setup (opens browser).",
     )
 
     # ssh subcommand (remote command via SSH)
@@ -4751,8 +4751,8 @@ PERFORMANCE TIP:
     return parser
 
 
-def _handle_configure_cli(args):
-    """Handle the 'configure' subcommand: register the MCP server with AI clients."""
+def _handle_register_mcp_client_cli(args):
+    """Handle 'register-mcp-client': register the MCP server with AI clients."""
     clients = onboarding_module.CLIENTS
 
     # --list: show supported clients and detection status, then exit.
@@ -4772,11 +4772,11 @@ def _handle_configure_cli(args):
         detected = onboarding_module.detect_clients()
         if not detected:
             print("No AI clients auto-detected. Use --client <name> or --all, or run "
-                  "'configure --list' to see options.", file=sys.stderr)
+                  "'register-mcp-client --list' to see options.", file=sys.stderr)
             sys.exit(1)
         print(f"Auto-detected clients: {', '.join(detected)}")
 
-    results = onboarding_module.configure(
+    results = onboarding_module.register_clients(
         clients=selected,
         all_clients=args.all,
         python=getattr(args, "python", None),
@@ -4833,11 +4833,11 @@ def main():
     parser = build_parser()
     args = parser.parse_args()
 
-    # The 'configure' subcommand registers this MCP server with AI clients. It
-    # does not need Torque config loaded, and handling it early avoids the
-    # missing-config warnings below.
-    if args.command == "configure":
-        _handle_configure_cli(args)
+    # The 'register-mcp-client' subcommand registers this MCP server with AI
+    # clients. It does not need Torque config loaded, and handling it early
+    # avoids the missing-config warnings below.
+    if args.command == "register-mcp-client":
+        _handle_register_mcp_client_cli(args)
         return
 
     # Load config file and store globally for runtime profile resolution

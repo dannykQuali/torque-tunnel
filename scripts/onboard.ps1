@@ -7,12 +7,12 @@
   the MCP server with your AI client(s) and (by default) launches the interactive
   Torque setup.
 
-  All arguments are passed through to the `configure` subcommand. With no
-  arguments it auto-detects installed clients and runs setup. Examples:
+  All arguments are passed through to the `register-mcp-client` subcommand. With
+  no arguments it auto-detects installed clients and runs setup. Examples:
 
     .\scripts\onboard.ps1                       # build + auto-detect + setup
     .\scripts\onboard.ps1 --list                # just list supported clients
-    .\scripts\onboard.ps1 --client claude-code  # configure one client, no setup
+    .\scripts\onboard.ps1 --client claude-code  # register one client, no setup
     .\scripts\onboard.ps1 --all --dry-run       # preview changes for all clients
 #>
 $ErrorActionPreference = "Stop"
@@ -40,6 +40,6 @@ if ($LASTEXITCODE -ne 0) { Write-Error "Installation failed."; exit 1 }
 $rest = $args
 if (-not $rest -or $rest.Count -eq 0) { $rest = @("--run-setup") }
 
-Write-Host "Configuring AI client(s) ..."
-& $venvPy -m torque_tunnel.mcp_tool configure @rest
+Write-Host "Registering MCP server with AI client(s) ..."
+& $venvPy -m torque_tunnel.mcp_tool register-mcp-client @rest
 exit $LASTEXITCODE

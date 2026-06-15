@@ -30,7 +30,7 @@ Then **restart your AI client** so it picks up the new MCP server.
 ### 1. Build
 
 The bootstrap scripts only locate Python (3.10+) and build the virtual
-environment, then hand off to the packaged `configure` subcommand — so all the
+environment, then hand off to the packaged `register-mcp-client` subcommand — so all the
 real logic is one cross-platform, tested Python implementation rather than
 duplicated shell code.
 
@@ -43,7 +43,7 @@ python -m venv .venv
 
 ### 2. Configure clients
 
-The `configure` subcommand writes the MCP server entry into each client's
+The `register-mcp-client` subcommand writes the MCP server entry into each client's
 config file. It is **safe and idempotent**:
 - It preserves all other content (other MCP servers, unrelated settings).
 - It backs up any existing file to `<file>.bak` before writing.
@@ -53,19 +53,19 @@ config file. It is **safe and idempotent**:
 
 ```bash
 # See what's supported and what's detected on this machine
-torque-tunnel configure --list
+torque-tunnel register-mcp-client --list
 
-# Auto-detect and configure (no setup)
-torque-tunnel configure
+# Auto-detect and register (no setup)
+torque-tunnel register-mcp-client
 
 # Configure specific clients
-torque-tunnel configure --client claude-code --client copilot
+torque-tunnel register-mcp-client --client claude-code --client copilot
 
 # Configure everything, but only preview the changes
-torque-tunnel configure --all --dry-run
+torque-tunnel register-mcp-client --all --dry-run
 
 # Configure and immediately run the browser setup
-torque-tunnel configure --run-setup
+torque-tunnel register-mcp-client --run-setup
 ```
 
 > When invoked through the venv interpreter (as the bootstrap does), the server
@@ -97,7 +97,7 @@ and resolution order.
 | Claude Desktop | `mcpServers` | `%APPDATA%\Claude\claude_desktop_config.json` (+ macOS/Linux equivalents) |
 
 > Only Claude Code and Copilot are actively tested here; the others use the same
-> two schema families and are best-effort. `configure --list` always prints the
+> two schema families and are best-effort. `register-mcp-client --list` always prints the
 > exact path it will touch on your machine.
 
 ## Troubleshooting
@@ -108,6 +108,6 @@ and resolution order.
 - **Client doesn't show the tools** — restart the client; MCP servers are loaded
   at startup.
 - **`No AI clients auto-detected`** — pass `--client <name>` or `--all`, or run
-  `configure --list` to see the supported set.
-- **Headless server** — `--run-setup` opens a browser. On a server, configure
-  without it and run `setup` from a machine with a browser, or paste a token.
+  `register-mcp-client --list` to see the supported set.
+- **Headless server** — `--run-setup` opens a browser. On a server, register the
+  client(s) without it and run `setup` from a machine with a browser, or paste a token.

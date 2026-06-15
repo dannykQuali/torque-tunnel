@@ -54,12 +54,12 @@ python -m venv .venv
 Then register the server with your client(s) and configure the connection:
 
 ```bash
-torque-tunnel configure --run-setup
+torque-tunnel register-mcp-client --run-setup
 ```
 
-- `configure` writes the MCP server entry into each client's config (safe,
+- `register-mcp-client` writes the MCP server entry into each client's config (safe,
   idempotent, backs up existing files). See [docs/onboarding.md](docs/onboarding.md).
-- `setup` (or `configure --run-setup`) opens a browser to authenticate with
+- `setup` (or `register-mcp-client --run-setup`) opens a browser to authenticate with
   Torque and save settings to `~/.torque-tunnel/config.yaml`. See
   [docs/configuration.md](docs/configuration.md).
 
@@ -107,7 +107,7 @@ The same entry point is a CLI outside of any AI client:
 
 ```bash
 # Onboarding / config
-torque-tunnel configure --list          # show supported clients + detection
+torque-tunnel register-mcp-client --list          # show supported clients + detection
 torque-tunnel setup                      # interactive Torque login (browser)
 torque-tunnel profiles                   # list configured profiles
 torque-tunnel serve                      # run as an MCP server (stdio)
@@ -143,13 +143,13 @@ torque-tunnel --profile lab-server-1 ssh "uname -a"
 - All execution is audited in Torque's environment logs.
 - Dangerous commands (reboot, shutdown, `docker restart`, etc.) are blocked by
   default; pass `allow_dangerous_commands` / `--allow-dangerous-commands` to override.
-- `configure` backs up any client config before modifying it and never
+- `register-mcp-client` backs up any client config before modifying it and never
   overwrites a config it cannot parse.
 
 ## Troubleshooting
 
 - **AI client doesn't show the tools** — restart the client (MCP servers load at startup).
-- **"Torque ... not configured"** — run `torque-tunnel setup` (or `configure --run-setup`).
+- **"Torque ... not configured"** — run `torque-tunnel setup` (or `register-mcp-client --run-setup`).
 - **"Environment did not complete within X seconds"** — the command may be slow; check the Torque UI and use `--timeout` to extend.
 - **SSH connection refused** — ensure the Torque agent can reach the target on port 22.
 
@@ -168,7 +168,7 @@ torque-tunnel/
 │   ├── persistent-container.yaml         # Persistent container blueprint
 │   └── local-shell-executor.yaml         # Disposable container blueprint
 ├── src/torque_tunnel/
-│   ├── mcp_tool.py                       # MCP server + CLI (tools, subcommands, configure)
+│   ├── mcp_tool.py                       # MCP server + CLI (tools, subcommands, register-mcp-client)
 │   ├── torque_client.py                  # Torque API client
 │   ├── config.py                         # Config file loading + profile resolution
 │   ├── auth.py                           # Browser-based interactive login/setup

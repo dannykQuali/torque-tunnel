@@ -11,8 +11,8 @@
   //
   // or, if torque-tunnel is already installed:
   //
-  //     torque-tunnel configure --run-setup
-  //     torque-tunnel configure --list      # show the exact file per client
+  //     torque-tunnel register-mcp-client --run-setup
+  //     torque-tunnel register-mcp-client --list   # show the exact file per client
   //
   // ----------------------------------------------------------------------------
   // If you DO want to configure manually, add the entry below to your client's

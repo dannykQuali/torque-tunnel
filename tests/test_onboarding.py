@@ -1,4 +1,4 @@
-"""Tests for the cross-platform onboarding/configure logic.
+"""Tests for the cross-platform onboarding / client-registration logic.
 
 These exercise the real production code in torque_tunnel.onboarding. Filesystem
 locations are redirected with monkeypatch (Path.home + APPDATA), so no real user
@@ -284,11 +284,11 @@ def test_dry_run_does_not_write(fake_home):
 
 
 # ---------------------------------------------------------------------------
-# orchestrator: configure()
+# orchestrator: register_clients()
 # ---------------------------------------------------------------------------
 
 def test_configure_explicit_clients(fake_home):
-    results = onboarding.configure(["claude-code", "cursor"], python="/x/py", system="Linux")
+    results = onboarding.register_clients(["claude-code", "cursor"], python="/x/py", system="Linux")
     assert {r.client for r in results} == {"claude-code", "cursor"}
     assert all(r.status == "created" for r in results)
     assert (fake_home / ".claude.json").exists()
@@ -297,23 +297,23 @@ def test_configure_explicit_clients(fake_home):
 
 def test_configure_auto_detect_only_present(fake_home):
     (fake_home / ".claude.json").write_text("{}", encoding="utf-8")
-    results = onboarding.configure(system="Linux", python="/x/py")
+    results = onboarding.register_clients(system="Linux", python="/x/py")
     assert [r.client for r in results] == ["claude-code"]
 
 
 def test_configure_all_clients(fake_home):
-    results = onboarding.configure(all_clients=True, python="/x/py", system="Linux")
+    results = onboarding.register_clients(all_clients=True, python="/x/py", system="Linux")
     assert {r.client for r in results} == set(onboarding.CLIENTS)
 
 
 def test_configure_dry_run_writes_nothing(fake_home):
-    results = onboarding.configure(["claude-code"], python="/x/py", system="Linux", dry_run=True)
+    results = onboarding.register_clients(["claude-code"], python="/x/py", system="Linux", dry_run=True)
     assert results[0].status == "dry-run"
     assert not (fake_home / ".claude.json").exists()
 
 
 def test_configure_correct_family_per_client(fake_home):
-    onboarding.configure(["claude-code", "copilot"], python="/x/py", system="Linux")
+    onboarding.register_clients(["claude-code", "copilot"], python="/x/py", system="Linux")
     claude = json.loads((fake_home / ".claude.json").read_text(encoding="utf-8"))
     copilot = json.loads((fake_home / ".config" / "Code" / "User" / "mcp.json").read_text(encoding="utf-8"))
     assert "type" not in claude["mcpServers"]["torque-tunnel"]
@@ -322,7 +322,7 @@ def test_configure_correct_family_per_client(fake_home):
 
 # ---------------------------------------------------------------------------
 # CLI subcommand: parsing + handler dispatch (exercises mcp_tool.build_parser
-# and _handle_configure_cli end-to-end)
+# and _handle_register_mcp_client_cli end-to-end)
 # ---------------------------------------------------------------------------
 
 from torque_tunnel import mcp_tool
@@ -330,39 +330,39 @@ from torque_tunnel import mcp_tool
 
 def test_configure_subcommand_parses_flags():
     args = mcp_tool.build_parser().parse_args(
-        ["configure", "--client", "claude-code", "--client", "cursor", "--dry-run"]
+        ["register-mcp-client", "--client", "claude-code", "--client", "cursor", "--dry-run"]
     )
-    assert args.command == "configure"
+    assert args.command == "register-mcp-client"
     assert args.client == ["claude-code", "cursor"]
     assert args.dry_run is True
 
 
 def test_configure_subcommand_rejects_unknown_client():
     with pytest.raises(SystemExit):
-        mcp_tool.build_parser().parse_args(["configure", "--client", "nope"])
+        mcp_tool.build_parser().parse_args(["register-mcp-client", "--client", "nope"])
 
 
-def test_handle_configure_cli_writes_selected_client(fake_home, capsys):
+def test_handle_register_cli_writes_selected_client(fake_home, capsys):
     args = mcp_tool.build_parser().parse_args(
-        ["configure", "--client", "claude-code", "--python", "/x/py"]
+        ["register-mcp-client", "--client", "claude-code", "--python", "/x/py"]
     )
-    mcp_tool._handle_configure_cli(args)
+    mcp_tool._handle_register_mcp_client_cli(args)
     out = capsys.readouterr().out
     assert "claude-code" in out
     data = json.loads((fake_home / ".claude.json").read_text(encoding="utf-8"))
     assert data["mcpServers"]["torque-tunnel"]["command"] == "/x/py"
 
 
-def test_handle_configure_cli_list_exits_cleanly(fake_home, capsys):
-    args = mcp_tool.build_parser().parse_args(["configure", "--list"])
-    mcp_tool._handle_configure_cli(args)        # must not raise / exit
+def test_handle_register_cli_list_exits_cleanly(fake_home, capsys):
+    args = mcp_tool.build_parser().parse_args(["register-mcp-client", "--list"])
+    mcp_tool._handle_register_mcp_client_cli(args)        # must not raise / exit
     out = capsys.readouterr().out
     assert "claude-code" in out and "copilot" in out
 
 
-def test_handle_configure_cli_no_detection_exits_1(fake_home):
+def test_handle_register_cli_no_detection_exits_1(fake_home):
     # empty fake home → nothing detected, no --client/--all → exit 1
-    args = mcp_tool.build_parser().parse_args(["configure"])
+    args = mcp_tool.build_parser().parse_args(["register-mcp-client"])
     with pytest.raises(SystemExit) as exc:
-        mcp_tool._handle_configure_cli(args)
+        mcp_tool._handle_register_mcp_client_cli(args)
     assert exc.value.code == 1

@@ -189,7 +189,7 @@ list_profiles()
 
 With a config file, the client's MCP entry shrinks to just how to launch the
 server. There are two schema families depending on the client (let
-`torque-tunnel configure` write the right one automatically — see
+`torque-tunnel register-mcp-client` write the right one automatically — see
 [onboarding.md](onboarding.md)).
 
 **`mcpServers` family** — Claude Code (`~/.claude.json`), Cursor, Windsurf, Claude Desktop:
