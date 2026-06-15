@@ -185,19 +185,38 @@ Or discover profiles first:
 list_profiles()
 ```
 
-### Simplified MCP server config (mcp.json)
+### Simplified MCP server config
 
-With a config file, `mcp.json` shrinks to:
+With a config file, the client's MCP entry shrinks to just how to launch the
+server. There are two schema families depending on the client (let
+`torque-tunnel configure` write the right one automatically — see
+[onboarding.md](onboarding.md)).
+
+**`mcpServers` family** — Claude Code (`~/.claude.json`), Cursor, Windsurf, Claude Desktop:
 
 ```jsonc
 {
-  "servers": {
+  "mcpServers": {
     "torque-tunnel": {
-      "command": "C:\\ZeroTouch\\torque-tunnel\\.venv\\Scripts\\torque-tunnel.exe",
-      "args": []
+      "command": "C:\\ZeroTouch\\torque-tunnel\\.venv\\Scripts\\python.exe",
+      "args": ["-m", "torque_tunnel.mcp_tool"]
     }
   }
 }
 ```
 
-Optionally override the default profile: `"args": ["--profile", "lab-server-1"]`
+**`servers` family** — GitHub Copilot / VS Code (`%APPDATA%\Code\User\mcp.json`); note `"type": "stdio"`:
+
+```jsonc
+{
+  "servers": {
+    "torque-tunnel": {
+      "type": "stdio",
+      "command": "C:\\ZeroTouch\\torque-tunnel\\.venv\\Scripts\\python.exe",
+      "args": ["-m", "torque_tunnel.mcp_tool"]
+    }
+  }
+}
+```
+
+Optionally override the default profile by appending to `args`: `"args": ["-m", "torque_tunnel.mcp_tool", "--profile", "lab-server-1"]`

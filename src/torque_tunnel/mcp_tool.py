@@ -32,6 +32,7 @@ from .torque_client import TorqueClient
 from . import croc_manager
 from . import config as config_module
 from . import auth as auth_module
+from . import onboarding as onboarding_module
 
 
 # Shared compiled patterns for filtering grain/execution logs.
@@ -4664,6 +4665,31 @@ PERFORMANCE TIP:
     # setup subcommand (interactive Torque setup)
     subparsers.add_parser("setup", parents=[common_parser], help="Set up Torque connection interactively (opens browser)")
 
+    # configure subcommand (register this MCP server with AI clients)
+    configure_parser = subparsers.add_parser(
+        "configure",
+        help="Register the torque-tunnel MCP server with AI clients (Claude Code, Copilot, Cursor, ...)",
+    )
+    configure_parser.add_argument(
+        "--client", action="append", choices=list(onboarding_module.CLIENTS),
+        help="Client to configure (repeatable). Default: auto-detect installed clients.",
+    )
+    configure_parser.add_argument(
+        "--all", action="store_true", help="Configure every supported client, detected or not.",
+    )
+    configure_parser.add_argument(
+        "--list", action="store_true", help="List supported clients and which are detected, then exit.",
+    )
+    configure_parser.add_argument(
+        "--python", help="Interpreter path to write into client configs (default: the current venv interpreter).",
+    )
+    configure_parser.add_argument(
+        "--dry-run", action="store_true", help="Show what would change without writing any files.",
+    )
+    configure_parser.add_argument(
+        "--run-setup", action="store_true", help="After configuring, launch the interactive Torque setup (opens browser).",
+    )
+
     # ssh subcommand (remote command via SSH)
     ssh_parser = subparsers.add_parser("ssh", parents=[common_parser], help="Execute a command on remote server via SSH")
     ssh_parser.add_argument("cmd", nargs='?', help="The shell command to execute (optional if --upload used)")
@@ -4725,11 +4751,95 @@ PERFORMANCE TIP:
     return parser
 
 
+def _handle_configure_cli(args):
+    """Handle the 'configure' subcommand: register the MCP server with AI clients."""
+    clients = onboarding_module.CLIENTS
+
+    # --list: show supported clients and detection status, then exit.
+    if getattr(args, "list", False):
+        detected = set(onboarding_module.detect_clients())
+        print("Supported AI clients:\n")
+        for name, spec in clients.items():
+            mark = "detected" if name in detected else "not detected"
+            tested = "" if spec.tested else " [untested]"
+            print(f"  {name:<16} {spec.display}{tested}")
+            print(f"  {'':<16} {spec.note}")
+            print(f"  {'':<16} config: {onboarding_module.config_path(name)}  ({mark})\n")
+        return
+
+    selected = args.client or None
+    if not selected and not args.all:
+        detected = onboarding_module.detect_clients()
+        if not detected:
+            print("No AI clients auto-detected. Use --client <name> or --all, or run "
+                  "'configure --list' to see options.", file=sys.stderr)
+            sys.exit(1)
+        print(f"Auto-detected clients: {', '.join(detected)}")
+
+    results = onboarding_module.configure(
+        clients=selected,
+        all_clients=args.all,
+        python=getattr(args, "python", None),
+        dry_run=args.dry_run,
+    )
+
+    if not results:
+        print("Nothing to configure.", file=sys.stderr)
+        sys.exit(1)
+
+    had_error = False
+    for r in results:
+        if r.status == "aborted":
+            had_error = True
+            print(f"  [SKIP] {r.client}: {r.reason}\n         {r.path}")
+        elif r.status == "dry-run":
+            print(f"  [DRY-RUN] {r.client}: would {r.reason} {r.path}")
+        elif r.status == "unchanged":
+            print(f"  [OK] {r.client}: already configured ({r.path})")
+        else:
+            backup = f"  (backup: {r.backup})" if r.backup else ""
+            print(f"  [{r.status.upper()}] {r.client}: {r.path}{backup}")
+
+    if not args.dry_run:
+        print("\nRestart the affected client(s) so they pick up the new MCP server.")
+
+    if args.run_setup and not args.dry_run:
+        print("\nLaunching interactive Torque setup...")
+        loaded = config_module.load_config()
+        torque_url = config_module.get_top_level_defaults(loaded).get("torque_url")
+        config_path = config_module.find_config_file()
+
+        async def run_setup():
+            auth_server = auth_module.TorqueAuthServer(
+                torque_url=torque_url or None,
+                config_path=str(config_path) if config_path else None,
+            )
+            result = await auth_server.run()
+            if result is None:
+                print("Setup cancelled.", file=sys.stderr)
+                return
+            lines = ["\nSetup complete! Configured profile:"]
+            lines.extend(_format_profile_entry(result))
+            print("\n".join(lines))
+
+        asyncio.run(run_setup())
+
+    if had_error:
+        sys.exit(1)
+
+
 def main():
     """Main entry point - supports both MCP server mode and CLI commands."""
     parser = build_parser()
     args = parser.parse_args()
-    
+
+    # The 'configure' subcommand registers this MCP server with AI clients. It
+    # does not need Torque config loaded, and handling it early avoids the
+    # missing-config warnings below.
+    if args.command == "configure":
+        _handle_configure_cli(args)
+        return
+
     # Load config file and store globally for runtime profile resolution
     global _loaded_config, _config_error, _default_profile_warning
     try:

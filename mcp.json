@@ -1,80 +1,64 @@
 {
   // ============================================================================
-  // torque-tunnel MCP Server Configuration
+  // torque-tunnel — manual MCP server configuration template
   // ============================================================================
   //
-  // SETUP: Add the "torque-tunnel" server entry below to your VS Code MCP config at:
-  //        %APPDATA%\Code\User\mcp.json
-  //        (typically C:\Users\<USERNAME>\AppData\Roaming\Code\User\mcp.json)
-  //        If the file already exists with other servers, merge the "torque-tunnel"
-  //        entry into the existing "servers" object.
+  // EASIEST PATH: don't edit this by hand. Run the onboarding script, which
+  // detects your AI client(s) and writes the right entry to the right file:
   //
-  // HOW TO GET A LONG TOKEN:
-  //   You need a short-lived Bearer token first (obtained when you log in to Torque),
-  //   then exchange it for a long-lived token (~68 years) via the API.
+  //     Windows:        .\scripts\onboard.ps1
+  //     Linux/macOS:    ./scripts/onboard.sh
   //
-  //   Option A — Use the API Reference UI (review/dev servers only):
-  //     1. Log in to your Torque portal
-  //     2. Go to: https://<YOUR-TORQUE-DOMAIN>/api_reference/#/paths/api-token-longtoken/post
-  //     3. Click "Send API Request" — your session token is used automatically
-  //     4. Copy the "access_token" from the response
+  // or, if torque-tunnel is already installed:
   //
-  //   Option B — Use curl (works on any server including production):
-  //     1. Log in to Torque and grab your Bearer token from the browser:
-  //        - Open DevTools (F12) → Network tab → find any API request → copy the
-  //          Authorization header value (the part after "Bearer ")
-  //     2. Run:
-  //        curl -X POST https://<YOUR-TORQUE-DOMAIN>/api/token/longtoken \
-  //          -H "Authorization: Bearer <YOUR-SHORT-TOKEN>" \
-  //          -H "Accept: application/json" \
-  //          -H "Content-Type: application/json"
-  //     3. Copy the "access_token" from the JSON response
+  //     torque-tunnel configure --run-setup
+  //     torque-tunnel configure --list      # show the exact file per client
   //
-  //   Paste the resulting long token in --torque-token below.
+  // ----------------------------------------------------------------------------
+  // If you DO want to configure manually, add the entry below to your client's
+  // MCP config. There are two schema families:
   //
-  // RECOMMENDED: Create a dedicated Torque space for this MCP server.
-  //   Every command launches a separate Torque environment, so using your
-  //   regular space will mix MCP-generated environments with your own.
-  //   When creating a dedicated space, don't forget to assign your agent to it.
+  //   "mcpServers"  → Claude Code     ~/.claude.json
+  //                   Cursor          ~/.cursor/mcp.json
+  //                   Windsurf        ~/.codeium/windsurf/mcp_config.json
+  //                   Claude Desktop  %APPDATA%\Claude\claude_desktop_config.json
   //
-  // Most options below (SSH target, hooks, flags) can be provided at runtime
-  // by the AI agent — only the four Torque connection settings are essential
-  // to pre-configure here.
+  //   "servers"     → Copilot/VS Code %APPDATA%\Code\User\mcp.json
+  //                   (Linux:  ~/.config/Code/User/mcp.json,
+  //                    macOS:  ~/Library/Application Support/Code/User/mcp.json)
   //
-  // All options can also be set via environment variables (see comments below).
+  // The "servers" family additionally wants "type": "stdio" on each entry.
+  // Merge the "torque-tunnel" entry into the existing object — don't clobber
+  // other servers you already have.
+  //
+  // ----------------------------------------------------------------------------
+  // Connection settings (Torque URL / token / space / agent, SSH target, etc.)
+  // are NOT put here anymore. They live in ~/.torque-tunnel/config.yaml, created
+  // by `torque-tunnel setup`. That keeps this entry minimal and shared across
+  // the CLI and every client. See docs/configuration.md and docs/onboarding.md.
+  //
+  // Use your venv interpreter so the client launches the environment you built.
+  // The `-m torque_tunnel.mcp_tool` module form is preferred over the generated
+  // .exe (it works regardless of CWD and platform).
   // ============================================================================
-  "servers": {
+
+  // ---- mcpServers family (Claude Code / Cursor / Windsurf / Claude Desktop) ----
+  "mcpServers": {
     "torque-tunnel": {
-      "command": "C:\\ZeroTouch\\torque-tunnel\\.venv\\Scripts\\torque-tunnel.exe",
-      "args": [
-        // ---- Torque Connection ----
-        // None of these are required at startup — the AI agent can supply them at runtime.
-        // However, pre-configuring all four is strongly recommended so the AI doesn't
-        // have to supply them on every call.
-        "--torque-url", "https://<YOUR-TORQUE-DOMAIN>",       // Torque base URL (env: TORQUE_URL)
-        "--torque-token", "<YOUR-LONG-TOKEN>",                // Torque API long token (env: TORQUE_TOKEN) — see instructions above
-        "--torque-space", "<YOUR-SPACE-NAME>",                // Torque space name (env: TORQUE_SPACE) — use a dedicated space (see above)
-        "--torque-agent", "<YOUR-AGENT-NAME>",                // Torque agent name (env: TORQUE_AGENT) — must be assigned to the space above
-
-        // ---- Optional: Default SSH Target (for ssh/read/list commands) ----
-        // Pre-configure these if you have a default machine you want the tool to SSH into.
-        // The AI agent can also supply or override these at runtime.
-        "--ssh-key", "C:\\path\\to\\your\\private-key.pem",   // SSH private key file path or key content (env: SSH_KEY)
-        "--host", "10.0.0.1",                                 // Target server IP or hostname (env: TARGET_HOST)
-        "--ssh-user", "root",                                 // SSH username (env: SSH_USER)
-
-        // ---- Optional: Command Hooks ----
-        "--init-commands", "",                                 // Commands to run BEFORE every SSH command (env: INIT_COMMANDS)
-                                                               //   e.g. "export HTTP_PROXY=http://proxy:80; export HTTPS_PROXY=http://proxy:80"
-        "--finally-commands", ""                               // Commands to run AFTER every SSH command (env: FINALLY_COMMANDS)
-
-        // ---- Optional: Behavior Flags (uncomment as needed) ----
-        // "--auto-delete-environments"                        // Auto-delete Torque environments after completion (env: AUTO_DELETE_ENVIRONMENTS=true)
-                                                               //   NOTE: Torque environment deletion is admin-only and not well maintained — use with caution
-        // "--container-idle-timeout", "7200"                  // Idle timeout (seconds) for persistent containers before auto-cleanup (default: 7200 = 2h, env: CONTAINER_IDLE_TIMEOUT)
-        // "--verbose"                                         // Show full unfiltered Torque output — usually not needed; raw output is very noisy
-                                                               //   as it includes the entire blueprint bash command preamble
-      ]
+      "command": "C:\\ZeroTouch\\torque-tunnel\\.venv\\Scripts\\python.exe",
+      "args": ["-m", "torque_tunnel.mcp_tool"]
     }
   }
+
+  // ---- servers family (Copilot / VS Code) — use this shape instead ----
+  // "servers": {
+  //   "torque-tunnel": {
+  //     "type": "stdio",
+  //     "command": "C:\\ZeroTouch\\torque-tunnel\\.venv\\Scripts\\python.exe",
+  //     "args": ["-m", "torque_tunnel.mcp_tool"]
+  //   }
+  // }
+
+  // ---- Optionally pin a profile from config.yaml ----
+  //   "args": ["-m", "torque_tunnel.mcp_tool", "--profile", "lab-server-1"]
 }
