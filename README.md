@@ -57,8 +57,8 @@ Then register the server with your client(s) and configure the connection:
 torque-tunnel register-mcp-client --run-setup
 ```
 
-- `register-mcp-client` writes the MCP server entry into each client's config (safe,
-  idempotent, backs up existing files). See [docs/onboarding.md](docs/onboarding.md).
+- `register-mcp-client` adds the MCP server entry to each client's config — only
+  if missing, preserving your file otherwise. See [docs/onboarding.md](docs/onboarding.md).
 - `setup` (or `register-mcp-client --run-setup`) opens a browser to authenticate with
   Torque and save settings to `~/.torque-tunnel/config.yaml`. See
   [docs/configuration.md](docs/configuration.md).
@@ -143,8 +143,10 @@ torque-tunnel --profile lab-server-1 ssh "uname -a"
 - All execution is audited in Torque's environment logs.
 - Dangerous commands (reboot, shutdown, `docker restart`, etc.) are blocked by
   default; pass `allow_dangerous_commands` / `--allow-dangerous-commands` to override.
-- `register-mcp-client` backs up any client config before modifying it and never
-  overwrites a config it cannot parse.
+- `register-mcp-client` only *adds* its entry — it leaves an already-registered
+  config untouched, preserves comments/formatting and other servers when
+  inserting, backs up to `<file>.bak` first, and never touches a config it
+  cannot parse.
 
 ## Troubleshooting
 

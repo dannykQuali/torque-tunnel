@@ -41,15 +41,24 @@ python -m venv .venv
 .venv/bin/python    -m pip install -e .      # Linux/macOS
 ```
 
-### 2. Configure clients
+### 2. Register clients
 
-The `register-mcp-client` subcommand writes the MCP server entry into each client's
-config file. It is **safe and idempotent**:
-- It preserves all other content (other MCP servers, unrelated settings).
-- It backs up any existing file to `<file>.bak` before writing.
-- It refuses to overwrite a config it cannot parse (you'll get a `[SKIP]` and a
+The `register-mcp-client` subcommand adds the MCP server entry to each client's
+config file. It is an **onboarding** action and is deliberately conservative —
+it's your file:
+- **If `torque-tunnel` is already present, the file is left completely untouched**
+  (byte-for-byte) — it does *not* re-point or reformat an existing entry. You'll
+  see `already configured`.
+- **When adding, it only inserts** the entry and preserves everything else
+  verbatim — comments, formatting, trailing commas, and other servers. (It backs
+  up to `<file>.bak` first.)
+- It refuses to touch a config it cannot parse (you'll get a `[SKIP]` and a
   pointer to the file).
-- Re-running reports `already configured` and changes nothing.
+- A brand-new config file is written as clean JSON.
+
+> Maintaining the entry after first onboarding — e.g. pointing it at a new venv —
+> is your responsibility (just edit the file, or ask your AI agent). The tool
+> won't overwrite what's already there.
 
 ```bash
 # See what's supported and what's detected on this machine
@@ -58,13 +67,13 @@ torque-tunnel register-mcp-client --list
 # Auto-detect and register (no setup)
 torque-tunnel register-mcp-client
 
-# Configure specific clients
+# Register specific clients
 torque-tunnel register-mcp-client --client claude-code --client copilot
 
-# Configure everything, but only preview the changes
+# Register with everything, but only preview the changes
 torque-tunnel register-mcp-client --all --dry-run
 
-# Configure and immediately run the browser setup
+# Register and immediately run the browser setup
 torque-tunnel register-mcp-client --run-setup
 ```
 

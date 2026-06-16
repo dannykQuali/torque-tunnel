@@ -147,7 +147,7 @@ def test_merge_preserves_other_servers_and_keys(fake_home):
     entry = onboarding.server_entry("mcpServers", python="/x/py")
 
     res = onboarding.merge_entry(path, "mcpServers", entry)
-    assert res.status == "updated"
+    assert res.status == "added"
     assert res.backup is not None and res.backup.exists()
 
     data = json.loads(path.read_text(encoding="utf-8"))
@@ -182,20 +182,26 @@ def test_merge_idempotent_second_run_unchanged(fake_home):
     assert path.read_text(encoding="utf-8") == first       # byte-identical, no rewrite
 
 
-def test_merge_updates_when_entry_changes(fake_home):
+def test_merge_does_not_touch_existing_entry_even_if_different(fake_home):
+    """If torque-tunnel is already present, the file is left completely untouched
+    — we do NOT re-point or 'upgrade' it. That's the user's job past onboarding."""
     path = fake_home / ".claude.json"
     onboarding.merge_entry(path, "mcpServers", onboarding.server_entry("mcpServers", python="/old/py"))
+    before = path.read_text(encoding="utf-8")
+
     res = onboarding.merge_entry(path, "mcpServers", onboarding.server_entry("mcpServers", python="/new/py"))
-    assert res.status == "updated"
+    assert res.status == "unchanged"
+    assert res.backup is None
+    assert path.read_text(encoding="utf-8") == before       # byte-identical
     data = json.loads(path.read_text(encoding="utf-8"))
-    assert data["mcpServers"]["torque-tunnel"]["command"] == "/new/py"
+    assert data["mcpServers"]["torque-tunnel"]["command"] == "/old/py"   # NOT changed
 
 
 # ---------------------------------------------------------------------------
 # merge_entry: JSONC and abort safety
 # ---------------------------------------------------------------------------
 
-def test_merge_handles_jsonc_with_comments(fake_home):
+def test_merge_adds_to_jsonc_preserving_comments(fake_home):
     path = fake_home / "mcp.json"
     jsonc = """{
         // a line comment with // and a "fake string"
@@ -208,8 +214,15 @@ def test_merge_handles_jsonc_with_comments(fake_home):
     entry = onboarding.server_entry("servers", python="/x/py")
 
     res = onboarding.merge_entry(path, "servers", entry)
-    assert res.status == "updated"
-    data = json.loads(path.read_text(encoding="utf-8"))
+    assert res.status == "added"
+
+    raw = path.read_text(encoding="utf-8")
+    # Comments MUST survive (the whole point — it's the user's file).
+    assert "// a line comment" in raw
+    assert "/* block comment */" in raw
+    # And the entry is added, existing preserved (parse leniently — comments remain).
+    data, ok = onboarding._load_lenient(raw)
+    assert ok
     assert data["servers"]["existing"] == {"command": "c", "args": []}
     assert data["servers"]["torque-tunnel"] == entry
 
@@ -221,7 +234,7 @@ def test_strip_jsonc_does_not_touch_comment_markers_inside_strings():
     }
 
 
-def test_merge_handles_trailing_commas(fake_home):
+def test_merge_adds_to_file_with_trailing_commas(fake_home):
     path = fake_home / "mcp.json"
     jsonc = """{
         "servers": {
@@ -231,10 +244,96 @@ def test_merge_handles_trailing_commas(fake_home):
     path.write_text(jsonc, encoding="utf-8")
     entry = onboarding.server_entry("servers", python="/x/py")
     res = onboarding.merge_entry(path, "servers", entry)
-    assert res.status == "updated"
-    data = json.loads(path.read_text(encoding="utf-8"))
+    assert res.status == "added"
+    data, ok = onboarding._load_lenient(path.read_text(encoding="utf-8"))
+    assert ok
     assert data["servers"]["existing"] == {"command": "c", "args": []}
     assert data["servers"]["torque-tunnel"] == entry
+
+
+def test_merge_skips_present_entry_in_commented_file_byte_identical(fake_home):
+    """The real-world copilot case: torque-tunnel already present in a heavily
+    commented file → leave the file byte-for-byte untouched (comments survive)."""
+    path = fake_home / "mcp.json"
+    original = """{
+        // user's notes and alternative configs
+        "servers": {
+            "torque-tunnel": {
+                "command": "C:\\\\old\\\\python.exe",
+                "args": [
+                    "-m", "torque_tunnel.mcp_tool"
+                    /* "--torque-url", "https://review1...",  alt config kept as reference */
+                ]
+            },
+            "other": {"command": "x", "args": []}
+        }
+    }"""
+    path.write_text(original, encoding="utf-8")
+    # A *different* entry is offered, but presence wins → no touch.
+    res = onboarding.merge_entry(path, "servers", onboarding.server_entry("servers", python="/new/py"))
+    assert res.status == "unchanged"
+    assert res.backup is None
+    assert path.read_text(encoding="utf-8") == original           # byte-identical
+    assert "alt config kept as reference" in path.read_text(encoding="utf-8")
+
+
+def test_merge_preserves_comment_in_otherwise_empty_object(fake_home):
+    """Adding to a family object that has no members but DOES have a comment must
+    keep the comment and not produce a trailing comma."""
+    path = fake_home / "mcp.json"
+    original = '{\n  "servers": {\n    /* todo: add servers here */\n  }\n}'
+    path.write_text(original, encoding="utf-8")
+    res = onboarding.merge_entry(path, "servers", onboarding.server_entry("servers", python="/x/py"))
+    assert res.status == "added"
+    raw = path.read_text(encoding="utf-8")
+    assert "/* todo: add servers here */" in raw
+    data, ok = onboarding._load_lenient(raw)
+    assert ok
+    assert data["servers"]["torque-tunnel"]["command"] == "/x/py"
+
+
+def test_merge_keeps_lf_line_endings(fake_home):
+    """On Windows, adding to an LF file must NOT flip the whole file to CRLF."""
+    path = fake_home / ".claude.json"
+    original = '{\n  "mcpServers": {\n    "existing": {"command": "x"}\n  }\n}\n'
+    path.write_bytes(original.encode("utf-8"))
+    res = onboarding.merge_entry(path, "mcpServers", onboarding.server_entry("mcpServers", python="/x/py"))
+    assert res.status == "added"
+    raw = path.read_bytes().decode("utf-8")
+    assert "\r\n" not in raw                                  # stayed LF
+    data, ok = onboarding._load_lenient(raw)
+    assert ok and data["mcpServers"]["torque-tunnel"]["command"] == "/x/py"
+    assert data["mcpServers"]["existing"] == {"command": "x"}
+
+
+def test_merge_keeps_crlf_line_endings(fake_home):
+    path = fake_home / ".claude.json"
+    original = '{\r\n  "mcpServers": {\r\n    "existing": {"command": "x"}\r\n  }\r\n}\r\n'
+    path.write_bytes(original.encode("utf-8"))
+    res = onboarding.merge_entry(path, "mcpServers", onboarding.server_entry("mcpServers", python="/x/py"))
+    assert res.status == "added"
+    raw = path.read_bytes().decode("utf-8")
+    assert "\r\n" in raw
+    assert "\n" not in raw.replace("\r\n", "")                # no bare LF introduced
+    data, ok = onboarding._load_lenient(raw)
+    assert ok and "torque-tunnel" in data["mcpServers"]
+
+
+def test_merge_adds_family_to_commented_root_preserving_comments(fake_home):
+    path = fake_home / ".claude.json"
+    original = """{
+        // keep me
+        "otherTool": {"command": "z", "args": []}
+    }"""
+    path.write_text(original, encoding="utf-8")
+    res = onboarding.merge_entry(path, "mcpServers", onboarding.server_entry("mcpServers", python="/x/py"))
+    assert res.status == "added"
+    raw = path.read_text(encoding="utf-8")
+    assert "// keep me" in raw                                     # comment preserved
+    data, ok = onboarding._load_lenient(raw)
+    assert ok
+    assert data["otherTool"] == {"command": "z", "args": []}       # other content preserved
+    assert data["mcpServers"]["torque-tunnel"]["command"] == "/x/py"
 
 
 def test_remove_trailing_commas_preserves_commas_in_strings():

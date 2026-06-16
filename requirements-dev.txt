@@ -1,0 +1,9 @@
+# Development / test dependencies.
+# Install into the project venv used for running the test suite:
+#   python -m pip install -r requirements-dev.txt
+#
+# (Kept separate from requirements.txt so the runtime install stays minimal.)
+
+pytest>=8.2
+pytest-asyncio>=0.23
+hypothesis>=6.100
