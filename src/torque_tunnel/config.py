@@ -33,6 +33,10 @@ CONFIG_KEY_MAP = {
     "auto_delete_environments": "auto_delete_environments",
     "verbose": "verbose",
     "container_idle_timeout": "container_idle_timeout",
+    "retry_enabled": "retry_enabled",
+    "retry_budget_seconds": "retry_budget_seconds",
+    "create_retry_budget_seconds": "create_retry_budget_seconds",
+    "retry_max_backoff_seconds": "retry_max_backoff_seconds",
 }
 
 # Profile YAML keys → MCP tool argument names (for injection into tool arguments)

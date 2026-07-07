@@ -89,6 +89,10 @@ These can appear at the top level and/or inside any profile:
 | `auto_delete_environments` | Auto-delete environments after completion |
 | `verbose` | Show full unfiltered output |
 | `container_idle_timeout` | Idle timeout for persistent containers (seconds) |
+| `retry_enabled` | Master switch for transient-error retries + idempotent creates (default `true`) |
+| `retry_budget_seconds` | Max consecutive outage tolerated while polling/monitoring, in seconds (default `600`, sized for a ~10-min Torque redeploy) |
+| `create_retry_budget_seconds` | Budget for idempotent environment create + reconcile, in seconds (default `600`) |
+| `retry_max_backoff_seconds` | Exponential-backoff cap between retries, in seconds (default `15`) |
 
 ### Top-level-only keys
 

@@ -934,6 +934,11 @@ _config = {
     "auto_delete_environments": False,
     "verbose": False,
     "container_idle_timeout": 7200,
+    # Resilience to Torque redeploys (transient API errors). See docs/design-api-resilience.md.
+    "retry_enabled": True,
+    "retry_budget_seconds": 600,
+    "create_retry_budget_seconds": 600,
+    "retry_max_backoff_seconds": 15,
 }
 
 # Default values for _config keys (used to reset removed keys on hot-reload)
@@ -1234,6 +1239,10 @@ def get_torque_client(torque_url=None, torque_token=None, torque_space=None, con
         default_agent=cfg["default_agent"],
         init_commands=cfg["init_commands"],
         finally_commands=cfg["finally_commands"],
+        retry_enabled=cfg.get("retry_enabled", True),
+        retry_budget_seconds=cfg.get("retry_budget_seconds", 600),
+        create_retry_budget_seconds=cfg.get("create_retry_budget_seconds", 600),
+        retry_max_backoff_seconds=cfg.get("retry_max_backoff_seconds", 15),
     )
 
 
@@ -1289,6 +1298,10 @@ docker restart/stop/kill, systemctl restart docker, reboot, shutdown, init 0/6
                     "command": {
                         "type": "string",
                         "description": "The shell command to execute on the remote server. Optional if only uploading files via upload_files.",
+                    },
+                    "command_description": {
+                        "type": "string",
+                        "description": "REQUIRED. A concise (3-6 word) description of what this command does, embedded in the Torque environment name so a user can find this environment in the Torque UI (e.g. 'restart nginx').",
                     },
                     "upload_files": {
                         "type": "array",
@@ -1367,7 +1380,7 @@ docker restart/stop/kill, systemctl restart docker, reboot, shutdown, init 0/6
                         "description": "Configuration profile name to use. Omit this parameter (or don't pass it) to use the default profile. Do NOT pass 'default' as the value — that would look for a profile literally named 'default'. Use list_profiles to see available profiles and which one is the default.",
                     },
                 },
-                "required": [],
+                "required": ["command_description"],
             },
         ),
         Tool(
@@ -1387,6 +1400,10 @@ for local network/VMs use regular terminal commands):
                     "command": {
                         "type": "string",
                         "description": "The shell command to execute on the agent container. Optional if only uploading files via upload_files.",
+                    },
+                    "command_description": {
+                        "type": "string",
+                        "description": "REQUIRED. A concise (3-6 word) description of what this command does, embedded in the Torque environment name so a user can find this environment in the Torque UI (e.g. 'restart nginx').",
                     },
                     "upload_files": {
                         "type": "array",
@@ -1457,7 +1474,7 @@ for local network/VMs use regular terminal commands):
                         "description": "Configuration profile name to use. Omit this parameter (or don't pass it) to use the default profile. Do NOT pass 'default' as the value — that would look for a profile literally named 'default'. Use list_profiles to see available profiles and which one is the default.",
                     },
                 },
-                "required": [],
+                "required": ["command_description"],
             },
         ),
         Tool(
@@ -1485,6 +1502,10 @@ Without the ID, a new container is created.
                     "command": {
                         "type": "string",
                         "description": "The shell command to execute on the agent container. Optional if only uploading files via upload_files.",
+                    },
+                    "command_description": {
+                        "type": "string",
+                        "description": "REQUIRED. A concise (3-6 word) description of what this command does, embedded in the Torque environment name so a user can find this environment in the Torque UI (e.g. 'restart nginx').",
                     },
                     "upload_files": {
                         "type": "array",
@@ -1542,6 +1563,10 @@ Without the ID, a new container is created.
                         "type": "boolean",
                         "description": "Set to true to create a new persistent container instead of reusing the current one. Old containers remain active.",
                     },
+                    "container_description": {
+                        "type": "string",
+                        "description": "REQUIRED (may be an empty string). A concise description of the persistent container itself (its purpose/session), embedded in the container's Torque environment name. Only applied when a NEW container is created (first call, new_container=true, or respawn); ignored when reusing an existing container — pass an empty string in that case. Distinct from command_description, which names each command environment.",
+                    },
                     "environment_id": {
                         "type": "string",
                         "description": "Target a specific persistent container by its environment ID. If omitted, uses the most recently used container (or creates one).",
@@ -1563,7 +1588,7 @@ Without the ID, a new container is created.
                         "description": "Configuration profile name to use. Omit this parameter (or don't pass it) to use the default profile. Do NOT pass 'default' as the value — that would look for a profile literally named 'default'. Use list_profiles to see available profiles and which one is the default.",
                     },
                 },
-                "required": [],
+                "required": ["command_description", "container_description"],
             },
         ),
         Tool(
@@ -1604,6 +1629,10 @@ systemctl restart docker, reboot, shutdown, init 0/6""",
                     "command": {
                         "type": "string",
                         "description": "The shell command to execute on the remote server.",
+                    },
+                    "command_description": {
+                        "type": "string",
+                        "description": "REQUIRED. A concise (3-6 word) description of what this command does, embedded in the Torque environment name so a user can find this environment in the Torque UI (e.g. 'restart nginx').",
                     },
                     "upload_files": {
                         "type": "array",
@@ -1678,7 +1707,7 @@ systemctl restart docker, reboot, shutdown, init 0/6""",
                         "description": "Configuration profile name to use. Omit this parameter (or don't pass it) to use the default profile. Do NOT pass 'default' as the value — that would look for a profile literally named 'default'. Use list_profiles to see available profiles and which one is the default.",
                     },
                 },
-                "required": ["command"],
+                "required": ["command", "command_description"],
             },
         ),
         Tool(
@@ -1700,6 +1729,10 @@ After restart: pass previous `environment_id` to reconnect.""",
                     "command": {
                         "type": "string",
                         "description": "The shell command to execute on the agent container.",
+                    },
+                    "command_description": {
+                        "type": "string",
+                        "description": "REQUIRED. A concise (3-6 word) description of what this command does, embedded in the Torque environment name so a user can find this environment in the Torque UI (e.g. 'restart nginx').",
                     },
                     "upload_files": {
                         "type": "array",
@@ -1753,6 +1786,10 @@ After restart: pass previous `environment_id` to reconnect.""",
                         "type": "boolean",
                         "description": "Set to true to create a new persistent container instead of reusing the current one. Old containers remain active.",
                     },
+                    "container_description": {
+                        "type": "string",
+                        "description": "REQUIRED (may be an empty string). A concise description of the persistent container itself (its purpose/session), embedded in the container's Torque environment name. Only applied when a NEW container is created (first call, new_container=true, or respawn); ignored when reusing an existing container — pass an empty string in that case. Distinct from command_description, which names each command environment.",
+                    },
                     "environment_id": {
                         "type": "string",
                         "description": "Target a specific persistent container by its environment ID. If omitted, uses the most recently used container (or creates one).",
@@ -1778,7 +1815,7 @@ After restart: pass previous `environment_id` to reconnect.""",
                         "description": "Configuration profile name to use. Omit this parameter (or don't pass it) to use the default profile. Do NOT pass 'default' as the value — that would look for a profile literally named 'default'. Use list_profiles to see available profiles and which one is the default.",
                     },
                 },
-                "required": ["command"],
+                "required": ["command", "command_description", "container_description"],
             },
         ),
         Tool(
@@ -1797,6 +1834,10 @@ Only for unreachable internal network targets. For local network/VMs, use termin
                     "command": {
                         "type": "string",
                         "description": "The shell command to execute on the agent container.",
+                    },
+                    "command_description": {
+                        "type": "string",
+                        "description": "REQUIRED. A concise (3-6 word) description of what this command does, embedded in the Torque environment name so a user can find this environment in the Torque UI (e.g. 'restart nginx').",
                     },
                     "upload_files": {
                         "type": "array",
@@ -1867,7 +1908,7 @@ Only for unreachable internal network targets. For local network/VMs, use termin
                         "description": "Configuration profile name to use. Omit this parameter (or don't pass it) to use the default profile. Do NOT pass 'default' as the value — that would look for a profile literally named 'default'. Use list_profiles to see available profiles and which one is the default.",
                     },
                 },
-                "required": ["command"],
+                "required": ["command", "command_description"],
             },
         ),
         Tool(
@@ -2129,6 +2170,7 @@ async def handle_run_on_tunneled_ssh(arguments: dict, config: dict = None):
         private_key_value = config.get("default_ssh_key")
         ssh_password = config.get("default_ssh_password")
     command = arguments.get("command")
+    command_description = arguments.get("command_description")
     files = arguments.get("upload_files", [])
     download_files = arguments.get("download_files", [])
     agent = arguments.get("torque_agent")
@@ -2255,6 +2297,10 @@ async def handle_run_on_tunneled_ssh(arguments: dict, config: dict = None):
             default_agent=config["default_agent"],
             init_commands=config["init_commands"],
             finally_commands=config["finally_commands"],
+            retry_enabled=config.get("retry_enabled", True),
+            retry_budget_seconds=config.get("retry_budget_seconds", 600),
+            create_retry_budget_seconds=config.get("create_retry_budget_seconds", 600),
+            retry_max_backoff_seconds=config.get("retry_max_backoff_seconds", 15),
         )
         async with client:
             result = await client.execute_remote_command(
@@ -2270,6 +2316,8 @@ async def handle_run_on_tunneled_ssh(arguments: dict, config: dict = None):
                 ssh_password=ssh_password,
                 container_pre_commands=container_pre_commands,
                 download_commands=dl_plan.download_commands if dl_plan else None,
+                command_description=command_description,
+                environment_kind="ssh",
             )
             
             # Try to get grain log for additional context (especially useful on failures)
@@ -2372,6 +2420,7 @@ async def _ensure_persistent_container(
     torque_token: Optional[str] = None,
     torque_space: Optional[str] = None,
     config: Optional[dict] = None,
+    container_description: Optional[str] = None,
 ) -> dict:
     """
     Ensure a persistent container is running and return its connection details.
@@ -2452,9 +2501,9 @@ async def _ensure_persistent_container(
                 del _persistent_containers[_default_persistent_container_id]
                 _default_persistent_container_id = None
     
-    # Launch a new persistent container  
+    # Launch a new persistent container
     async with get_torque_client(torque_url, torque_token, torque_space, config=cfg) as client:
-        env_id = await client.start_persistent_container(agent=agent_name)
+        env_id = await client.start_persistent_container(agent=agent_name, container_description=container_description)
         print(f"[torque-tunnel] Launching persistent container (env: {env_id})...", file=sys.stderr, flush=True)
         
         info = await client.get_persistent_container_info(env_id)
@@ -2485,6 +2534,8 @@ async def handle_run_on_tunneled_persistent_container(arguments: dict, config: d
     """
     cfg = config or _config
     command = arguments.get("command")
+    command_description = arguments.get("command_description")
+    container_description = arguments.get("container_description")
     files = arguments.get("upload_files", [])
     download_files = arguments.get("download_files", [])
     agent = arguments.get("torque_agent")
@@ -2494,7 +2545,7 @@ async def handle_run_on_tunneled_persistent_container(arguments: dict, config: d
     torque_url = arguments.get("torque_url")
     torque_token = arguments.get("torque_token")
     torque_space = arguments.get("torque_space")
-    
+
     # Must have at least command OR upload_files OR download_files
     if not command and not files and not download_files:
         return [TextContent(
@@ -2504,7 +2555,7 @@ async def handle_run_on_tunneled_persistent_container(arguments: dict, config: d
 
     try:
         # Ensure we have a persistent container running
-        container_info = await _ensure_persistent_container(agent=agent, new_container=new_container, environment_id=target_env_id, torque_url=torque_url, torque_token=torque_token, torque_space=torque_space, config=cfg)
+        container_info = await _ensure_persistent_container(agent=agent, new_container=new_container, environment_id=target_env_id, torque_url=torque_url, torque_token=torque_token, torque_space=torque_space, config=cfg, container_description=container_description)
         container_ip = container_info["container_ip"]
         private_key = container_info["private_key"]
         env_id = container_info["environment_id"]
@@ -2588,8 +2639,11 @@ async def handle_run_on_tunneled_persistent_container(arguments: dict, config: d
                 init_commands=init_commands,
                 container_pre_commands=container_pre_commands,
                 download_commands=dl_plan.download_commands if dl_plan else None,
+                command_description=command_description,
+                environment_kind="persistent-command",
+                parent_env_id=env_id,
             )
-            
+
             grain_log = None
             try:
                 grain_log = await client.get_grain_log(result.environment_id)
@@ -2698,6 +2752,7 @@ async def handle_run_on_tunneled_disposable_container(arguments: dict, config: d
     """Execute a command on a fresh Torque agent container, optionally uploading files first."""
     cfg = config or _config
     command = arguments.get("command")
+    command_description = arguments.get("command_description")
     files = arguments.get("upload_files", [])
     download_files = arguments.get("download_files", [])
     agent = arguments.get("torque_agent")
@@ -2781,8 +2836,9 @@ async def handle_run_on_tunneled_disposable_container(arguments: dict, config: d
                 log_callback=log_callback,
                 init_commands=init_commands,
                 download_commands=dl_plan.download_commands if dl_plan else None,
+                command_description=command_description,
             )
-            
+
             # Try to get grain log for additional context (especially useful on failures)
             grain_log = None
             try:
@@ -2888,6 +2944,7 @@ async def handle_run_on_tunneled_ssh_async(arguments: dict, config: dict = None)
         private_key_value = cfg.get("default_ssh_key")
         ssh_password = cfg.get("default_ssh_password")
     command = arguments.get("command")
+    command_description = arguments.get("command_description")
     files = arguments.get("upload_files", [])
     download_files = arguments.get("download_files", [])
     agent = arguments.get("torque_agent")
@@ -2981,8 +3038,10 @@ async def handle_run_on_tunneled_ssh_async(arguments: dict, config: dict = None)
                 ssh_password=ssh_password,
                 container_pre_commands=container_pre_commands,
                 download_commands=dl_plan.download_commands if dl_plan else None,
+                command_description=command_description,
+                environment_kind="ssh",
             )
-        
+
         # Track croc state for cleanup when execution completes
         async_state = {}
         if croc_process is not None:
@@ -3037,6 +3096,8 @@ async def handle_run_on_tunneled_persistent_container_async(arguments: dict, con
     """
     cfg = config or _config
     command = arguments.get("command")
+    command_description = arguments.get("command_description")
+    container_description = arguments.get("container_description")
     files = arguments.get("upload_files", [])
     download_files = arguments.get("download_files", [])
     agent = arguments.get("torque_agent")
@@ -3046,13 +3107,13 @@ async def handle_run_on_tunneled_persistent_container_async(arguments: dict, con
     torque_url = arguments.get("torque_url")
     torque_token = arguments.get("torque_token")
     torque_space = arguments.get("torque_space")
-    
+
     if not command and not files and not download_files:
         return [TextContent(type="text", text="Error: Must provide either 'command', 'upload_files', or 'download_files' (or any combination).")]
 
     try:
         # Ensure persistent container is up (this blocks until ready)
-        container_info = await _ensure_persistent_container(agent=agent, new_container=new_container, environment_id=target_env_id, torque_url=torque_url, torque_token=torque_token, torque_space=torque_space, config=cfg)
+        container_info = await _ensure_persistent_container(agent=agent, new_container=new_container, environment_id=target_env_id, torque_url=torque_url, torque_token=torque_token, torque_space=torque_space, config=cfg, container_description=container_description)
         container_ip = container_info["container_ip"]
         private_key = container_info["private_key"]
         env_id = container_info["environment_id"]
@@ -3120,6 +3181,9 @@ async def handle_run_on_tunneled_persistent_container_async(arguments: dict, con
                 timeout=timeout,
                 container_pre_commands=container_pre_commands,
                 download_commands=dl_plan.download_commands if dl_plan else None,
+                command_description=command_description,
+                environment_kind="persistent-command",
+                parent_env_id=env_id,
             )
             
             # Track croc state for cleanup when execution completes
@@ -3188,6 +3252,7 @@ async def handle_run_on_tunneled_disposable_container_async(arguments: dict, con
     """Start a disposable container command without waiting for completion."""
     cfg = config or _config
     command = arguments.get("command")
+    command_description = arguments.get("command_description")
     files = arguments.get("upload_files", [])
     download_files = arguments.get("download_files", [])
     agent = arguments.get("torque_agent")
@@ -3250,8 +3315,9 @@ async def handle_run_on_tunneled_disposable_container_async(arguments: dict, con
                 init_commands=init_commands,
                 timeout=timeout,
                 download_commands=dl_plan.download_commands if dl_plan else None,
+                command_description=command_description,
             )
-        
+
         # Track croc state for cleanup when execution completes
         async_state = {}
         if croc_process is not None:
@@ -3809,6 +3875,7 @@ async def cli_dispatch(args):
             timeout = getattr(args, 'timeout', None)
             allow_dangerous_commands = getattr(args, 'allow_dangerous_commands', False)
             output_json = getattr(args, 'json', False)
+            command_description = getattr(args, 'description', None)
             uploads = parse_uploads(getattr(args, 'upload', None))
             downloads = parse_downloads(getattr(args, 'download', None))
             cmd = getattr(args, 'cmd', None)
@@ -3901,6 +3968,8 @@ async def cli_dispatch(args):
                         ssh_password=ssh_password,
                         container_pre_commands=container_pre_commands,
                         download_commands=dl_plan.download_commands if dl_plan and dl_plan.needs_download else None,
+                        command_description=command_description,
+                        environment_kind="ssh",
                     )
             finally:
                 await cleanup_croc_resources(croc_process, plan.croc_staging_dir if plan else "")
@@ -3951,12 +4020,14 @@ async def cli_dispatch(args):
             env_id = getattr(args, 'env_id', None)
             new_container = getattr(args, 'new', False)
             release_all = getattr(args, 'all', False)
-            
+            command_description = getattr(args, 'description', None)
+            container_description = getattr(args, 'container_description', None)
+
             # Handle sub-actions: create, list, release
             if cmd == "create":
                 # Create a new persistent container and output its env_id
                 try:
-                    container_info = await _ensure_persistent_container(agent=agent, new_container=True)
+                    container_info = await _ensure_persistent_container(agent=agent, new_container=True, container_description=container_description)
                     cid = container_info["environment_id"]
                     agent_name = container_info.get("agent", agent or _config["default_agent"])
                     _save_container_to_state(cid, agent_name)
@@ -4066,7 +4137,8 @@ async def cli_dispatch(args):
                 
                 try:
                     container_info = await _ensure_persistent_container(
-                        agent=agent, new_container=new_container, environment_id=target_env_id
+                        agent=agent, new_container=new_container, environment_id=target_env_id,
+                        container_description=container_description,
                     )
                     container_ip = container_info["container_ip"]
                     private_key = container_info["private_key"]
@@ -4141,6 +4213,9 @@ async def cli_dispatch(args):
                             init_commands=init_commands,
                             container_pre_commands=container_pre_commands,
                             download_commands=dl_plan.download_commands if dl_plan and dl_plan.needs_download else None,
+                            command_description=command_description,
+                            environment_kind="persistent-command",
+                            parent_env_id=used_env_id,
                         )
                     
                         # Extend idle timeout
@@ -4204,6 +4279,7 @@ async def cli_dispatch(args):
             uploads = parse_uploads(getattr(args, 'upload', None))
             downloads = parse_downloads(getattr(args, 'download', None))
             cmd = getattr(args, 'cmd', None)
+            command_description = getattr(args, 'description', None)
             
             # Must have command or uploads or downloads
             if not cmd and not uploads and not downloads:
@@ -4262,6 +4338,7 @@ async def cli_dispatch(args):
                         log_callback=cli_log_callback(""),
                         init_commands=init_commands,
                         download_commands=dl_plan.download_commands if dl_plan and dl_plan.needs_download else None,
+                        command_description=command_description,
                     )
             finally:
                 await cleanup_croc_resources(croc_process, plan.croc_staging_dir if plan else "")
@@ -4330,7 +4407,7 @@ async def cli_dispatch(args):
             # Build safe read command
             escaped_path = args.path.replace("'", "'\\''") 
             cmd = f"head -c {max_size} '{escaped_path}' 2>/dev/null || cat '{escaped_path}' 2>&1"
-            
+
             async with get_torque_client() as client:
                 result = await client.execute_remote_command(
                     target_ip=target_ip,
@@ -4341,6 +4418,8 @@ async def cli_dispatch(args):
                     timeout=timeout,
                     auto_cleanup=_config["auto_delete_environments"],
                     ssh_password=ssh_password,
+                    command_description=f"read {args.path}",
+                    environment_kind="ssh",
                 )
             
             if result.status == "completed":
@@ -4387,7 +4466,7 @@ async def cli_dispatch(args):
             
             escaped_path = args.path.replace("'", "'\\''") 
             cmd = f"ls {flags} '{escaped_path}'" if flags else f"ls '{escaped_path}'"
-            
+
             async with get_torque_client() as client:
                 result = await client.execute_remote_command(
                     target_ip=target_ip,
@@ -4398,6 +4477,8 @@ async def cli_dispatch(args):
                     timeout=timeout,
                     auto_cleanup=_config["auto_delete_environments"],
                     ssh_password=ssh_password,
+                    command_description=f"list {args.path}",
+                    environment_kind="ssh",
                 )
             
             if result.status == "completed":
@@ -4703,7 +4784,8 @@ PERFORMANCE TIP:
                               help="Upload local file/dir to remote path (can be repeated)")
     ssh_parser.add_argument("--download", action="append", metavar="REMOTE:LOCAL",
                               help="Download remote file/dir to local path after command runs (can be repeated)")
-    
+    ssh_parser.add_argument("--description", help="Optional short description embedded in the Torque environment name (for finding it in the UI)")
+
     # persistent-container subcommand (run on persistent Torque agent container)
     pc_parser = subparsers.add_parser("persistent-container", parents=[common_parser],
                                        help="Execute a command on a persistent Torque agent container (state preserved across calls)")
@@ -4717,6 +4799,8 @@ PERFORMANCE TIP:
     pc_parser.add_argument("--download", action="append", metavar="REMOTE:LOCAL",
                              help="Download file/dir from container to local path after command runs (can be repeated)")
     pc_parser.add_argument("--all", action="store_true", help="Release all containers (used with 'release' action)")
+    pc_parser.add_argument("--description", help="Optional short description of the command, embedded in the command's Torque environment name")
+    pc_parser.add_argument("--container-description", help="Optional short description of the persistent container itself; used only when a new container is created")
 
     # disposable-container subcommand (run on fresh Torque agent container)
     dc_parser = subparsers.add_parser("disposable-container", parents=[common_parser],
@@ -4728,7 +4812,8 @@ PERFORMANCE TIP:
                              help="Upload local file/dir to container (can be repeated)")
     dc_parser.add_argument("--download", action="append", metavar="REMOTE:LOCAL",
                              help="Download file/dir from container to local path after command runs (can be repeated)")
-    
+    dc_parser.add_argument("--description", help="Optional short description embedded in the Torque environment name (for finding it in the UI)")
+
     # read subcommand
     read_parser = subparsers.add_parser("read", parents=[common_parser], help="Read a file from remote server")
     read_parser.add_argument("path", help="Remote file path to read")

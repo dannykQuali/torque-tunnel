@@ -5,9 +5,11 @@ Torque API Client for interacting with Quali Torque REST API.
 import asyncio
 import base64
 import gzip
+import random
 import re
 import sys
 import time
+import uuid
 from pathlib import Path
 from typing import Optional, Callable, Awaitable
 from dataclasses import dataclass
@@ -17,6 +19,77 @@ import httpx
 # Resolve blueprints directory relative to this file:
 # src/torque_tunnel/torque_client.py -> ../../.. -> project root -> /blueprints
 _BLUEPRINTS_DIR = Path(__file__).resolve().parent.parent.parent / "blueprints"
+
+
+# --- Resilience: transient-error classification ---------------------------------
+# Status codes we treat as transient (worth retrying). Per design decision we retry
+# 401 (auth backend flaps during a Torque redeploy) but NOT 403; 429 for rate limits;
+# and any 5xx. This is the single place to add codes as we encounter them.
+_TRANSIENT_STATUS_CODES = frozenset({401, 429})
+
+
+def _is_transient_status(status_code: int) -> bool:
+    """Whether an HTTP status code should be retried."""
+    return status_code >= 500 or status_code in _TRANSIENT_STATUS_CODES
+
+
+# httpx exception types that indicate a transient transport/network problem.
+_TRANSIENT_EXCEPTIONS = (httpx.TransportError, httpx.TimeoutException)
+
+
+# --- Idempotency key + environment naming ---------------------------------------
+# Label key carrying our client-generated idempotency id (queryable via ?labels=).
+LABEL_KEY = "torque-tunnel-id"
+# Label key linking a per-command environment back to its persistent container.
+PARENT_LABEL_KEY = "torque-tunnel-parent"
+
+# Max length of the human description segment embedded in an environment name.
+_MAX_DESCRIPTION_LEN = 60
+
+
+def generate_idempotency_key() -> str:
+    """Generate a case-insensitive, colon-free, URL/label-safe unique id.
+
+    Uses lowercase base32 of a random uuid4 (26 chars, alphabet [a-z2-7], 128 bits).
+    A case-insensitive alphabet keeps matching correct regardless of any case handling
+    in the stack (the Torque label DB query is case-sensitive while its in-memory label
+    equality is case-insensitive).
+    """
+    return base64.b32encode(uuid.uuid4().bytes).decode("ascii").rstrip("=").lower()
+
+
+def sanitize_description(description: Optional[str]) -> str:
+    """Sanitize an AI-supplied description for embedding in an environment name.
+
+    Collapses whitespace, drops non-printable/control chars, trims, and caps length.
+    Returns "" when there is nothing usable.
+    """
+    if not description:
+        return ""
+    collapsed = re.sub(r"\s+", " ", description).strip()
+    cleaned = "".join(ch for ch in collapsed if ch.isprintable())
+    if len(cleaned) > _MAX_DESCRIPTION_LEN:
+        cleaned = cleaned[:_MAX_DESCRIPTION_LEN].rstrip()
+    return cleaned
+
+
+def build_environment_name(kind: str, description: Optional[str], key: str) -> str:
+    """Build an environment name: tunneled-<description>-<kind>-<key>.
+
+    The description (when present) leads so it isn't hidden behind a long kind prefix
+    in the Torque UI; the kind and the idempotency key follow. Without a description the
+    name is tunneled-<kind>-<key>.
+
+    Args:
+        kind: environment role, e.g. "ssh", "disposable-container",
+              "persistent-container", "persistent-command".
+        description: optional human-oriented description (sanitized).
+        key: the idempotency key (stable suffix).
+    """
+    desc = sanitize_description(description)
+    if desc:
+        return f"tunneled-{desc}-{kind}-{key}"
+    return f"tunneled-{kind}-{key}"
 
 
 @dataclass
@@ -72,10 +145,14 @@ class TorqueClient:
         poll_interval: int = 2,
         init_commands: Optional[str] = None,
         finally_commands: Optional[str] = None,
+        retry_enabled: bool = True,
+        retry_budget_seconds: float = 600,
+        create_retry_budget_seconds: float = 600,
+        retry_max_backoff_seconds: float = 15,
     ):
         """
         Initialize Torque client.
-        
+
         Args:
             base_url: Torque base URL (e.g., https://portal.qtorque.io)
             token: Torque API token
@@ -85,6 +162,11 @@ class TorqueClient:
             poll_interval: How often to check environment status (seconds)
             init_commands: Commands to run before every SSH command (e.g., proxy setup)
             finally_commands: Commands to run after every SSH command (cleanup)
+            retry_enabled: Master switch for transient-error retries and idempotent creates
+            retry_budget_seconds: Max consecutive outage tolerated for idempotent ops and
+                monitoring (sized for a ~10-min Torque rollout)
+            create_retry_budget_seconds: Budget for idempotent create + reconcile
+            retry_max_backoff_seconds: Exponential-backoff cap
         """
         self.base_url = base_url.rstrip("/")
         self.token = token
@@ -94,7 +176,11 @@ class TorqueClient:
         self.poll_interval = poll_interval
         self.init_commands = init_commands or ""
         self.finally_commands = finally_commands or ""
-        
+        self.retry_enabled = retry_enabled
+        self.retry_budget_seconds = retry_budget_seconds
+        self.create_retry_budget_seconds = create_retry_budget_seconds
+        self.retry_max_backoff_seconds = retry_max_backoff_seconds
+
         self._client = httpx.AsyncClient(
             base_url=f"{self.base_url}/api",
             headers={
@@ -113,7 +199,164 @@ class TorqueClient:
     
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self.close()
-    
+
+    # --- Retry helpers ----------------------------------------------------------
+
+    def _backoff_delay(self, attempt: int) -> float:
+        """Exponential backoff with jitter, capped at retry_max_backoff_seconds.
+
+        attempt is 1-based (first retry -> attempt 1).
+        """
+        base = min(2 ** (attempt - 1), self.retry_max_backoff_seconds)
+        jitter = random.uniform(0, min(0.5, base))
+        return min(base + jitter, self.retry_max_backoff_seconds)
+
+    async def _request_with_retry(
+        self,
+        method: str,
+        url: str,
+        *,
+        budget_seconds: Optional[float] = None,
+        **kwargs,
+    ) -> httpx.Response:
+        """Send an HTTP request, retrying transient failures within a time budget.
+
+        Retries on transient statuses (5xx/401/429) and transient transport errors,
+        with exponential backoff. Non-transient responses (success or permanent 4xx) are
+        returned as-is for the caller to handle. On budget exhaustion the last transient
+        response is returned (so the caller's own status handling still applies), or the
+        last transport exception is re-raised if no response was obtained.
+
+        Intended for idempotent operations only. Not used by wait_for_environment, which
+        implements its own two-budget (wait-timeout vs. outage) accounting.
+        """
+        if not self.retry_enabled:
+            return await self._client.request(method, url, **kwargs)
+
+        budget = budget_seconds if budget_seconds is not None else self.retry_budget_seconds
+        deadline = time.monotonic() + budget
+        attempt = 0
+        last_response: Optional[httpx.Response] = None
+        last_exc: Optional[Exception] = None
+
+        while True:
+            try:
+                response = await self._client.request(method, url, **kwargs)
+                if not _is_transient_status(response.status_code):
+                    return response
+                last_response = response
+                last_exc = None
+            except _TRANSIENT_EXCEPTIONS as e:
+                last_exc = e
+                last_response = None
+
+            now = time.monotonic()
+            if now >= deadline:
+                if last_response is not None:
+                    return last_response
+                raise last_exc  # type: ignore[misc]
+
+            attempt += 1
+            delay = min(self._backoff_delay(attempt), max(0.0, deadline - now))
+            await asyncio.sleep(delay)
+
+    async def _reconcile_find(self, key: str, budget_seconds: float) -> Optional[str]:
+        """Find an environment previously created with idempotency `key`.
+
+        Queries by exact label containment (torque-tunnel-id:<key>). This must never
+        return a false negative: it only returns None when the server was reachable and
+        confirmed no such environment exists. If the server can't be reached within the
+        budget it RAISES, so the create loop keeps waiting rather than re-POSTing (which
+        would risk double-executing the user command).
+
+        Returns the environment id if found, None if confirmed-absent.
+        """
+        response = await self._request_with_retry(
+            "GET",
+            f"/spaces/{self.space}/environments",
+            budget_seconds=budget_seconds,
+            params={
+                "labels": f"{LABEL_KEY}:{key}",
+                "match_all_labels": "true",
+            },
+        )
+        # A lingering transient status here means we could NOT confirm -> raise.
+        response.raise_for_status()
+        envs = response.json()
+        if not isinstance(envs, list):
+            return None
+        matches = [e.get("id") for e in envs if isinstance(e, dict) and e.get("id")]
+        if not matches:
+            return None
+        if len(matches) > 1:
+            # A unique idempotency key can match at most one environment. More than one
+            # means the label filter was ignored/malformed and we got an unfiltered list.
+            # Adopting a random one could hijack a stranger's environment, so fail safe
+            # (this neither re-POSTs nor adopts a wrong env).
+            raise RuntimeError(
+                f"Reconciliation for key {key} returned {len(matches)} environments; "
+                f"refusing to adopt ambiguously (label filter may be malfunctioning)."
+            )
+        return matches[0]
+
+    async def _create_environment_idempotent(self, payload: dict, key: str) -> str:
+        """POST an environment create, retrying transient failures safely.
+
+        Guarantees at-most-once creation: on any transient failure we reconcile by
+        `key` before deciding to re-POST. We only re-POST when the server is reachable
+        and confirms the environment does not exist. On a permanent error we fail fast.
+        """
+        url = f"/spaces/{self.space}/environments"
+
+        # Fast path: retries disabled -> single attempt, original behavior.
+        if not self.retry_enabled:
+            response = await self._client.post(url, json=payload)
+            if response.status_code >= 400:
+                raise RuntimeError(
+                    f"Torque API error {response.status_code} creating environment: {response.text}"
+                )
+            return response.json()["id"]
+
+        deadline = time.monotonic() + self.create_retry_budget_seconds
+        attempt = 0
+
+        while True:
+            transient = False
+            try:
+                response = await self._client.post(url, json=payload)
+                if response.status_code < 400:
+                    return response.json()["id"]
+                if not _is_transient_status(response.status_code):
+                    raise RuntimeError(
+                        f"Torque API error {response.status_code} creating environment: {response.text}"
+                    )
+                transient = True
+            except _TRANSIENT_EXCEPTIONS:
+                transient = True
+
+            # We could not confirm the POST landed. Reconcile within the remaining
+            # budget: adopt if it exists, re-POST only if confirmed absent.
+            assert transient
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(
+                    f"Torque environment create did not succeed within "
+                    f"{self.create_retry_budget_seconds}s (transient errors)."
+                )
+            found = await self._reconcile_find(key, budget_seconds=remaining)
+            if found:
+                return found
+
+            now = time.monotonic()
+            if now >= deadline:
+                raise RuntimeError(
+                    f"Torque environment create did not succeed within "
+                    f"{self.create_retry_budget_seconds}s (transient errors)."
+                )
+            attempt += 1
+            delay = min(self._backoff_delay(attempt), max(0.0, deadline - now))
+            await asyncio.sleep(delay)
+
     async def start_environment(
         self,
         target_ip: str,
@@ -128,17 +371,20 @@ class TorqueClient:
         ssh_password: Optional[str] = None,
         container_pre_commands: Optional[str] = None,
         download_commands: Optional[str] = None,
+        command_description: Optional[str] = None,
+        environment_kind: str = "ssh",
+        parent_env_id: Optional[str] = None,
     ) -> str:
         """
         Start a new environment to execute remote command.
-        
+
         Args:
             target_ip: Target host IP/hostname
             ssh_user: SSH username
             ssh_private_key: SSH private key (raw PEM format). Use this OR ssh_password.
             command: Command to execute
             agent: Agent name (uses default if not specified)
-            environment_name: Optional name for the environment
+            environment_name: Optional explicit name (overrides the generated name)
             init_commands: Optional commands to run before main command (overrides instance default)
             finally_commands: Optional cleanup commands (overrides instance default)
             timeout: Optional timeout override in seconds (overrides instance default)
@@ -147,18 +393,23 @@ class TorqueClient:
                 (e.g., croc file receive + SCP to target). Only used by remote-shell-executor.
             download_commands: Optional commands to run on the container AFTER the main command
                 completes (e.g., SCP from target + croc send to local for file downloads).
-            
+            command_description: Optional human-oriented description embedded in the name.
+            environment_kind: Naming kind ("ssh" or "persistent-command").
+            parent_env_id: If set (persistent-command), added as a parent label linking
+                this command environment to its persistent container.
+
         Returns:
             Environment ID
         """
         agent_name = agent or self.default_agent
         if not agent_name:
             raise ValueError("Agent name must be provided either as argument or default")
-        
-        # Generate environment name if not provided
+
+        # Idempotency key + name/labels
+        key = generate_idempotency_key()
         if not environment_name:
-            environment_name = f"shell-cmd-{int(time.time())}"
-        
+            environment_name = build_environment_name(environment_kind, command_description, key)
+
         # Combine instance defaults with per-call overrides:
         # Global init (e.g. proxy vars) runs FIRST, then per-call init (e.g. file deployment)
         if init_commands is not None and self.init_commands:
@@ -201,22 +452,21 @@ class TorqueClient:
             "environment_name": environment_name,
             "duration": "PT8H",  # 8 hours (irrelevant for workflows, they auto-terminate)
             "inputs": inputs,
+            "labels": self._build_labels(key, parent_env_id),
             # Standalone blueprint: send YAML inline so no GitHub repo is needed
             "base64_standalone_blueprint": self._load_standalone_blueprint(self.BLUEPRINT_NAME),
         }
-        
-        response = await self._client.post(
-            f"/spaces/{self.space}/environments",
-            json=payload,
-        )
-        if response.status_code >= 400:
-            raise RuntimeError(
-                f"Torque API error {response.status_code} creating environment: {response.text}"
-            )
-        
-        data = response.json()
-        return data["id"]
-    
+
+        return await self._create_environment_idempotent(payload, key)
+
+    @staticmethod
+    def _build_labels(key: str, parent_env_id: Optional[str] = None) -> list[dict]:
+        """Build the create-payload labels array (idempotency id + optional parent link)."""
+        labels = [{"key": LABEL_KEY, "value": key}]
+        if parent_env_id:
+            labels.append({"key": PARENT_LABEL_KEY, "value": parent_env_id})
+        return labels
+
     async def start_local_environment(
         self,
         command: str,
@@ -225,30 +475,35 @@ class TorqueClient:
         init_commands: Optional[str] = None,
         timeout: Optional[int] = None,
         download_commands: Optional[str] = None,
+        command_description: Optional[str] = None,
     ) -> str:
         """
         Start a new environment to execute command locally on the agent container.
-        
+
         Args:
             command: Command to execute
             agent: Agent name (uses default if not specified)
-            environment_name: Optional name for the environment
+            environment_name: Optional explicit name (overrides the generated name)
             init_commands: Optional commands to run before the main command (prepended to global init_commands)
             timeout: Optional timeout override in seconds (overrides instance default)
             download_commands: Optional commands to run after execution completes
                 (e.g., croc send to local for file downloads).
-            
+            command_description: Optional human-oriented description embedded in the name.
+
         Returns:
             Environment ID
         """
         agent_name = agent or self.default_agent
         if not agent_name:
             raise ValueError("Agent name must be provided either as argument or default")
-        
-        # Generate environment name if not provided
+
+        # Idempotency key + name/labels
+        key = generate_idempotency_key()
         if not environment_name:
-            environment_name = f"local-cmd-{int(time.time())}"
-        
+            environment_name = build_environment_name(
+                "disposable-container", command_description, key
+            )
+
         # Combine per-call init_commands with global init_commands
         # Global init (e.g. proxy vars) runs FIRST, then per-call init (e.g. file deployment)
         combined_init = None
@@ -283,42 +538,38 @@ class TorqueClient:
             "environment_name": environment_name,
             "duration": "PT8H",  # 8 hours (irrelevant for workflows, they auto-terminate)
             "inputs": inputs,
+            "labels": self._build_labels(key),
             # Standalone blueprint: send YAML inline so no GitHub repo is needed
             "base64_standalone_blueprint": self._load_standalone_blueprint(self.LOCAL_BLUEPRINT_NAME),
         }
-        
-        response = await self._client.post(
-            f"/spaces/{self.space}/environments",
-            json=payload,
-        )
-        if response.status_code >= 400:
-            raise RuntimeError(
-                f"Torque API error {response.status_code} creating environment: {response.text}"
-            )
-        
-        data = response.json()
-        return data["id"]
-    
-    async def get_environment_status(self, environment_id: str) -> dict:
+
+        return await self._create_environment_idempotent(payload, key)
+
+    async def get_environment_status(self, environment_id: str, retry: bool = True) -> dict:
         """
         Get environment status and details.
-        
+
         Args:
             environment_id: Environment ID
-            
+            retry: Whether to retry transient errors within retry_budget_seconds.
+                Callers with their own error/outage accounting (wait_for_environment,
+                get_grain_log) pass retry=False.
+
         Returns:
             Environment details dict
         """
-        response = await self._client.get(
-            f"/spaces/{self.space}/environments/{environment_id}"
-        )
+        url = f"/spaces/{self.space}/environments/{environment_id}"
+        if retry:
+            response = await self._request_with_retry("GET", url)
+        else:
+            response = await self._client.get(url)
         response.raise_for_status()
         return response.json()
-    
+
     async def end_environment(self, environment_id: str, force: bool = False) -> None:
         """
         End/terminate a running environment (stops execution but keeps it in the system).
-        
+
         Args:
             environment_id: Environment ID
             force: Whether to force termination (for environments in transitional state)
@@ -327,8 +578,8 @@ class TorqueClient:
         url = f"/spaces/{self.space}/environments/{environment_id}"
         if force:
             url += "?force=true"
-        
-        response = await self._client.delete(url)
+
+        response = await self._request_with_retry("DELETE", url)
         
         # 404 is ok - environment may have already ended
         if response.status_code == 404:
@@ -359,9 +610,9 @@ class TorqueClient:
         url = f"/spaces/{self.space}/environments/{environment_id}/release"
         if force:
             url += "?force=true"
-        
-        response = await self._client.delete(url)
-        
+
+        response = await self._request_with_retry("DELETE", url)
+
         # 404 is ok - environment may have already been released/ended
         if response.status_code == 404:
             return
@@ -380,10 +631,11 @@ class TorqueClient:
         Args:
             environment_id: Environment ID
         """
-        # First, wait for environment to be in ended/terminated state
+        # First, wait for environment to be in ended/terminated state.
+        # retry=False: this loop already tolerates errors and polls repeatedly.
         for _ in range(10):  # Wait up to 50 seconds
             try:
-                env_data = await self.get_environment_status(environment_id)
+                env_data = await self.get_environment_status(environment_id, retry=False)
                 status = env_data.get("details", {}).get("computed_status", "").lower().replace(" ", "_")
                 if status in ("ended", "terminating", "terminated"):
                     break
@@ -391,18 +643,16 @@ class TorqueClient:
                 print(f"[WARNING] Error getting environment status (may be gone): {e}", file=sys.stderr)
                 return  # Environment may already be gone
             await asyncio.sleep(5)
-        
+
         # Use the /remove_state endpoint to fully delete from DB
-        response = await self._client.delete(
-            f"/spaces/{self.space}/environments/{environment_id}/remove_state"
+        response = await self._request_with_retry(
+            "DELETE",
+            f"/spaces/{self.space}/environments/{environment_id}/remove_state",
         )
         # 404 is ok - environment may have already been deleted
         if response.status_code != 404:
             response.raise_for_status()
-        # 404 is ok - environment may have already been deleted
-        if response.status_code != 404:
-            response.raise_for_status()
-    
+
     async def get_grain_log(self, environment_id: str) -> Optional[str]:
         """
         Get the grain activity log for an environment.
@@ -414,9 +664,10 @@ class TorqueClient:
             Log content as string, or None if not available
         """
         try:
-            env_data = await self.get_environment_status(environment_id)
+            # retry=False: best-effort log fetch inside polling loops; must stay snappy.
+            env_data = await self.get_environment_status(environment_id, retry=False)
             grains = env_data.get("details", {}).get("state", {}).get("grains", [])
-            
+
             if not grains:
                 return None
             
@@ -459,16 +710,25 @@ class TorqueClient:
             EnvironmentResult with command output
         """
         timeout = timeout or self.timeout
-        start_time = time.time()
+        start_time = time.monotonic()
+        # Two independent budgets (see docs/design-api-resilience.md §2):
+        #  - `timeout` (wait budget) counts only HEALTHY time; outage time is excluded.
+        #  - retry_budget_seconds bounds a single consecutive outage (Torque presumed down).
+        total_outage_seconds = 0.0   # accumulated closed-outage time (excluded from wait budget)
+        outage_start: Optional[float] = None  # monotonic start of the current outage, if any
+        outage_attempt = 0           # backoff attempt counter for the current outage
         last_log_content = ""  # Track actual content to detect rotation
-        consecutive_errors = 0  # Track consecutive errors to avoid infinite loops
-        max_consecutive_errors = 10  # Give up after this many consecutive errors
         output_marker = "=== Output (streaming) =========================================================================================================================\n"
         timestamp_pattern = re.compile(r'^\[\d{2}:\d{2}:\d{2}\.\d{3}\] ', re.MULTILINE)
-        
+
+        def _healthy_elapsed(now: float) -> float:
+            """Elapsed wall time minus all outage time (closed + ongoing)."""
+            ongoing = (now - outage_start) if outage_start is not None else 0.0
+            return now - start_time - total_outage_seconds - ongoing
+
         while True:
-            elapsed = time.time() - start_time
-            if elapsed > timeout:
+            now = time.monotonic()
+            if _healthy_elapsed(now) > timeout:
                 # Try to get partial output before returning timeout
                 partial_output = ""
                 try:
@@ -489,14 +749,16 @@ class TorqueClient:
                     command_output=partial_output,
                     error=f"Environment did not complete within {timeout} seconds. The output is partial.",
                 )
-            
+
             try:
-                env_data = await self.get_environment_status(environment_id)
-                consecutive_errors = 0  # Reset on success
-            except httpx.HTTPStatusError as e:
-                status_code = e.response.status_code
-                # 4xx client errors - return immediately (won't be fixed by retrying)
-                if 400 <= status_code < 500:
+                # retry=False: we do our own outage accounting here (retrying inside would
+                # blow the wait/outage budgets and stall polling).
+                env_data = await self.get_environment_status(environment_id, retry=False)
+            except (httpx.HTTPStatusError, *_TRANSIENT_EXCEPTIONS, Exception) as e:
+                status_code = e.response.status_code if isinstance(e, httpx.HTTPStatusError) else None
+
+                # Permanent errors -> return immediately (retrying won't help).
+                if status_code is not None and not _is_transient_status(status_code):
                     if status_code == 404:
                         return EnvironmentResult(
                             environment_id=environment_id,
@@ -508,29 +770,43 @@ class TorqueClient:
                         status="error",
                         error=f"HTTP {status_code} error: {e}",
                     )
-                # 5xx server errors - log and retry
-                consecutive_errors += 1
-                print(f"[WARNING] HTTP {status_code} error polling environment {environment_id} ({consecutive_errors}/{max_consecutive_errors}): {e}", file=sys.stderr)
-                if consecutive_errors >= max_consecutive_errors:
+
+                # Transient (5xx/401/429/network) -> outage handling.
+                if not self.retry_enabled:
                     return EnvironmentResult(
                         environment_id=environment_id,
                         status="error",
-                        error=f"Too many consecutive errors while polling environment: {e}",
+                        error=f"Error polling environment (retries disabled): {e}",
                     )
-                await asyncio.sleep(self.poll_interval)
-                continue
-            except Exception as e:
-                # Network errors, connection issues, etc.
-                consecutive_errors += 1
-                print(f"[WARNING] Error polling environment {environment_id} ({consecutive_errors}/{max_consecutive_errors}): {e}", file=sys.stderr)
-                if consecutive_errors >= max_consecutive_errors:
+                now = time.monotonic()
+                if outage_start is None:
+                    outage_start = now
+                    outage_attempt = 0
+                outage_elapsed = now - outage_start
+                if outage_elapsed > self.retry_budget_seconds:
                     return EnvironmentResult(
                         environment_id=environment_id,
                         status="error",
-                        error=f"Too many consecutive errors while polling environment: {e}",
+                        error=(
+                            f"Torque unreachable for {int(outage_elapsed)}s while polling "
+                            f"environment (exceeded retry budget {self.retry_budget_seconds}s): {e}"
+                        ),
                     )
-                await asyncio.sleep(self.poll_interval)
+                outage_attempt += 1
+                code_str = status_code if status_code is not None else "network"
+                print(
+                    f"[WARNING] {code_str} error polling environment {environment_id} "
+                    f"(outage {int(outage_elapsed)}s/{int(self.retry_budget_seconds)}s): {e}",
+                    file=sys.stderr,
+                )
+                await asyncio.sleep(min(self._backoff_delay(outage_attempt), self.poll_interval * 4))
                 continue
+
+            # Success: close any open outage (its duration is excluded from the wait budget).
+            if outage_start is not None:
+                total_outage_seconds += time.monotonic() - outage_start
+                outage_start = None
+                outage_attempt = 0
             
             # If we have a log callback, fetch and stream the log
             if log_callback:
@@ -728,16 +1004,19 @@ class TorqueClient:
         ssh_password: Optional[str] = None,
         container_pre_commands: Optional[str] = None,
         download_commands: Optional[str] = None,
+        command_description: Optional[str] = None,
+        environment_kind: str = "ssh",
+        parent_env_id: Optional[str] = None,
     ) -> EnvironmentResult:
         """
         Execute a remote command and wait for result.
-        
+
         This is the main high-level method that:
         1. Starts an environment
         2. Waits for completion
         3. Returns the command output
         4. Optionally cleans up the environment
-        
+
         Args:
             target_ip: Target host IP/hostname
             ssh_user: SSH username
@@ -752,7 +1031,10 @@ class TorqueClient:
             ssh_password: SSH password for authentication. Use this OR ssh_private_key.
             container_pre_commands: Optional commands to run on the container BEFORE SSH
                 (e.g., croc file receive + SCP to target).
-            
+            command_description: Optional human-oriented description embedded in the env name.
+            environment_kind: Naming kind ("ssh" or "persistent-command").
+            parent_env_id: For persistent-command, the parent container's env id (label link).
+
         Returns:
             EnvironmentResult with command output
         """
@@ -767,6 +1049,9 @@ class TorqueClient:
             ssh_password=ssh_password,
             container_pre_commands=container_pre_commands,
             download_commands=download_commands,
+            command_description=command_description,
+            environment_kind=environment_kind,
+            parent_env_id=parent_env_id,
         )
         
         result = None
@@ -797,13 +1082,14 @@ class TorqueClient:
         log_callback: Optional[Callable[[str], Awaitable[None]]] = None,
         init_commands: Optional[str] = None,
         download_commands: Optional[str] = None,
+        command_description: Optional[str] = None,
     ) -> EnvironmentResult:
         """
         Execute a command locally on the Torque agent container.
-        
+
         This method runs commands directly on the agent without SSH to any remote host.
         Useful for running scripts, tools, or commands that don't require a target machine.
-        
+
         Args:
             command: Command to execute
             agent: Agent name (uses default if not specified)
@@ -813,7 +1099,8 @@ class TorqueClient:
             init_commands: Optional commands to run before the main command
             download_commands: Optional commands to run after execution completes
                 (e.g., croc send to local for file downloads).
-            
+            command_description: Optional human-oriented description embedded in the env name.
+
         Returns:
             EnvironmentResult with command output
         """
@@ -822,6 +1109,7 @@ class TorqueClient:
             agent=agent,
             init_commands=init_commands,
             download_commands=download_commands,
+            command_description=command_description,
         )
         
         result = None
@@ -847,28 +1135,35 @@ class TorqueClient:
         self,
         agent: Optional[str] = None,
         environment_name: Optional[str] = None,
+        container_description: Optional[str] = None,
     ) -> str:
         """
         Start a persistent container with SSH access on the Torque agent.
-        
+
         The container runs dropbear (lightweight SSH server) in foreground and stays alive until terminated.
         Returns the environment ID. Use get_persistent_container_info() to get
         connection details (IP, private key) from the deploy log.
-        
+
         Args:
             agent: Agent name (uses default if not specified)
-            environment_name: Optional name for the environment
-            
+            environment_name: Optional explicit name (overrides the generated name)
+            container_description: Optional human-oriented description embedded in the name.
+
         Returns:
             Environment ID
         """
         agent_name = agent or self.default_agent
         if not agent_name:
             raise ValueError("Agent name must be provided either as argument or default")
-        
+
+        # Idempotency key + name/labels. The container runs no user command, so retry is
+        # inherently safe; reconciliation just prevents leaking orphan containers.
+        key = generate_idempotency_key()
         if not environment_name:
-            environment_name = f"persistent-container-{int(time.time())}"
-        
+            environment_name = build_environment_name(
+                "persistent-container", container_description, key
+            )
+
         payload = {
             "blueprint_name": self.PERSISTENT_CONTAINER_BLUEPRINT,
             "environment_name": environment_name,
@@ -876,22 +1171,13 @@ class TorqueClient:
             "inputs": {
                 "agent": agent_name,
             },
+            "labels": self._build_labels(key),
             # Standalone blueprint: send YAML inline so no GitHub repo is needed
             "base64_standalone_blueprint": self._load_standalone_blueprint(self.PERSISTENT_CONTAINER_BLUEPRINT),
         }
-        
-        response = await self._client.post(
-            f"/spaces/{self.space}/environments",
-            json=payload,
-        )
-        if response.status_code >= 400:
-            raise RuntimeError(
-                f"Torque API error {response.status_code} creating persistent container: {response.text}"
-            )
-        
-        data = response.json()
-        return data["id"]
-    
+
+        return await self._create_environment_idempotent(payload, key)
+
     async def get_persistent_container_info(
         self,
         environment_id: str,
@@ -949,7 +1235,7 @@ class TorqueClient:
             if log_url:
                 # Strip /api prefix if present
                 fetch_url = log_url[4:] if log_url.startswith("/api/") else log_url
-                response = await self._client.get(fetch_url)
+                response = await self._request_with_retry("GET", fetch_url)
                 if response.status_code == 200:
                     log_text = response.text
                     # Handle JSON-encoded string responses
@@ -1007,7 +1293,8 @@ class TorqueClient:
             environment_id: Environment ID
             duration: ISO 8601 duration string (e.g., "PT2H" for 2 hours)
         """
-        response = await self._client.put(
+        response = await self._request_with_retry(
+            "PUT",
             f"/spaces/{self.space}/environments/{environment_id}/extend",
             json={"duration": duration},
         )

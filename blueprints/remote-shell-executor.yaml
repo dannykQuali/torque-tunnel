@@ -100,7 +100,36 @@ grains:
                   fi
                 fi
                 rm -f "$__CONTAINER_PRE" 2>/dev/null || true
-                
+
+                # --- Print the commands for visibility in the Torque web UI (decoded) ---
+                # Shown before execution so a user inspecting the environment can read what
+                # ran without decoding the gzip+base64 inputs. Placed before the execution
+                # marker so the MCP output filter still returns only command output.
+                # Note: upload-only / download-only calls carry no real command; the MCP
+                # tool substitutes this placeholder (keep in sync with mcp_tool handlers).
+                # We recognize it so the dump doesn't present a fake command.
+                __TT_NO_CMD="echo 'Files deployed successfully'"
+                __tt_show_cmd() {
+                  __tt_f=$(mktemp)
+                  printf '%s' "$2" | base64 -d 2>/dev/null | gzip -d > "$__tt_f" 2>/dev/null || true
+                  if [ -s "$__tt_f" ]; then
+                    if [ "$1" = "command" ] && [ "$(cat "$__tt_f")" = "$__TT_NO_CMD" ]; then
+                      echo "----- command (none - file upload/download only) -----"
+                      echo ""
+                    else
+                      echo "----- $1 -----"
+                      cat "$__tt_f"
+                      echo ""
+                    fi
+                  fi
+                  rm -f "$__tt_f" 2>/dev/null || true
+                }
+                echo "=== Commands (decoded for visibility) =========================================================================================================="
+                __tt_show_cmd "init commands" '{{ .inputs.init_commands_b64 }}'
+                __tt_show_cmd "command" '{{ .inputs.command_b64 }}'
+                __tt_show_cmd "finally commands" '{{ .inputs.finally_commands_b64 }}'
+                echo "==============================================================================================================================================="
+
                 echo "=== Beginning of execution ====================================================================================================================="
                 
                 # Wrap the main logic in a function so we can capture any errors
