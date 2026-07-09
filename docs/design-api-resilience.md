@@ -132,6 +132,18 @@ The operation ends when: the environment reaches a terminal status (normal),
 the **healthy** elapsed time exceeds the wait timeout, or a **single** outage exceeds the
 outage budget.
 
+**Suspend/hibernate exclusion.** Both budgets measure `time.monotonic()`, which advances
+across an OS suspend (laptop sleep/hibernate). Without care, hibernating mid-poll makes
+the first poll after wake see a huge elapsed time and falsely trip the outage budget
+(observed: `outage 3s` → `unreachable for 3261s` after hibernating at the office and
+resuming at home). Fix: if the gap between two consecutive polls exceeds
+`_SUSPEND_GAP_SECONDS` (**120s** — far beyond any real inter-poll interval, since a poll
+tops out at the 60s httpx timeout and backoff caps at a few seconds), the process was
+frozen, not retrying. We shift `start_time`/`outage_start` forward by the frozen span so
+it counts against **neither** budget: a suspend just pauses the watcher, and it resumes
+polling on wake (the remote command kept running — and the Torque API is a public
+endpoint, so polling works from any network the resumed machine lands on).
+
 Why this is safe from runaway commands: the *actual* command-execution limit is enforced
 **server-side** by the blueprint's `timeout_minutes` input (`torque_client.py:176`).
 Torque kills a runaway command regardless of how long we wait. Our wait timeout only

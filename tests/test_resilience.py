@@ -231,6 +231,35 @@ class TestWaitForEnvironment:
         result = await client.wait_for_environment("env-1", timeout=5)
         assert result.status == "completed"
 
+    async def test_suspend_does_not_trip_outage_budget(self, monkeypatch):
+        """A system suspend (huge gap between polls) must not abort a still-running op.
+
+        Regression for: `outage 3s` jumping to `unreachable for 3261s` after a laptop sleep.
+        """
+        clock = FakeClock()
+        monkeypatch.setattr(tc.time, "monotonic", clock.monotonic)
+        state = {"suspended": False}
+
+        async def sleeper(sec):
+            clock.advance(sec)
+            if not state["suspended"]:
+                state["suspended"] = True
+                clock.advance(3000)  # simulate laptop sleep during the first backoff
+        monkeypatch.setattr(tc.asyncio, "sleep", sleeper)
+
+        calls = {"n": 0}
+
+        def handler(request):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return httpx.Response(503, text="down")  # opens an outage, then we "sleep"
+            return httpx.Response(200, json=active_env_response())  # recovers after wake
+
+        # Budget far smaller than the 3000s suspend: without exclusion this would abort.
+        client = make_client(handler, retry_budget_seconds=30)
+        result = await client.wait_for_environment("env-1", timeout=100000)
+        assert result.status == "completed"
+
     async def test_retry_disabled_errors_on_transient(self, no_sleep):
         def handler(request):
             return httpx.Response(500, text="down")

@@ -36,6 +36,13 @@ def _is_transient_status(status_code: int) -> bool:
 # httpx exception types that indicate a transient transport/network problem.
 _TRANSIENT_EXCEPTIONS = (httpx.TransportError, httpx.TimeoutException)
 
+# If the gap between two consecutive poll attempts exceeds this, the process was almost
+# certainly frozen (laptop sleep / hibernate / OS suspend) rather than genuinely retrying
+# — a single poll never legitimately takes this long (httpx timeout is 60s, backoff caps
+# at a few seconds). We exclude such frozen spans from the retry/outage and wait budgets
+# so a suspend pauses the watcher instead of aborting a still-running remote operation.
+_SUSPEND_GAP_SECONDS = 120.0
+
 
 # --- Idempotency key + environment naming ---------------------------------------
 # Label key carrying our client-generated idempotency id (queryable via ?labels=).
@@ -726,8 +733,28 @@ class TorqueClient:
             ongoing = (now - outage_start) if outage_start is not None else 0.0
             return now - start_time - total_outage_seconds - ongoing
 
+        last_tick = start_time  # monotonic time of the previous loop iteration
         while True:
             now = time.monotonic()
+
+            # Suspend/hibernate detection: if far more time elapsed since the previous
+            # poll than we ever intend to wait between polls, the process was frozen (e.g.
+            # laptop sleep) — not a real outage. Shift our reference points forward by the
+            # frozen span so it counts against neither the outage budget nor the wait
+            # timeout; the remote command kept running and we simply resume watching.
+            gap = now - last_tick
+            if gap > _SUSPEND_GAP_SECONDS:
+                excess = gap - self.poll_interval
+                start_time += excess
+                if outage_start is not None:
+                    outage_start += excess
+                print(
+                    f"[WARNING] Detected a {int(gap)}s pause (likely system suspend) while "
+                    f"polling environment {environment_id}; excluding it from the timeout/retry budgets.",
+                    file=sys.stderr,
+                )
+            last_tick = now
+
             if _healthy_elapsed(now) > timeout:
                 # Try to get partial output before returning timeout
                 partial_output = ""
