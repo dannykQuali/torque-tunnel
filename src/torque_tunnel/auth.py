@@ -18,6 +18,7 @@ import httpx
 from aiohttp import web
 
 from . import config as config_module
+from . import sso_browser
 
 # Long token never-expire sentinel (Int32.MaxValue from Torque)
 _LONG_TOKEN_EXPIRES = 2147483647
@@ -78,11 +79,14 @@ class TorqueAuthServer:
         config_path: Optional[str] = None,
         profile_name: Optional[str] = None,
         timeout: int = 1800,
+        sso_session_factory=None,
     ):
         self.torque_url = torque_url.rstrip("/") if torque_url else ""
         self.config_path = config_path
         self.profile_name = profile_name or ""
         self.timeout = timeout
+        self._sso_session_factory = sso_session_factory or sso_browser.CiscoSsoSession
+        self._sso_session = None
         self._csrf_token = secrets.token_urlsafe(32)
         self._url_secret = secrets.token_urlsafe(16)
         self._result: Optional[dict] = None
@@ -123,6 +127,7 @@ class TorqueAuthServer:
                 "Please try again with 'setup' tool."
             )
         finally:
+            await self.cleanup_sso()
             await self._runner.cleanup()
 
         if self._cancelled:
@@ -161,6 +166,10 @@ class TorqueAuthServer:
         app.router.add_post(f"/{s}/api/cancel", self._handle_cancel)
         app.router.add_get(f"/{s}/api/profiles", self._handle_list_profiles)
         app.router.add_post(f"/{s}/api/use-profile", self._handle_use_profile)
+        app.router.add_get(f"/{s}/api/sso-options", self._handle_sso_options)
+        app.router.add_post(f"/{s}/api/sso-start", self._handle_sso_start)
+        app.router.add_get(f"/{s}/api/sso-status", self._handle_sso_status)
+        app.router.add_post(f"/{s}/api/sso-cancel", self._handle_sso_cancel)
         return app
 
     def _check_csrf(self, request: web.Request) -> None:
@@ -257,6 +266,64 @@ class TorqueAuthServer:
             "token_id": profile.get("torque_token_id"),
             "spaces": resp.json(),
         })
+
+    # -- Cisco ID SSO --
+
+    async def cleanup_sso(self) -> None:
+        """Cancel any in-flight SSO browser session (idempotent)."""
+        if self._sso_session is not None:
+            await self._sso_session.cancel()
+
+    async def _handle_sso_options(self, request: web.Request) -> web.Response:
+        """Report whether the target Torque instance supports Cisco ID login."""
+        torque_url = (request.query.get("torque_url") or self.torque_url or "").rstrip("/")
+        if not torque_url:
+            return web.json_response({"cisco_sso": False})
+        supported = await sso_browser.probe_cisco_sso(torque_url)
+        return web.json_response({"cisco_sso": supported})
+
+    async def _handle_sso_start(self, request: web.Request) -> web.Response:
+        """Launch the Cisco ID sign-in flow in a temporary browser."""
+        self._check_csrf(request)
+        body = await request.json()
+        torque_url = body.get("torque_url", "") or self.torque_url
+        if not torque_url:
+            return web.json_response({"error": "Torque URL is required"}, status=400)
+        self.torque_url = torque_url.rstrip("/")
+
+        # Only one SSO attempt at a time — abort any previous one
+        if self._sso_session is not None:
+            await self._sso_session.cancel()
+
+        session = self._sso_session_factory(self.torque_url)
+        try:
+            await session.start()
+        except sso_browser.SsoLoginError as e:
+            return web.json_response({"error": str(e)}, status=500)
+        self._sso_session = session
+        print("Cisco ID sign-in: opened a temporary browser window.", file=sys.stderr)
+        return web.json_response({"status": "started"})
+
+    async def _handle_sso_status(self, request: web.Request) -> web.Response:
+        """Poll the state of the running SSO attempt."""
+        session = self._sso_session
+        if session is None:
+            return web.json_response({"status": "none"})
+        return web.json_response({
+            "status": session.status,
+            "error": session.error,
+            "token": session.token,
+            "accounts": session.accounts,
+            # The URL this sign-in belongs to — authoritative for the page,
+            # which may have navigated to a different URL meanwhile.
+            "torque_url": session.torque_url,
+        })
+
+    async def _handle_sso_cancel(self, request: web.Request) -> web.Response:
+        """Abort the running SSO attempt (closes the temporary browser)."""
+        self._check_csrf(request)
+        await self.cleanup_sso()
+        return web.json_response({"status": "cancelled"})
 
     async def _handle_login(self, request: web.Request) -> web.Response:
         """Proxy email/password login to Torque API."""

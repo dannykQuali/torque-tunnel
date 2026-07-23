@@ -1955,7 +1955,7 @@ Use `wait` to avoid tight polling. Typical: wait=10, repeat until completed.""",
         ),
         Tool(
             name="setup",
-            description="""Interactively set up or add a Torque connection profile. Opens a browser window where the user can authenticate with email/password or paste an existing token, select account/space/agent, and optionally reuse an existing profile. The selections are saved to the config file for future use.
+            description="""Interactively set up or add a Torque connection profile. Opens a browser window where the user can authenticate with email/password, sign in with Cisco ID (SSO), or paste an existing token, select account/space/agent, and optionally reuse an existing profile. The selections are saved to the config file for future use.
 
 WHEN TO USE THIS TOOL (always prefer this over searching config files manually):
 - User says "add agent", "add connection", "connect to torque", "set up torque tunnel", "configure torque"

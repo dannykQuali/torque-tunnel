@@ -74,6 +74,12 @@
   .profile-list .profile-name { font-weight: 500; }
   .profile-list .profile-desc { color: var(--muted); font-size: 12px; margin-left: 4px; }
   .profile-list .profile-url { color: var(--muted); font-size: 11px; display: block; margin-top: 2px; }
+  .btn-sso { width: 100%; background: #049fd9; color: #fff; font-weight: 600; }
+  .btn-sso:hover { background: #007ab8; }
+  .btn-sso:disabled { background: #86d1ec; cursor: not-allowed; }
+  .sso-divider { display: flex; align-items: center; gap: 10px; color: var(--muted); font-size: 12px; margin-top: 16px; }
+  .sso-divider hr { flex: 1; border: none; border-top: 1px solid var(--border); margin: 0; }
+  .sso-pending { margin-top: 10px; font-size: 13px; color: var(--muted); display: flex; align-items: center; gap: 4px; }
 </style>
 </head>
 <body>
@@ -89,7 +95,7 @@
       <label for="urlSelect">Select or enter your Torque URL</label>
       <select id="urlSelect" onchange="onUrlSelectChange()">
         <option value="https://portal.qtorque.io">https://portal.qtorque.io</option>
-        <option value="https://jarvis.qtorque.io">https://jarvis.qtorque.io</option>
+        <option value="https://stackautomation.cisco.com">https://stackautomation.cisco.com</option>
         <option value="https://review1.qualilabs.net">https://review1.qualilabs.net</option>
         <option value="https://review2.qualilabs.net">https://review2.qualilabs.net</option>
         <option value="https://review3.qualilabs.net">https://review3.qualilabs.net</option>
@@ -110,6 +116,15 @@
     <!-- Step 1: Login -->
     <div id="step-login" class="step">
       <div id="loginError" class="error"></div>
+      <div id="ssoSection" style="display:none; margin-bottom:20px;">
+        <button class="btn-sso" id="ssoBtn" onclick="startCiscoSso()">Sign in with Cisco ID</button>
+        <div id="ssoPending" class="sso-pending" style="display:none;">
+          <span class="spinner"></span>
+          <span>Complete the Cisco ID sign-in in the browser window that just opened&hellip;</span>
+          <button class="btn-link" onclick="cancelCiscoSso()">Cancel</button>
+        </div>
+        <div class="sso-divider"><hr><span>or</span><hr></div>
+      </div>
       <div id="loginForm">
         <label for="email">Email</label>
         <input type="email" id="email">
@@ -296,6 +311,8 @@ let state = {
 
 let cachedProfiles = [];  // fetched once from /api/profiles
 let cachedHasDefaultProfile = false;  // whether config already has a default_profile
+let ssoPollTimer = null;  // Cisco ID SSO status polling
+let ssoCheckSeq = 0;      // guards against stale sso-options responses after URL changes
 
 // -- Init: decide first step --
 (function init() {
@@ -329,15 +346,25 @@ document.addEventListener('visibilitychange', () => {
 
 // -- Navigation --
 function showStep(id, pushHistory) {
-  if (pushHistory !== false) {
-    const current = document.querySelector('.step.active');
-    if (current) {
-      const curId = current.id.replace('step-', '');
-      if (curId !== id) state.stepHistory.push(curId);
-    }
+  const current = document.querySelector('.step.active');
+  const curId = current ? current.id.replace('step-', '') : null;
+  if (curId === 'login' && id !== 'login' && ssoPollTimer) {
+    // Leaving the login step (e.g. Back) while a Cisco ID sign-in is in flight:
+    // abort it and close the temporary browser, so a login started for one URL
+    // can't complete after the user switched to another URL.
+    cancelCiscoSso();
+  }
+  if (pushHistory !== false && curId && curId !== id) {
+    state.stepHistory.push(curId);
   }
   document.querySelectorAll('.step').forEach(s => s.classList.remove('active'));
-  document.getElementById('step-' + id).classList.add('active');
+  const target = document.getElementById('step-' + id);
+  if (curId !== id) {
+    // Entering a different step: clear stale error messages left from a previous visit.
+    // (Re-showing the same step keeps its error, so just-set errors stay visible.)
+    target.querySelectorAll('.error').forEach(e => e.classList.remove('show'));
+  }
+  target.classList.add('active');
 }
 
 function goBack(fromStep) {
@@ -447,6 +474,7 @@ async function useProfile(profileName) {
           state.torqueUrl = profile.torque_url.replace(/\/+$/, '');
           document.getElementById('subtitleLine').innerHTML = 'Connect to <strong>' + escHtml(state.torqueUrl) + '</strong>';
           renderLoginProfiles();
+          checkSsoSupport();
           showStep('login');
         }
         return;
@@ -466,6 +494,7 @@ async function useProfile(profileName) {
     state.torqueUrl = profile.torque_url.replace(/\/+$/, '');
     document.getElementById('subtitleLine').innerHTML = 'Connect to <strong>' + escHtml(state.torqueUrl) + '</strong>';
     renderLoginProfiles();
+    checkSsoSupport();
     showStep('login');
   }
 }
@@ -504,6 +533,7 @@ function confirmUrl() {
   state.torqueUrl = url.replace(/\/+$/, '');
   document.getElementById('subtitleLine').innerHTML = 'Connect to <strong>' + escHtml(state.torqueUrl) + '</strong>';
   renderLoginProfiles();
+  checkSsoSupport();
   showStep('login');
 }
 
@@ -549,26 +579,108 @@ async function doLogin() {
       showError('loginError', data.error || 'Login failed');
       return;
     }
-    state.accounts = data;
     // Clear password field immediately so the browser won't offer to save it
     document.getElementById('password').value = '';
-    const aliases = Object.keys(data);
-    if (aliases.length === 0) {
-      showError('loginError', 'No accounts found for this user');
-      return;
-    }
-    if (aliases.length === 1) {
-      selectAccount(aliases[0]);
-    } else {
-      renderAccounts(aliases);
-      showStep('account');
-    }
+    handleAccountsDict(data);
   } catch (err) {
     showError('loginError', 'Network error: ' + err.message);
   } finally {
     btn.disabled = false;
     btn.textContent = 'Sign in';
   }
+}
+
+// Shared by password login and Cisco ID SSO: handle Dict<account_alias, TokenResponse>
+function handleAccountsDict(accounts) {
+  state.accounts = accounts;
+  const aliases = Object.keys(accounts);
+  if (aliases.length === 0) {
+    showError('loginError', 'No accounts found for this user');
+    return;
+  }
+  if (aliases.length === 1) {
+    selectAccount(aliases[0]);
+  } else {
+    renderAccounts(aliases);
+    showStep('account');
+  }
+}
+
+// -- Cisco ID SSO --
+async function checkSsoSupport() {
+  const seq = ++ssoCheckSeq;
+  const section = document.getElementById('ssoSection');
+  section.style.display = 'none';
+  if (!state.torqueUrl) return;
+  try {
+    const resp = await fetch(BASE_PATH + '/api/sso-options?torque_url=' + encodeURIComponent(state.torqueUrl));
+    if (!resp.ok || seq !== ssoCheckSeq) return;
+    const data = await resp.json();
+    if (data.cisco_sso && seq === ssoCheckSeq) section.style.display = '';
+  } catch (_) {}
+}
+
+async function startCiscoSso() {
+  hideError('loginError');
+  const btn = document.getElementById('ssoBtn');
+  btn.disabled = true;
+  try {
+    const resp = await fetch(BASE_PATH + '/api/sso-start', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({torque_url: state.torqueUrl}),
+    });
+    const data = await resp.json();
+    if (!resp.ok) {
+      showError('loginError', data.error || 'Failed to start Cisco ID sign-in');
+      btn.disabled = false;
+      return;
+    }
+    document.getElementById('ssoPending').style.display = '';
+    ssoPollTimer = setInterval(pollSsoStatus, 1000);
+  } catch (err) {
+    showError('loginError', 'Network error: ' + err.message);
+    btn.disabled = false;
+  }
+}
+
+function stopSsoUi() {
+  if (ssoPollTimer) { clearInterval(ssoPollTimer); ssoPollTimer = null; }
+  document.getElementById('ssoPending').style.display = 'none';
+  document.getElementById('ssoBtn').disabled = false;
+}
+
+async function pollSsoStatus() {
+  try {
+    const resp = await fetch(BASE_PATH + '/api/sso-status');
+    if (!resp.ok) return;
+    const data = await resp.json();
+    if (data.status === 'success') {
+      stopSsoUi();
+      // The session's URL is authoritative — the sign-in happened against it,
+      // regardless of any URL the page navigated to meanwhile.
+      if (data.torque_url && data.torque_url !== state.torqueUrl) {
+        state.torqueUrl = data.torque_url;
+        document.getElementById('subtitleLine').innerHTML = 'Connect to <strong>' + escHtml(state.torqueUrl) + '</strong>';
+      }
+      if (data.accounts) {
+        handleAccountsDict(data.accounts);
+      } else if (data.token) {
+        state.shortToken = data.token;
+        afterAuth(data.token);
+      }
+    } else if (data.status === 'error') {
+      stopSsoUi();
+      showError('loginError', data.error || 'Cisco ID sign-in failed');
+    } else if (data.status === 'cancelled' || data.status === 'none') {
+      stopSsoUi();
+    }
+  } catch (_) {}
+}
+
+async function cancelCiscoSso() {
+  try { await fetch(BASE_PATH + '/api/sso-cancel', {method: 'POST', headers}); } catch (_) {}
+  stopSsoUi();
 }
 
 async function validateToken() {

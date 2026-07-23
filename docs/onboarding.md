@@ -84,13 +84,22 @@ torque-tunnel register-mcp-client --run-setup
 
 ### 3. Setup (Torque connection)
 
-`setup` opens a browser window to authenticate with Torque (email/password or a
-pasted token), pick the account/space/agent, and saves everything to
-`~/.torque-tunnel/config.yaml`. Run it standalone any time:
+`setup` opens a browser window to authenticate with Torque (email/password,
+**Sign in with Cisco ID**, or a pasted token), pick the account/space/agent, and
+saves everything to `~/.torque-tunnel/config.yaml`. Run it standalone any time:
 
 ```bash
 torque-tunnel setup
 ```
+
+The **Sign in with Cisco ID** button appears when the Torque instance has Cisco
+SSO configured. It opens a second, temporary browser window for the Cisco ID +
+Duo sign-in — your default browser if it's Chromium-based (Edge, Chrome, Brave,
+Vivaldi, Opera), otherwise any installed one of those — always with a throwaway
+profile. Once you're signed in, the window closes automatically and setup
+continues. To force a specific browser, point the `TORQUE_TUNNEL_SSO_BROWSER`
+environment variable at its executable. See [design-login-flow.md](design-login-flow.md)
+for how this works.
 
 See [configuration.md](configuration.md) for the config file format, profiles,
 and resolution order.

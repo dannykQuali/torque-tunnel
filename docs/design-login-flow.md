@@ -434,3 +434,96 @@ When an agent is selected, the JS extracts proxy environment variables from the 
 ### XSS Prevention
 
 Template variables (`{{TORQUE_URL}}`, `{{CSRF_TOKEN}}`, `{{PROFILE_NAME}}`) are now escaped via `_js_string_escape()` before embedding in the HTML template, preventing injection if values contain quotes, backslashes, or HTML tags.
+
+---
+
+## Login Flow v3: Sign in with Cisco ID (SSO)
+
+### How Cisco ID works in Torque (verified in cs2018 / cs2018-ui)
+
+Torque's "Sign In with Cisco ID" button navigates the browser to
+`GET {torque}/api/accounts/idp_login/Cisco` (`IdentityProviderController`). The backend
+runs an OIDC Authorization Code + PKCE flow against `https://id.cisco.com/oauth2/default`
+(`CiscoIdentityProvider.cs`) and receives the callback on a **hardcoded**
+`{torque-host}/api/accounts/idp-callback` (pre-registered with Cisco's IdP client).
+The resulting Torque token is **not** returned as JSON. Instead the backend sets a
+one-shot, non-HttpOnly cookie on the Torque domain and 302s to the UI root:
+
+- `loginResponse` — single account: JSON `{access_token, refresh_token, token_type, expires_in}`
+- `loginMultiAccountResponse` — multiple accounts: JSON `Dict<account_alias, TokenResponse>`
+  (same shape as `POST /api/accounts/login`)
+
+The Torque SPA moves the cookie into `localStorage` (same key names) on boot and deletes it.
+
+**Constraints that shaped the design:**
+- `redirect_uri` is derived from the request Host and registered with Cisco — it can never
+  point at `127.0.0.1`, so our local auth server cannot receive the OIDC callback.
+- There is no device-code or polling flow in the Torque backend.
+- The token therefore only ever materializes inside a browser on the Torque origin.
+
+### torque-tunnel approach: temporary DevTools-controlled browser
+
+`src/torque_tunnel/sso_browser.py` launches the user's Edge/Chrome with a **throwaway
+profile** and `--remote-debugging-port=0`, pointed at `{torque}/api/accounts/idp_login/Cisco`.
+The user completes the normal Cisco ID (+ Duo) sign-in in that window. Meanwhile the
+local server polls the browser over the Chrome DevTools Protocol (plain aiohttp
+websocket — no new dependencies):
+
+1. Wait for `DevToolsActivePort` in the temp profile dir (real port of the ephemeral debug endpoint).
+2. Every second, `GET http://127.0.0.1:{port}/json/list` and pick page targets on the Torque origin.
+3. `Runtime.evaluate` on those pages: read `localStorage.loginResponse` /
+   `localStorage.loginMultiAccountResponse` and `document.cookie` (covers the race
+   window before the SPA consumes the cookie).
+4. Detect failure: a Torque-origin page landing on `/ssoerror` or `/error`, the browser
+   window being closed, or a timeout (default 10 min).
+5. On success: close the browser, delete the temp profile, hand the token(s) to the
+   setup page — which continues through the **existing** account → space → agent →
+   long-token → save steps unchanged.
+
+### Capability probe
+
+The "Sign in with Cisco ID" button is only shown when the target instance supports it.
+Probe: `GET {torque}/api/accounts/idp_login/Cisco` **without following redirects** —
+supported means a 30x redirect whose `Location` carries a non-empty `client_id`.
+(The production UI's visibility logic isn't reusable: it renders the Cisco button
+unconditionally once `/api/about` loads.)
+
+In addition, a small denylist (`_CISCO_SSO_DISABLED_HOSTS`) suppresses the button on
+hosts where Cisco ID must not be offered regardless of what the probe says — currently
+`portal.qtorque.io` (the public Quali SaaS portal). Denylisted hosts are rejected
+without any network call.
+
+### New local-server endpoints
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET | `/api/sso-options?torque_url=...` | Capability probe → `{cisco_sso: bool}` |
+| POST | `/api/sso-start` | Launch the SSO browser session (CSRF-protected) |
+| GET | `/api/sso-status` | Poll: `pending` / `success` (+`token` or `accounts`) / `error` / `cancelled` / `none`; always includes the session's `torque_url` |
+| POST | `/api/sso-cancel` | Abort: close browser, delete temp profile (CSRF-protected) |
+
+Starting a new SSO attempt cancels any previous one; the setup server's `run()` also
+cancels a dangling session on completion/cancel/timeout so no browser outlives setup.
+
+**URL binding:** an SSO attempt is bound to the `torque_url` it was started for.
+Navigating away from the login step (e.g. Back) while a sign-in is in flight aborts it
+and closes the temporary browser — a login started for one URL must not complete after
+the user switched to another. As defense in depth, `sso-status` reports the session's
+`torque_url` and the page adopts it on success, so the harvested token, the
+space/agent/long-token API calls, and the saved profile always refer to the same instance.
+
+### Notes & trade-offs
+
+- **Fresh profile every time**: the throwaway profile has no existing Cisco session, so the
+  user does a full Cisco ID + Duo login each time. This is the price of being able to
+  harvest the token; it also guarantees no interference with the user's real browser profile.
+- **Browser discovery** (in order): the `TORQUE_TUNNEL_SSO_BROWSER` environment variable
+  (path to an executable) → the **OS-default browser**, when it is Chromium-based
+  (Edge/Chrome/Brave/Vivaldi/Opera/Chromium; detected via the Windows `https` UserChoice
+  registry key, macOS LaunchServices plist, or `xdg-settings` on Linux) → well-known
+  install locations → `PATH`. Firefox/Safari can't be used (different debugging protocol).
+  If no Chromium-based browser is found, the UI shows an error; the email/password and
+  paste-token paths remain available.
+- **Security**: the DevTools port binds to 127.0.0.1 and lives only for the duration of the
+  sign-in; the temp profile (which briefly holds the session) is deleted immediately after.
+  The harvested short token flows through the same localhost channel as password login.
