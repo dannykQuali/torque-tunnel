@@ -49,6 +49,58 @@ CROC_SEND_STARTUP_SECONDS = 3
 # Croc exits immediately when no sender room exists; this controls the retry interval.
 CROC_RECEIVE_RETRY_SECONDS = 5
 
+# --- Download (remote→local) coordination protocol ---
+# The remote croc-send wrapper emits these sentinel lines on stdout. They reach the
+# local machine through the streamed grain log, where DownloadPlan.observe_output
+# (mcp_tool) parses them and coordinates the local receiver via signal files.
+# This implements a sender-first handshake: the local receiver does not connect to
+# the relay until the sender's room is registered, which eliminates the PAKE race
+# ("could not secure channel") that receiver-first retry loops can trigger.
+CROC_SENTINEL_READY = "__CROC_SEND_READY__"    # croc send registered its relay room
+CROC_SENTINEL_RETRY = "__CROC_SEND_RETRY__"    # sender is about to restart croc send
+CROC_SENTINEL_SIZE = "__CROC_DL_SIZE__"        # "<sentinel> <bytes> <croc_filename>"
+CROC_SENTINEL_MD5 = "__CROC_DL_MD5__"          # "<sentinel> <md5hex> <croc_filename>"
+CROC_SENTINEL_FAILED = "__CROC_DL_FAILED__"    # sender gave up (after one retry)
+CROC_SENTINEL_DONE = "__CROC_DL_DONE__"        # sender finished (rc 0/124/137)
+
+# Signal files inside the local receive dir (dot-prefixed so the received-files
+# checks ignore them). Written by the local sentinel watcher, read by the
+# receive retry wrapper. The manifest maps croc_filename ->
+# {"size": bytes|None, "md5": hex|None}. MD5 verification is essential: croc
+# pre-sizes the destination file and writes ranges in parallel, so a dead
+# transfer leaves a file with the CORRECT length full of holes — size checks
+# alone accepted a 2.3 GB VMDK that was 72.8% zeros (2026-07-29 incident).
+CROC_READY_SIGNAL = ".croc_send_ready"
+CROC_ABORT_SIGNAL = ".croc_abort"
+CROC_EXPECTED_SIZES_FILE = ".croc_expected_manifest.json"
+CROC_RECEIVE_LOG_FILE = ".croc_receive.log"
+
+# Delay before the remote sender retries croc send after a failure. Gives the local
+# watcher time to observe CROC_SENTINEL_RETRY (log stream polls every few seconds)
+# and pull the ready signal so the receiver doesn't race the re-registration.
+CROC_SEND_RETRY_DELAY_SECONDS = 8
+
+# Minimum assumed relay transfer rate used to scale the remote croc-send timeout
+# with the staged payload size. Observed relay rates in the Cisco lab are
+# 3-12 MB/s; 1 MB/s keeps a generous margin without letting croc hang forever.
+CROC_SEND_MIN_RATE_BYTES_PER_SEC = 1_000_000
+
+# Croc reliably hangs after 100% when sending through a proxy relay. The send
+# monitor kills it once its progress line has sat unchanged at 100% for this
+# many consecutive 5-second checks (9 => ~45s) — without this, a size-scaled
+# timeout would let a multi-GB download hang for its full remaining budget
+# after the transfer already completed.
+CROC_SEND_STALL_CHECKS = 9
+
+# A transfer can also freeze MID-flight (observed live: 25 minutes at 87% —
+# the proxy silently killed the long-lived relay tunnel). If the progress line
+# (containing a percentage below 100%) is unchanged for this many consecutive
+# 5-second checks (24 => ~120s), croc is killed and the send is RETRIED —
+# croc can usually resume from the receiver's partial file. Only lines with a
+# percentage count: the pre-transfer "Sending ..." wait (receiver gated on
+# sentinel delivery) can legitimately last minutes and must not trip this.
+CROC_SEND_MIDSTALL_CHECKS = 24
+
 
 def _get_cache_dir() -> Path:
     """Get platform-appropriate cache directory for the croc binary."""
@@ -61,9 +113,16 @@ def _get_cache_dir() -> Path:
     return base / "torque-tunnel" / "bin"
 
 
-def _get_croc_binary_name() -> str:
-    """Return the platform-specific croc binary name."""
-    return "croc.exe" if sys.platform == "win32" else "croc"
+def _get_croc_binary_name(version: str = CROC_VERSION) -> str:
+    """Return the platform- and version-specific cached croc binary name.
+
+    The version is embedded in the filename so that bumping CROC_VERSION
+    invalidates the cache: both sides must run the same croc version for the
+    PAKE handshake to succeed, and a stale cached binary would fail it with
+    the same "could not secure channel" symptom as the receiver race.
+    """
+    suffix = ".exe" if sys.platform == "win32" else ""
+    return f"croc-{version}{suffix}"
 
 
 def _get_croc_asset_name(version: str = CROC_VERSION) -> tuple[str, str]:
@@ -106,17 +165,27 @@ def get_local_croc_path() -> Optional[Path]:
     """Get path to local croc binary if it already exists.
 
     Checks (in order):
-    1. Cached download in platform-specific cache directory (known correct version)
+    1. Cached download in platform-specific cache directory (version embedded
+       in the filename, so the cache can never serve a stale version)
     2. System PATH (only if version matches CROC_VERSION)
 
     We prefer the cache because the remote side installs CROC_VERSION, and
     both sides must run the same version for the PAKE handshake to succeed.
     """
-    # Check cache directory first (guaranteed correct version)
-    binary_name = _get_croc_binary_name()
-    cache_path = _get_cache_dir() / binary_name
+    # Check cache directory first (versioned filename => guaranteed correct version)
+    cache_dir = _get_cache_dir()
+    cache_path = cache_dir / _get_croc_binary_name()
     if cache_path.exists():
         return cache_path
+
+    # Clean up binaries from other versions and the old unversioned name
+    # (best effort - a stale binary must never be picked up again)
+    if cache_dir.exists():
+        for stale in cache_dir.glob("croc*"):
+            try:
+                stale.unlink()
+            except OSError:
+                pass
 
     # Check PATH, but only if it's the right version
     croc_in_path = shutil.which("croc")
@@ -538,6 +607,175 @@ async def cleanup_croc_send(process: Optional[asyncio.subprocess.Process]) -> No
 # --- Download (remote→local) support ---
 
 
+def _generate_croc_send_core(code: str, timeout: int, cleanup_commands: list[str]) -> list[str]:
+    """Shared croc-send block used by both download command generators.
+
+    Expects staged files to already exist in $__DL_DIR. Implements the
+    coordination protocol (see CROC_SENTINEL_* constants):
+
+    1. Emits a size sentinel per staged regular file so the local side can
+       verify transfer completeness (rejecting partial files).
+    2. Runs croc send in the background while tailing its output; emits the
+       READY sentinel the moment croc prints "Code is:" (relay room registered).
+       The local receiver connects only after that - sender-first by
+       construction, so the PAKE handshake can't race a half-open receiver.
+    3. Scales the croc-send timeout with the staged payload size (the fixed
+       default killed healthy multi-GB transfers mid-flight).
+    4. Retries the whole send once on failure (relay flakes), announcing it
+       with the RETRY sentinel so the local receiver stands down first.
+    5. Ends with an explicit DONE/FAILED sentinel and a non-zero exit on
+       failure - a failed download must never look like success.
+
+    Args:
+        code: The croc secret code.
+        timeout: Minimum (floor) croc send timeout in seconds.
+        cleanup_commands: Extra cleanup lines to run after the send (e.g.
+            removing a temporary SSH key), before the final status is emitted.
+
+    Returns:
+        List of shell command lines (bash).
+    """
+    c = []
+    c.append('cd "$__DL_DIR"')
+    # Fail fast if nothing was staged - croc send with no files would just error
+    c.append('set -- *')
+    c.append('if [ ! -e "$1" ]; then')
+    c.append('  echo "ERROR: no files were staged for download" >&2')
+    c.append(f'  echo "{CROC_SENTINEL_FAILED} exit_code=stage"')
+    c.append('  cd /')
+    c.append('  rm -rf "$__DL_DIR"')
+    c.extend(f'  {line}' for line in cleanup_commands)
+    c.append('  exit 1')
+    c.append('fi')
+    # Report per-file sizes AND content hashes so the local receiver can verify
+    # completeness. Size alone is NOT integrity: croc pre-sizes the destination
+    # and writes ranges in parallel, so a dead transfer leaves a size-correct
+    # file full of holes.
+    c.append('for __DL_F in *; do')
+    c.append('  if [ -f "$__DL_F" ]; then')
+    c.append(f'    echo "{CROC_SENTINEL_SIZE} $(stat -c %s "$__DL_F") $__DL_F"')
+    c.append("    __DL_MD5=$(md5sum \"$__DL_F\" 2>/dev/null | cut -d' ' -f1)")
+    c.append(f'    [ -n "$__DL_MD5" ] && echo "{CROC_SENTINEL_MD5} $__DL_MD5 $__DL_F"')
+    c.append('  fi')
+    c.append('done')
+    c.append(f'export CROC_SECRET="{code}"')
+    # Scale the send timeout with the payload size; `timeout` is the floor
+    c.append('__DL_BYTES=$(du -sb . 2>/dev/null | cut -f1)')
+    c.append(f'__DL_TIMEOUT=$(( ${{__DL_BYTES:-0}} / {CROC_SEND_MIN_RATE_BYTES_PER_SEC} + 120 ))')
+    c.append(f'[ "$__DL_TIMEOUT" -lt {timeout} ] && __DL_TIMEOUT={timeout}')
+    c.append('__croc_send_once() {')
+    c.append('  set -- *')
+    c.append('  : > .croc_send.log')
+    # Croc prints the transfer code ("Code is:" / "On the other computer run:"
+    # blocks). Keep those OUT of the echoed progress lines so the secret never
+    # lands in the persisted grain log (an improvement over the old behavior,
+    # which streamed croc's raw output including the code).
+    c.append("  __croc_tail() { tr '\\r' '\\n' < .croc_send.log 2>/dev/null"
+             " | grep -v -e '^[[:space:]]*$' -e 'CROC_SECRET=' -e 'Code is:'"
+             " -e 'On the other computer' -e '(For ' -e '^[[:space:]]*croc '; }")
+    # -k 5: SIGKILL 5s after SIGTERM if croc ignores it. Croc sometimes hangs
+    # after 100% when going through a proxy relay.
+    c.append('  timeout -k 5 "$__DL_TIMEOUT" croc send --no-local "$@" > .croc_send.log 2>&1 &')
+    c.append('  __CROC_PID=$!')
+    c.append('  __CROC_READY=0')
+    c.append('  __CROC_TICK=0')
+    c.append('  __CROC_PREV=""')
+    c.append('  __CROC_STALL=0')
+    c.append('  __CROC_MIDSTALL=0')
+    c.append('  __CROC_STALL_KILL=0')
+    c.append('  __CROC_QUIET=0')
+    c.append('  while kill -0 "$__CROC_PID" 2>/dev/null; do')
+    c.append("    if [ \"$__CROC_READY\" -eq 0 ] && grep -q 'Code is:' .croc_send.log 2>/dev/null; then")
+    c.append(f'      echo "{CROC_SENTINEL_READY}"')
+    c.append('      __CROC_READY=1')
+    c.append('    fi')
+    # Surface croc's latest progress line every ~5s (its raw \r-updates would
+    # otherwise flood the streamed log or be lost entirely)
+    c.append('    if [ "$__CROC_TICK" -gt 0 ] && [ $((__CROC_TICK % 10)) -eq 0 ]; then')
+    c.append('      __CROC_LAST=$(__croc_tail | tail -n 1)')
+    # Echo only when the progress line changed (a post-100% hang would
+    # otherwise repeat the same line every 5s for minutes)
+    c.append('      if [ -n "$__CROC_LAST" ] && [ "$__CROC_LAST" != "$__CROC_PREV" ]; then')
+    c.append('        echo "[croc send] $__CROC_LAST"')
+    c.append('        __CROC_PREV=$__CROC_LAST')
+    c.append('        __CROC_STALL=0')
+    c.append('        __CROC_MIDSTALL=0')
+    c.append('        __CROC_QUIET=0')
+    # Progress stuck at 100%: croc's known hang-after-complete-transfer through
+    # proxy relays. Kill it instead of burning the remaining (size-scaled)
+    # timeout budget; the local side verifies the received sizes regardless.
+    c.append('      elif case "$__CROC_LAST" in *100%*) true;; *) false;; esac; then')
+    c.append('        __CROC_STALL=$((__CROC_STALL + 1))')
+    c.append(f'        if [ "$__CROC_STALL" -ge {CROC_SEND_STALL_CHECKS} ]; then')
+    c.append('          echo "[croc send] no progress after 100% - assuming croc hang-after-transfer, terminating"')
+    c.append('          kill "$__CROC_PID" 2>/dev/null')
+    c.append('        fi')
+    # Progress frozen MID-transfer (percentage below 100% unchanged): a wedged
+    # relay tunnel. Kill and RETRY - croc can usually resume from the
+    # receiver's partial file. Observed live: 25 minutes frozen at 87%.
+    c.append('      elif case "$__CROC_LAST" in *%*) true;; *) false;; esac; then')
+    c.append('        __CROC_MIDSTALL=$((__CROC_MIDSTALL + 1))')
+    c.append('        __CROC_QUIET=$((__CROC_QUIET + 1))')
+    c.append(f'        if [ "$__CROC_MIDSTALL" -ge {CROC_SEND_MIDSTALL_CHECKS} ]; then')
+    c.append('          echo "[croc send] transfer stalled with no progress - terminating for retry"')
+    c.append('          __CROC_STALL_KILL=1')
+    c.append('          kill "$__CROC_PID" 2>/dev/null')
+    c.append('        elif [ "$__CROC_QUIET" -ge 6 ]; then')
+    c.append('          echo "[croc send] still running ($((__CROC_TICK / 2))s): $__CROC_LAST"')
+    c.append('          __CROC_QUIET=0')
+    c.append('        fi')
+    # Heartbeat every ~30s while output is otherwise unchanged: liveness signal
+    # for humans, and it keeps the runner shipping log chunks - the local
+    # receiver is gated on sentinels arriving through that stream, and a
+    # fully quiet log can sit in the runner's buffer for minutes.
+    c.append('      else')
+    c.append('        __CROC_QUIET=$((__CROC_QUIET + 1))')
+    c.append('        if [ "$__CROC_QUIET" -ge 6 ]; then')
+    c.append('          echo "[croc send] still running ($((__CROC_TICK / 2))s): $__CROC_LAST"')
+    c.append('          __CROC_QUIET=0')
+    c.append('        fi')
+    c.append('      fi')
+    c.append('    fi')
+    c.append('    __CROC_TICK=$((__CROC_TICK + 1))')
+    c.append('    sleep 0.5')
+    c.append('  done')
+    c.append('  wait "$__CROC_PID"')
+    c.append('  __DL_RC=$?')
+    # A mid-transfer stall kill is NOT a post-completion hang: the whitelisted
+    # kill codes (124/137/143) must not apply - force failure so the
+    # retry/FAILED path runs instead of reporting DONE on a frozen transfer.
+    c.append('  if [ "$__CROC_STALL_KILL" -eq 1 ]; then')
+    c.append('    __DL_RC=1')
+    c.append('  fi')
+    # Croc may have registered and exited between monitor polls - emit READY
+    # regardless so the local side knows the room existed
+    c.append("  if [ \"$__CROC_READY\" -eq 0 ] && grep -q 'Code is:' .croc_send.log 2>/dev/null; then")
+    c.append(f'    echo "{CROC_SENTINEL_READY}"')
+    c.append('  fi')
+    c.append('  __croc_tail | tail -n 3')
+    c.append('}')
+    c.append('__croc_send_once')
+    # Exit codes 124 (timeout SIGTERM), 137 (SIGKILL) and 143 (stall-detection
+    # TERM) can mean croc hung after a complete transfer; the local side
+    # verifies received sizes either way.
+    c.append('if [ $__DL_RC -ne 0 ] && [ $__DL_RC -ne 124 ] && [ $__DL_RC -ne 137 ] && [ $__DL_RC -ne 143 ]; then')
+    c.append(f'  echo "{CROC_SENTINEL_RETRY} (first attempt failed with exit code $__DL_RC; retrying once)"')
+    c.append(f'  sleep {CROC_SEND_RETRY_DELAY_SECONDS}')
+    c.append('  __croc_send_once')
+    c.append('fi')
+    c.append('unset CROC_SECRET')
+    c.append('cd /')
+    c.append('rm -rf "$__DL_DIR"')
+    c.extend(cleanup_commands)
+    c.append('if [ $__DL_RC -ne 0 ] && [ $__DL_RC -ne 124 ] && [ $__DL_RC -ne 137 ] && [ $__DL_RC -ne 143 ]; then')
+    c.append('  echo "ERROR: croc file download failed (exit code: $__DL_RC)" >&2')
+    c.append(f'  echo "{CROC_SENTINEL_FAILED} exit_code=$__DL_RC"')
+    c.append('  exit 1')
+    c.append('fi')
+    c.append(f'echo "{CROC_SENTINEL_DONE} exit_code=$__DL_RC"')
+    return c
+
+
 def generate_croc_send_commands(
     code: str,
     file_infos: list[dict],
@@ -554,9 +792,10 @@ def generate_croc_send_commands(
         file_infos: List of dicts, each with:
             - remote_source_path: Path on the container to download.
             - croc_filename: Uniquely-prefixed filename for staging.
-        timeout: Timeout in seconds for croc send (default 300s).
-            Croc may hang after 100% transfer through proxy relays;
-            this timeout ensures the environment doesn't get stuck.
+        timeout: Minimum (floor) timeout in seconds for croc send (default 300s).
+            The effective timeout scales with the staged payload size so
+            multi-GB transfers are not killed mid-flight; croc may also hang
+            after 100% through proxy relays, which this bounds.
 
     Returns:
         Shell commands string.
@@ -570,31 +809,16 @@ def generate_croc_send_commands(
         croc_name = fi["croc_filename"]
         escaped_src = _shell_escape_single(src)
         escaped_name = _shell_escape_single(croc_name)
-        # cp -r works for both files and directories
+        # Hardlink when possible (same filesystem): no disk-usage doubling and no
+        # copy latency at GB scale. cp -r fallback covers directories and
+        # cross-device sources.
         commands.append(
-            f"cp -r '{escaped_src}' \"$__DL_DIR/\"'{escaped_name}'"
+            f"ln '{escaped_src}' \"$__DL_DIR/\"'{escaped_name}' 2>/dev/null"
+            f" || cp -r '{escaped_src}' \"$__DL_DIR/\"'{escaped_name}'"
             f" || {{ echo 'WARNING: Failed to stage {escaped_src} for download' >&2; }}"
         )
 
-    # croc send all files from the staging directory
-    commands.append('cd "$__DL_DIR"')
-    commands.append(f'export CROC_SECRET="{code}"')
-
-    croc_names = [f"'{_shell_escape_single(fi['croc_filename'])}'" for fi in file_infos]
-    files_arg = " ".join(croc_names)
-
-    # -k 5: if SIGTERM is ignored, SIGKILL after 5 seconds
-    # Croc sometimes hangs after 100% transfer when going through a proxy relay
-    commands.append(f'timeout -k 5 {timeout} croc send --no-local {files_arg}')
-    commands.append('__DL_RC=$?')
-    commands.append('unset CROC_SECRET')
-    commands.append('cd /')
-    commands.append('rm -rf "$__DL_DIR"')
-    # Exit codes 124 (timeout SIGTERM) and 137 (SIGKILL) are expected when croc hangs
-    # after a successful transfer - the data was already sent to the receiver
-    commands.append('if [ $__DL_RC -ne 0 ] && [ $__DL_RC -ne 124 ] && [ $__DL_RC -ne 137 ]; then')
-    commands.append('  echo "WARNING: croc file download failed (exit code: $__DL_RC)" >&2')
-    commands.append('fi')
+    commands.extend(_generate_croc_send_core(code, timeout, cleanup_commands=[]))
     commands.append("# === End croc file download ===")
     return "\n".join(commands)
 
@@ -621,9 +845,10 @@ def generate_croc_scp_download_commands(
         ssh_user: SSH username.
         ssh_private_key: SSH private key content (PEM format).
         ssh_password: SSH password (alternative to key).
-        timeout: Timeout in seconds for croc send (default 300s).
-            Croc may hang after 100% transfer through proxy relays;
-            this timeout ensures the environment doesn't get stuck.
+        timeout: Minimum (floor) timeout in seconds for croc send (default 300s).
+            The effective timeout scales with the staged payload size so
+            multi-GB transfers are not killed mid-flight; croc may also hang
+            after 100% through proxy relays, which this bounds.
 
     Returns:
         Shell commands string to run on the agent container.
@@ -674,25 +899,8 @@ def generate_croc_scp_download_commands(
         )
 
     # croc send all staged files to local
-    commands.append('cd "$__DL_DIR"')
-    commands.append(f'export CROC_SECRET="{code}"')
-
-    croc_names = [f"'{_shell_escape_single(fi['croc_filename'])}'" for fi in file_infos]
-    files_arg = " ".join(croc_names)
-
-    commands.append(f'timeout -k 5 {timeout} croc send --no-local {files_arg}')
-    commands.append('__DL_RC=$?')
-    commands.append('unset CROC_SECRET')
-    commands.append('cd /')
-
-    # Cleanup
-    if ssh_private_key:
-        commands.append('rm -f "$__DL_KEY"')
-    commands.append('rm -rf "$__DL_DIR"')
-
-    commands.append('if [ $__DL_RC -ne 0 ] && [ $__DL_RC -ne 124 ] && [ $__DL_RC -ne 137 ]; then')
-    commands.append('  echo "WARNING: croc file download failed (exit code: $__DL_RC)" >&2')
-    commands.append('fi')
+    cleanup_commands = ['rm -f "$__DL_KEY"'] if ssh_private_key else []
+    commands.extend(_generate_croc_send_core(code, timeout, cleanup_commands=cleanup_commands))
     commands.append("# === End SCP download + croc send ===")
     return "\n".join(commands)
 
@@ -702,22 +910,41 @@ async def start_croc_receive(
     code: str,
     receive_dir: str,
     timeout: int = 1800,
+    gated: bool = False,
 ) -> asyncio.subprocess.Process:
     """Start croc receive as a background process with automatic retry.
 
-    Croc receive exits immediately when no sender room exists on the relay.
-    Since the receiver must start BEFORE the remote environment runs (which
-    creates the sender), this function wraps croc in a retry loop that keeps
-    trying every CROC_RECEIVE_RETRY_SECONDS until the sender appears or
-    the timeout expires.
+    Croc receive exits immediately when no sender room exists on the relay,
+    so croc runs inside a retry wrapper. With gated=True (the download flow),
+    the wrapper holds off entirely until the CROC_READY_SIGNAL file appears in
+    receive_dir — written by the sentinel watcher when the remote sender has
+    registered its relay room. Sender-first ordering makes the PAKE handshake
+    race-free; an ungated receiver hammering the room can cross the sender's
+    registration and kill it with "could not secure channel".
 
     Files are saved to receive_dir (croc writes to cwd).
+
+    Coordination files inside receive_dir (all dot-prefixed):
+    - CROC_READY_SIGNAL: created externally; allows croc attempts (gated mode).
+      Removed externally while the sender restarts, re-created on re-registration.
+    - CROC_ABORT_SIGNAL: created externally; makes the wrapper stop immediately
+      (exit 2), killing any in-flight croc attempt.
+    - CROC_EXPECTED_SIZES_FILE: JSON {croc_filename: {"size": bytes, "md5": hex}}
+      written externally from the sender's size/hash sentinels. When present,
+      the wrapper only declares success once every expected file exists with
+      the expected size AND content hash — a partial transfer keeps retrying
+      instead of passing as done. The hash matters: croc pre-sizes the
+      destination file, so a dead transfer can leave a size-correct file full
+      of holes.
+    - CROC_RECEIVE_LOG_FILE: attempt log + croc output, written by the wrapper
+      for diagnosability (previously everything was discarded).
 
     Args:
         croc_path: Path to local croc binary.
         code: The croc secret code.
         receive_dir: Directory where received files will be saved.
         timeout: Maximum seconds to keep retrying (default 1800 = 30 min).
+        gated: If True, wait for CROC_READY_SIGNAL before each croc attempt.
 
     Returns:
         The asyncio subprocess Process handle (a Python wrapper process that
@@ -726,39 +953,116 @@ async def start_croc_receive(
     # Build a small Python script that retries croc until it succeeds.
     # Using sys.executable ensures cross-platform compatibility.
     # repr() handles Windows backslashes in paths safely.
-    #
-    # Key design choices:
-    # - On first attempt, use --overwrite in case stale files exist from prior runs.
-    # - After each attempt, check if ANY files appeared in receive_dir.
-    #   If files exist, stop retrying even if croc exited non-zero — the sender
-    #   may hang after 100% transfer (proxy/relay issues) causing croc to exit
-    #   with error, but the data is already written.
-    # - On retries (no files received yet), keep using --overwrite.
     retry_script = (
-        "import subprocess, os, sys, time\n"
+        "import hashlib, json, os, subprocess, sys, time\n"
         f"croc_path = {str(croc_path)!r}\n"
         f"receive_dir = {receive_dir!r}\n"
         f"code = {code!r}\n"
         f"timeout = {timeout}\n"
         f"retry_interval = {CROC_RECEIVE_RETRY_SECONDS}\n"
+        f"gated = {gated!r}\n"
+        f"ready_f = os.path.join(receive_dir, {CROC_READY_SIGNAL!r})\n"
+        f"abort_f = os.path.join(receive_dir, {CROC_ABORT_SIGNAL!r})\n"
+        f"sizes_f = os.path.join(receive_dir, {CROC_EXPECTED_SIZES_FILE!r})\n"
+        f"log_f = os.path.join(receive_dir, {CROC_RECEIVE_LOG_FILE!r})\n"
         "env = os.environ.copy()\n"
         "env['CROC_SECRET'] = code\n"
+        "def log(msg):\n"
+        "    try:\n"
+        "        with open(log_f, 'a') as f:\n"
+        "            f.write(time.strftime('[%H:%M:%S] ') + msg + '\\n')\n"
+        "    except OSError:\n"
+        "        pass\n"
+        "def received_files():\n"
+        "    return [f for f in os.listdir(receive_dir) if not f.startswith('.')]\n"
+        "def md5_of(path):\n"
+        "    h = hashlib.md5()\n"
+        "    with open(path, 'rb') as f:\n"
+        "        for chunk in iter(lambda: f.read(1024 * 1024), b''):\n"
+        "            h.update(chunk)\n"
+        "    return h.hexdigest()\n"
+        "def expected_status():\n"
+        "    # True: every expected file present, size AND content hash matching\n"
+        "    # False: some expected file missing, size-mismatched, or corrupt\n"
+        "    # None: no expectation information available\n"
+        "    # Size alone is NOT integrity: croc pre-sizes the destination file,\n"
+        "    # so a dead transfer leaves a size-correct file full of holes.\n"
+        "    try:\n"
+        "        with open(sizes_f) as f:\n"
+        "            expected = json.load(f)\n"
+        "    except (OSError, ValueError):\n"
+        "        return None\n"
+        "    if not expected:\n"
+        "        return None\n"
+        "    for name, want in expected.items():\n"
+        "        path = os.path.join(receive_dir, name)\n"
+        "        if not os.path.exists(path):\n"
+        "            return False\n"
+        "        size = want.get('size')\n"
+        "        if isinstance(size, int) and os.path.isfile(path) and os.path.getsize(path) != size:\n"
+        "            return False\n"
+        "        md5 = want.get('md5')\n"
+        "        if md5 and os.path.isfile(path):\n"
+        "            try:\n"
+        "                if md5_of(path) != md5:\n"
+        "                    log('content hash mismatch for %s' % name)\n"
+        "                    return False\n"
+        "            except OSError:\n"
+        "                return False\n"
+        "    return True\n"
         "deadline = time.monotonic() + timeout\n"
+        "attempt = 0\n"
+        "log('receiver started (gated=%s, timeout=%ss)' % (gated, timeout))\n"
         "while time.monotonic() < deadline:\n"
-        "    result = subprocess.run(\n"
-        "        [croc_path, '--yes', '--overwrite'],\n"
-        "        cwd=receive_dir,\n"
-        "        env=env,\n"
-        "        stdin=subprocess.DEVNULL,\n"
-        "        stdout=subprocess.DEVNULL,\n"
-        "        stderr=subprocess.DEVNULL,\n"
-        "    )\n"
-        "    if result.returncode == 0:\n"
+        "    if os.path.exists(abort_f):\n"
+        "        log('abort signal received; giving up')\n"
+        "        sys.exit(2)\n"
+        "    if gated and not os.path.exists(ready_f):\n"
+        "        time.sleep(0.25)\n"
+        "        continue\n"
+        "    attempt += 1\n"
+        "    log('croc attempt %d starting' % attempt)\n"
+        "    rc = None\n"
+        "    try:\n"
+        "        with open(log_f, 'a') as lf:\n"
+        "            proc = subprocess.Popen(\n"
+        "                [croc_path, '--yes', '--overwrite'],\n"
+        "                cwd=receive_dir, env=env,\n"
+        "                stdin=subprocess.DEVNULL, stdout=lf, stderr=lf,\n"
+        "            )\n"
+        "            while True:\n"
+        "                rc = proc.poll()\n"
+        "                if rc is not None:\n"
+        "                    break\n"
+        "                if os.path.exists(abort_f) or time.monotonic() > deadline:\n"
+        "                    proc.kill()\n"
+        "                    proc.wait()\n"
+        "                    rc = -9\n"
+        "                    break\n"
+        "                time.sleep(0.5)\n"
+        "    except OSError as e:\n"
+        "        log('failed to run croc: %s' % e)\n"
+        "        rc = -1\n"
+        "    log('croc attempt %d finished (rc=%s)' % (attempt, rc))\n"
+        "    status = expected_status()\n"
+        "    if status is True:\n"
+        "        log('all expected files received with matching sizes')\n"
         "        sys.exit(0)\n"
-        "    # Check if files appeared — sender may hang after transfer completes\n"
-        "    if any(f for f in os.listdir(receive_dir) if not f.startswith('.')):\n"
+        "    if rc == 0:\n"
+        "        if status is False:\n"
+        "            log('croc exited 0 but expected files are incomplete; retrying')\n"
+        "        else:\n"
+        "            sys.exit(0)\n"
+        "    elif status is None and received_files():\n"
+        "        # Legacy heuristic (no size info): files appeared - the sender may\n"
+        "        # hang after a complete transfer, so treat this as success.\n"
+        "        log('files present and no size info; assuming complete')\n"
         "        sys.exit(0)\n"
+        "    if os.path.exists(abort_f):\n"
+        "        log('abort signal received; giving up')\n"
+        "        sys.exit(2)\n"
         "    time.sleep(retry_interval)\n"
+        "log('deadline reached; giving up after %d attempts' % attempt)\n"
         "sys.exit(1)\n"
     )
 
@@ -772,8 +1076,10 @@ async def start_croc_receive(
     # Brief pause to ensure the wrapper process started
     await asyncio.sleep(1)
 
-    # Check if it crashed during startup (e.g. syntax error in script)
-    if process.returncode is not None:
+    # Check if it crashed during startup (e.g. syntax error in script).
+    # A clean exit (0) is legitimate: files may already be present / the
+    # transfer can finish faster than this startup pause.
+    if process.returncode is not None and process.returncode != 0:
         raise RuntimeError(
             f"croc receive wrapper exited immediately with code {process.returncode}"
         )

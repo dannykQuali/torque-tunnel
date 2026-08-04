@@ -7,6 +7,7 @@ by tunneling through Torque's agent infrastructure into unreachable networks.
 
 import base64
 import gzip
+import json
 import os
 import re
 import shutil
@@ -15,6 +16,7 @@ import time
 import asyncio
 import argparse
 import tempfile
+from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass, field
 from typing import Optional, Callable, Awaitable
 
@@ -728,7 +730,14 @@ async def cleanup_croc_resources(
 
 @dataclass
 class DownloadPlan:
-    """Result of preparing download instructions for remote→local file transfer via croc."""
+    """Result of preparing download instructions for remote→local file transfer via croc.
+
+    Besides the prepared commands, this carries the sentinel-watcher state: the
+    remote croc-send wrapper emits coordination sentinels (croc_manager.CROC_SENTINEL_*)
+    into the streamed output, observe_output() parses them, and signal files in
+    croc_receive_dir relay them to the receive retry wrapper (sender-first
+    handshake, abort, expected sizes). See docs/croc-file-transfer.md.
+    """
     # Shell commands to run on the container/target AFTER the main command (croc send)
     download_commands: str = ""
     # The croc secret code (needed to start local croc receive)
@@ -743,6 +752,133 @@ class DownloadPlan:
     errors: list[str] = field(default_factory=list)
     # File info strings for output reporting
     files_info: list[str] = field(default_factory=list)
+    # Expected file sizes reported by the remote sender (croc_filename → bytes)
+    expected_sizes: dict = field(default_factory=dict)
+    # Expected content hashes reported by the remote sender (croc_filename → md5 hex).
+    # Size alone is NOT integrity: croc pre-sizes the destination file, so a
+    # dead transfer can leave a size-correct file full of holes.
+    expected_hashes: dict = field(default_factory=dict)
+    # Sentinel observations from the streamed remote output
+    send_ready_seen: bool = False
+    send_done_seen: bool = False
+    remote_failed: bool = False
+    remote_failure: str = ""
+    # Partial-line carry-over for observe_output chunk handling
+    _watch_tail: str = field(default="", repr=False)
+
+    def observe_output(self, content: str) -> None:
+        """Feed a chunk of streamed remote output to the sentinel watcher.
+
+        Chunks may split lines arbitrarily; only complete (newline-terminated)
+        lines are examined. Safe to call with duplicated content (log rotation
+        overlap) — all reactions are idempotent.
+        """
+        if not self.needs_download or not content:
+            return
+        data = self._watch_tail + content
+        lines = data.split("\n")
+        # Keep the (possibly incomplete) last line for the next chunk, bounded
+        self._watch_tail = lines.pop()[-1024:]
+        for raw in lines:
+            line = raw.strip()
+            if croc_manager.CROC_SENTINEL_SIZE in line:
+                payload = line.split(croc_manager.CROC_SENTINEL_SIZE, 1)[1].strip()
+                size_str, _, name = payload.partition(" ")
+                name = name.strip()
+                if name and size_str.isdigit():
+                    self.expected_sizes[name] = int(size_str)
+                    self._write_expected_manifest()
+            elif croc_manager.CROC_SENTINEL_MD5 in line:
+                payload = line.split(croc_manager.CROC_SENTINEL_MD5, 1)[1].strip()
+                md5_hex, _, name = payload.partition(" ")
+                name = name.strip()
+                if name and re.fullmatch(r"[0-9a-fA-F]{32}", md5_hex):
+                    self.expected_hashes[name] = md5_hex.lower()
+                    self._write_expected_manifest()
+            elif croc_manager.CROC_SENTINEL_READY in line:
+                self.send_ready_seen = True
+                self._signal(croc_manager.CROC_READY_SIGNAL)
+            elif croc_manager.CROC_SENTINEL_RETRY in line:
+                # Sender is restarting croc send — hold the receiver off until
+                # the new room is registered (a fresh READY sentinel re-arms it)
+                self._clear_signal(croc_manager.CROC_READY_SIGNAL)
+            elif croc_manager.CROC_SENTINEL_FAILED in line:
+                self.remote_failed = True
+                self.remote_failure = line[line.index(croc_manager.CROC_SENTINEL_FAILED):]
+                self.signal_abort()
+            elif croc_manager.CROC_SENTINEL_DONE in line:
+                self.send_done_seen = True
+
+    def signal_abort(self) -> None:
+        """Tell the local receive wrapper to stop retrying immediately."""
+        self._signal(croc_manager.CROC_ABORT_SIGNAL)
+
+    def _signal(self, filename: str) -> None:
+        if not self.croc_receive_dir:
+            return
+        try:
+            with open(os.path.join(self.croc_receive_dir, filename), "w") as f:
+                f.write("1")
+        except OSError:
+            pass
+
+    def _clear_signal(self, filename: str) -> None:
+        if not self.croc_receive_dir:
+            return
+        try:
+            os.remove(os.path.join(self.croc_receive_dir, filename))
+        except OSError:
+            pass
+
+    def _write_expected_manifest(self) -> None:
+        if not self.croc_receive_dir:
+            return
+        manifest = {
+            name: {
+                "size": self.expected_sizes.get(name),
+                "md5": self.expected_hashes.get(name),
+            }
+            for name in set(self.expected_sizes) | set(self.expected_hashes)
+        }
+        path = os.path.join(self.croc_receive_dir, croc_manager.CROC_EXPECTED_SIZES_FILE)
+        try:
+            tmp = path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(manifest, f)
+        except OSError:
+            return
+        # On Windows os.replace fails transiently while another process has
+        # the destination open (the receive wrapper polls this file; AV and
+        # indexers also take peeks). A silently-stale manifest would degrade
+        # verification to size-only — retry briefly before giving up.
+        for attempt in range(5):
+            try:
+                os.replace(tmp, path)
+                return
+            except OSError:
+                time.sleep(0.05)
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
+def make_download_watch_callback(dl_plan: DownloadPlan, inner=None):
+    """Wrap a log callback so streamed remote output also feeds the download watcher.
+
+    Every execution path that passes download_commands MUST wire this in (the
+    gated receiver won't start until the watcher sees the sender's READY
+    sentinel in the stream). `inner` may be None — the returned callback then
+    only watches.
+    """
+    async def _watch(content: str, environment_id: str = "") -> None:
+        try:
+            dl_plan.observe_output(content)
+        except Exception:
+            pass  # Watching must never break log streaming
+        if inner is not None:
+            await inner(content, environment_id)
+    return _watch
 
 
 def prepare_download_with_croc(
@@ -824,52 +960,105 @@ def prepare_download_with_croc(
     return plan
 
 
-async def execute_download_receive(plan: DownloadPlan) -> asyncio.subprocess.Process:
+async def execute_download_receive(
+    plan: DownloadPlan,
+    command_timeout: Optional[int] = None,
+) -> asyncio.subprocess.Process:
     """Start the local croc receive process for a download plan.
-    
-    Must be called BEFORE launching the Torque environment (the receiver
-    connects to the relay and waits for the sender).
+
+    Must be called BEFORE launching the Torque environment. The receiver is
+    GATED: it stays idle until the sentinel watcher sees the remote sender
+    register its relay room (sender-first handshake) — so the caller MUST also
+    wire make_download_watch_callback() into the environment's log stream.
     Caller MUST call cleanup_download_resources() when done.
-    
+
     Args:
         plan: A DownloadPlan with needs_download=True.
-    
+        command_timeout: The remote command timeout in seconds, if known. The
+            receiver deadline extends beyond it so a long-running remote
+            command can't outlive its receiver.
+
     Returns:
         The background croc receive process.
     """
     croc_path = await croc_manager.ensure_local_croc()
+    receive_timeout = 1800
+    if command_timeout:
+        receive_timeout = max(receive_timeout, int(command_timeout) + 300)
     process = await croc_manager.start_croc_receive(
         croc_path=croc_path,
         code=plan.croc_code,
         receive_dir=plan.croc_receive_dir,
+        timeout=receive_timeout,
+        gated=True,
     )
     return process
 
 
+def _md5_of_file(path: str) -> str:
+    """Chunked MD5 of a file (multi-GB downloads must not be read whole)."""
+    import hashlib
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def finalize_download(plan: DownloadPlan) -> tuple[list[str], list[str]]:
     """Move received croc files to their final local destinations.
-    
+
     Called after the environment has completed and croc receive has finished.
+    Verifies received file sizes against the sender-reported sizes (when known)
+    so a partial/truncated transfer is reported as a failure instead of being
+    placed at the destination as if it completed.
     Retries briefly on file lock errors (e.g. croc still releasing the handle).
-    
+
     Args:
         plan: The DownloadPlan with file_mappings and croc_receive_dir.
-    
+
     Returns:
         Tuple of (successes, errors) lists of strings.
     """
     successes = []
     errors = []
-    
+
     for mapping in plan.file_mappings:
         croc_filename = mapping["croc_filename"]
         local_dest = mapping["local_destination_path"]
         received_path = os.path.join(plan.croc_receive_dir, croc_filename)
-        
+
         if not os.path.exists(received_path):
-            errors.append(f"File not received: {croc_filename}")
+            errors.append(f"Download failed for {local_dest}: file not received ({croc_filename})")
             continue
-        
+
+        expected_size = plan.expected_sizes.get(croc_filename)
+        if expected_size is not None and os.path.isfile(received_path):
+            actual_size = os.path.getsize(received_path)
+            if actual_size != expected_size:
+                errors.append(
+                    f"Download failed for {local_dest}: incomplete transfer of "
+                    f"{croc_filename} ({actual_size} of {expected_size} bytes)"
+                )
+                continue
+
+        # Size match is not integrity: croc pre-sizes the destination file, so
+        # a dead transfer can leave a size-correct file full of holes. Verify
+        # content against the sender-reported hash before placing the file.
+        expected_md5 = plan.expected_hashes.get(croc_filename)
+        if expected_md5 and os.path.isfile(received_path):
+            try:
+                actual_md5 = _md5_of_file(received_path)
+            except OSError as e:
+                errors.append(f"Download failed for {local_dest}: could not hash {croc_filename}: {e}")
+                continue
+            if actual_md5 != expected_md5:
+                errors.append(
+                    f"Download failed for {local_dest}: content corruption in "
+                    f"{croc_filename} (md5 {actual_md5}, expected {expected_md5})"
+                )
+                continue
+
         # Retry move a few times in case croc just released the file handle
         max_retries = 5
         last_error = None
@@ -905,6 +1094,76 @@ def finalize_download(plan: DownloadPlan) -> tuple[list[str], list[str]]:
     return successes, errors
 
 
+async def complete_download(
+    dl_plan: Optional[DownloadPlan],
+    dl_process: Optional[asyncio.subprocess.Process],
+) -> tuple[list[str], list[str]]:
+    """Wind down the local receiver after the remote command finished, then
+    move received files into place.
+
+    Replaces the old unbounded ``await dl_process.wait()`` (which let a failed
+    transfer silently burn the receiver's full 30-minute deadline):
+    - If the remote sender reported failure, or never registered its relay
+      room, the receiver is aborted immediately.
+    - Otherwise the receiver gets a bounded grace period to flush.
+
+    Does NOT clean up resources — callers keep cleanup_download_resources()
+    in their finally blocks.
+
+    Returns:
+        Tuple of (successes, errors) lists of strings.
+    """
+    if dl_plan is None or not dl_plan.needs_download:
+        return [], []
+
+    context_errors = []
+    if dl_plan.remote_failed:
+        dl_plan.signal_abort()
+        context_errors.append(
+            f"remote croc send failed: {dl_plan.remote_failure or 'unknown error'}"
+        )
+    elif not dl_plan.send_ready_seen and not dl_plan.send_done_seen:
+        # The sender never registered with the relay — nothing will ever arrive
+        dl_plan.signal_abort()
+        context_errors.append(
+            "croc sender never registered with the relay "
+            "(no ready sentinel observed in the remote output)"
+        )
+
+    if dl_process is not None and dl_process.returncode is None:
+        wait_seconds = (
+            CROC_DOWNLOAD_ABORT_WAIT_SECONDS if context_errors
+            else CROC_DOWNLOAD_RECEIVE_WAIT_SECONDS
+        )
+        try:
+            await asyncio.wait_for(dl_process.wait(), timeout=wait_seconds)
+        except asyncio.TimeoutError:
+            pass  # cleanup_download_resources will terminate it
+
+    successes, errors = finalize_download(dl_plan)
+    if errors:
+        # The context explains WHY files are missing/incomplete; drop it when
+        # everything arrived intact despite scary sentinels.
+        errors = context_errors + errors
+        log_tail = _read_receive_log_tail(dl_plan)
+        if log_tail:
+            errors.append(f"receiver log (tail): {log_tail}")
+    return successes, errors
+
+
+def _read_receive_log_tail(plan: DownloadPlan, max_chars: int = 1500) -> str:
+    """Best-effort tail of the receive wrapper's log for failure diagnostics."""
+    if not plan.croc_receive_dir:
+        return ""
+    path = os.path.join(plan.croc_receive_dir, croc_manager.CROC_RECEIVE_LOG_FILE)
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+    except OSError:
+        return ""
+    return content[-max_chars:].strip()
+
+
 async def cleanup_download_resources(
     dl_process: Optional[asyncio.subprocess.Process] = None,
     receive_dir: str = "",
@@ -933,7 +1192,7 @@ _config = {
     "finally_commands": None,
     "auto_delete_environments": False,
     "verbose": False,
-    "container_idle_timeout": 7200,
+    "container_idle_timeout": 86400,  # 24h: container dies this long after its last use
     # Resilience to Torque redeploys (transient API errors). See docs/design-api-resilience.md.
     "retry_enabled": True,
     "retry_budget_seconds": 600,
@@ -1083,6 +1342,40 @@ _download_results: dict[str, tuple] = {}  # env_id -> (successes, errors) from f
 # the environment's croc send finishes.
 CROC_DOWNLOAD_RECEIVE_WAIT_SECONDS = 120
 
+# How long to wait for the receiver after it was told to abort (remote send
+# failed / never registered) — just enough for the wrapper to notice the
+# abort signal and exit; cleanup terminates it afterwards regardless.
+CROC_DOWNLOAD_ABORT_WAIT_SECONDS = 10
+
+# Slack added on top of a command's timeout when arming the persistent
+# container's end time at command start, so the container cannot die under a
+# command that is still running.
+CONTAINER_COMMAND_SLACK_SECONDS = 1800
+
+
+def _format_iso_duration(seconds: int) -> str:
+    """Format seconds as an ISO 8601 duration (PT2H, PT1H30M, PT30M, ...)."""
+    total_minutes = max(1, int(seconds) // 60)
+    hours, minutes = divmod(total_minutes, 60)
+    if hours and minutes:
+        return f"PT{hours}H{minutes}M"
+    if hours:
+        return f"PT{hours}H"
+    return f"PT{minutes}M"
+
+
+def _container_deadline(idle_seconds: int, command_timeout: Optional[int] = None) -> datetime:
+    """Absolute scheduled end time for a persistent container.
+
+    Idle-timeout semantics: the container dies idle_seconds after its last
+    use. At command START pass the command's timeout so the deadline also
+    covers the command's own runtime (+ slack) — the container must not die
+    under a running command. At command COMPLETION pass no timeout, which
+    re-arms the plain idle window (shortening any longer protection window).
+    """
+    protect = (int(command_timeout) + CONTAINER_COMMAND_SLACK_SECONDS) if command_timeout else 0
+    return datetime.now(timezone.utc) + timedelta(seconds=max(int(idle_seconds), protect))
+
 # Terminal statuses that indicate the environment has finished
 _TERMINAL_STATUSES = {
     "active", "success",  # Completed successfully
@@ -1124,6 +1417,18 @@ async def _background_stream_grain_log(environment_id: str) -> None:
                     if len(grain_log) > last_log_len:
                         new_content = grain_log[last_log_len:]
                         last_log_len = len(grain_log)
+                        # Feed the download sentinel watcher (async executions
+                        # register their DownloadPlan in _croc_async_state; the
+                        # gated receiver depends on the watcher seeing the
+                        # sender's READY sentinel)
+                        croc_state = _croc_async_state.get(environment_id)
+                        if croc_state is not None:
+                            dl_plan = croc_state.get("dl_plan")
+                            if dl_plan is not None:
+                                try:
+                                    dl_plan.observe_output(new_content)
+                                except Exception:
+                                    pass
                         if filter_state['found']:
                             print(new_content, file=sys.stderr, end='', flush=True)
                         else:
@@ -1487,7 +1792,7 @@ For partial output or cancel mid-execution, use run_on_tunneled_persistent_conta
 All tools here reach an unreachable internal network - for local network/VMs, use terminal commands instead.
 For one-off commands: run_on_tunneled_disposable_container. For remote servers: run_on_tunneled_ssh.
 
-First call provisions ~30-40s. Subsequent calls reuse with near-zero overhead. Idle timeout: 2h default.
+First call provisions ~30-40s. Subsequent calls reuse with near-zero overhead. Idle timeout: 24h after last use (default).
 
 **Multiple containers:** `new_container=true` creates additional ones. `environment_id` targets a
 specific one. Output includes `Persistent Container: <env_id>` - save to target it later.
@@ -1720,7 +2025,7 @@ Only for unreachable internal network targets. For local network/VMs, use termin
 Only use when you NEED state across calls. One-off: run_on_tunneled_disposable_container_async.
 Remote server: run_on_tunneled_ssh_async.
 
-First call provisions ~30-40s. Subsequent calls reuse. Idle timeout: 2h default.
+First call provisions ~30-40s. Subsequent calls reuse. Idle timeout: 24h after last use (default).
 `new_container=true` for additional containers. `environment_id` to target a specific one.
 After restart: pass previous `environment_id` to reconnect.""",
             inputSchema={
@@ -2273,7 +2578,12 @@ async def handle_run_on_tunneled_ssh(arguments: dict, config: dict = None):
         log_callback = create_log_streamer(session)
     except Exception:
         pass  # Streaming not available
-    
+
+    # Downloads are gated on the sender's READY sentinel, so the watcher must
+    # observe the streamed output even when MCP streaming is unavailable
+    if dl_plan is not None and dl_plan.needs_download:
+        log_callback = make_download_watch_callback(dl_plan, log_callback)
+
     try:
         # Start croc send locally if needed (must happen BEFORE Torque environment)
         if plan is not None and plan.needs_croc:
@@ -2282,10 +2592,11 @@ async def handle_run_on_tunneled_ssh(arguments: dict, config: dict = None):
             except Exception as e:
                 return [TextContent(type="text", text=f"Error starting croc file transfer: {str(e)}")]
         
-        # Start croc receive locally if download is needed (receiver connects to relay first)
+        # Start croc receive locally if download is needed (gated: idle until
+        # the watcher sees the sender's READY sentinel)
         if dl_plan is not None and dl_plan.needs_download:
             try:
-                dl_process = await execute_download_receive(dl_plan)
+                dl_process = await execute_download_receive(dl_plan, command_timeout=timeout)
             except Exception as e:
                 return [TextContent(type="text", text=f"Error starting croc file download receiver: {str(e)}")]
         
@@ -2330,18 +2641,12 @@ async def handle_run_on_tunneled_ssh(arguments: dict, config: dict = None):
         # Finalize file downloads if any
         dl_summary = ""
         if dl_plan is not None and dl_plan.needs_download:
-            # Wait for croc receive to finish (it should complete when remote croc send finishes)
-            if dl_process is not None and dl_process.returncode is None:
-                try:
-                    await asyncio.wait_for(dl_process.wait(), timeout=CROC_DOWNLOAD_RECEIVE_WAIT_SECONDS)
-                except asyncio.TimeoutError:
-                    pass  # Will be cleaned up in finally
-            dl_successes, dl_errors = finalize_download(dl_plan)
+            dl_successes, dl_errors = await complete_download(dl_plan, dl_process)
             parts = []
             if dl_successes:
                 parts.append("\n".join(f"- {s}" for s in dl_successes))
             if dl_errors:
-                parts.append("\n".join(f"- WARNING: {e}" for e in dl_errors))
+                parts.append("\n".join(f"- DOWNLOAD FAILED: {e}" for e in dl_errors))
             if parts:
                 dl_summary = "\n**Files Downloaded:**\n" + "\n".join(parts) + "\n"
         
@@ -2501,9 +2806,17 @@ async def _ensure_persistent_container(
                 del _persistent_containers[_default_persistent_container_id]
                 _default_persistent_container_id = None
     
-    # Launch a new persistent container
+    # Launch a new persistent container. Initial lifetime = the idle timeout
+    # (was a hardcoded PT24H, which made the documented "2h idle timeout" a
+    # fiction); every command re-arms the end via set_scheduled_end_time.
+    # Floor of 30 min so container provisioning can't outrun a tiny timeout.
+    initial_duration = _format_iso_duration(max(int(cfg["container_idle_timeout"]), 1800))
     async with get_torque_client(torque_url, torque_token, torque_space, config=cfg) as client:
-        env_id = await client.start_persistent_container(agent=agent_name, container_description=container_description)
+        env_id = await client.start_persistent_container(
+            agent=agent_name,
+            container_description=container_description,
+            duration=initial_duration,
+        )
         print(f"[torque-tunnel] Launching persistent container (env: {env_id})...", file=sys.stderr, flush=True)
         
         info = await client.get_persistent_container_info(env_id)
@@ -2609,7 +2922,12 @@ async def handle_run_on_tunneled_persistent_container(arguments: dict, config: d
         log_callback = create_log_streamer(session)
     except Exception:
         pass
-    
+
+    # Downloads are gated on the sender's READY sentinel, so the watcher must
+    # observe the streamed output even when MCP streaming is unavailable
+    if dl_plan is not None and dl_plan.needs_download:
+        log_callback = make_download_watch_callback(dl_plan, log_callback)
+
     try:
         # Start croc send locally if needed (must happen BEFORE Torque environment)
         if plan is not None and plan.needs_croc:
@@ -2621,12 +2939,20 @@ async def handle_run_on_tunneled_persistent_container(arguments: dict, config: d
         # Start croc receive locally if download is needed
         if dl_plan is not None and dl_plan.needs_download:
             try:
-                dl_process = await execute_download_receive(dl_plan)
+                dl_process = await execute_download_receive(dl_plan, command_timeout=timeout)
             except Exception as e:
                 return [TextContent(type="text", text=f"Error starting croc file download receiver: {str(e)}")]
         
         # Reuse the SSH execution logic - SSH from a disposable grain into the persistent container
         async with get_torque_client(torque_url, torque_token, torque_space, config=cfg) as client:
+            # Arm the container's end time so it cannot die under this command
+            try:
+                await client.set_scheduled_end_time(
+                    env_id, _container_deadline(cfg["container_idle_timeout"], timeout)
+                )
+            except Exception:
+                pass  # Non-critical
+
             result = await client.execute_remote_command(
                 target_ip=container_ip,
                 ssh_user="root",
@@ -2649,20 +2975,15 @@ async def handle_run_on_tunneled_persistent_container(arguments: dict, config: d
                 grain_log = await client.get_grain_log(result.environment_id)
             except Exception:
                 pass
-            
-            # Extend the persistent container's idle timeout after each successful command
+
+            # Re-arm the idle timeout: the container dies idle_timeout after
+            # its LAST USE. Absolute end time — the previous additive /extend
+            # accumulated +2h per command on top of a 24h initial duration,
+            # so containers effectively never idled out.
             try:
-                idle_seconds = cfg["container_idle_timeout"]
-                hours = idle_seconds / 3600
-                # Build ISO 8601 duration: PT2H, PT1H30M, etc.
-                if hours == int(hours):
-                    duration_str = f"PT{int(hours)}H"
-                else:
-                    total_minutes = int(idle_seconds / 60)
-                    h = total_minutes // 60
-                    m = total_minutes % 60
-                    duration_str = f"PT{h}H{m}M" if h else f"PT{m}M"
-                await client.extend_environment(env_id, duration=duration_str)
+                await client.set_scheduled_end_time(
+                    env_id, _container_deadline(cfg["container_idle_timeout"])
+                )
             except Exception:
                 pass  # Non-critical
         
@@ -2670,17 +2991,12 @@ async def handle_run_on_tunneled_persistent_container(arguments: dict, config: d
         # Finalize file downloads if any
         dl_summary = ""
         if dl_plan is not None and dl_plan.needs_download:
-            if dl_process is not None and dl_process.returncode is None:
-                try:
-                    await asyncio.wait_for(dl_process.wait(), timeout=CROC_DOWNLOAD_RECEIVE_WAIT_SECONDS)
-                except asyncio.TimeoutError:
-                    pass
-            dl_successes, dl_errors = finalize_download(dl_plan)
+            dl_successes, dl_errors = await complete_download(dl_plan, dl_process)
             parts = []
             if dl_successes:
                 parts.append("\n".join(f"- {s}" for s in dl_successes))
             if dl_errors:
-                parts.append("\n".join(f"- WARNING: {e}" for e in dl_errors))
+                parts.append("\n".join(f"- DOWNLOAD FAILED: {e}" for e in dl_errors))
             if parts:
                 dl_summary = "\n**Files Downloaded:**\n" + "\n".join(parts) + "\n"
         
@@ -2811,7 +3127,12 @@ async def handle_run_on_tunneled_disposable_container(arguments: dict, config: d
         log_callback = create_log_streamer(session)
     except Exception:
         pass  # Streaming not available
-    
+
+    # Downloads are gated on the sender's READY sentinel, so the watcher must
+    # observe the streamed output even when MCP streaming is unavailable
+    if dl_plan is not None and dl_plan.needs_download:
+        log_callback = make_download_watch_callback(dl_plan, log_callback)
+
     try:
         # Start croc send locally if needed (must happen BEFORE Torque environment)
         if plan is not None and plan.needs_croc:
@@ -2823,7 +3144,7 @@ async def handle_run_on_tunneled_disposable_container(arguments: dict, config: d
         # Start croc receive locally if download is needed
         if dl_plan is not None and dl_plan.needs_download:
             try:
-                dl_process = await execute_download_receive(dl_plan)
+                dl_process = await execute_download_receive(dl_plan, command_timeout=timeout)
             except Exception as e:
                 return [TextContent(type="text", text=f"Error starting croc file download receiver: {str(e)}")]
         
@@ -2849,17 +3170,12 @@ async def handle_run_on_tunneled_disposable_container(arguments: dict, config: d
         # Finalize file downloads if any
         dl_summary = ""
         if dl_plan is not None and dl_plan.needs_download:
-            if dl_process is not None and dl_process.returncode is None:
-                try:
-                    await asyncio.wait_for(dl_process.wait(), timeout=CROC_DOWNLOAD_RECEIVE_WAIT_SECONDS)
-                except asyncio.TimeoutError:
-                    pass
-            dl_successes, dl_errors = finalize_download(dl_plan)
+            dl_successes, dl_errors = await complete_download(dl_plan, dl_process)
             parts = []
             if dl_successes:
                 parts.append("\n".join(f"- {s}" for s in dl_successes))
             if dl_errors:
-                parts.append("\n".join(f"- WARNING: {e}" for e in dl_errors))
+                parts.append("\n".join(f"- DOWNLOAD FAILED: {e}" for e in dl_errors))
             if parts:
                 dl_summary = "\n**Files Downloaded:**\n" + "\n".join(parts) + "\n"
         
@@ -3022,7 +3338,7 @@ async def handle_run_on_tunneled_ssh_async(arguments: dict, config: dict = None)
         # Start croc receive locally if download is needed
         if dl_plan is not None and dl_plan.needs_download:
             try:
-                dl_process = await execute_download_receive(dl_plan)
+                dl_process = await execute_download_receive(dl_plan, command_timeout=timeout)
             except Exception as e:
                 return [TextContent(type="text", text=f"Error starting croc file download receiver: {str(e)}")]
         
@@ -3165,7 +3481,7 @@ async def handle_run_on_tunneled_persistent_container_async(arguments: dict, con
         # Start croc receive locally if download is needed
         if dl_plan is not None and dl_plan.needs_download:
             try:
-                dl_process = await execute_download_receive(dl_plan)
+                dl_process = await execute_download_receive(dl_plan, command_timeout=timeout)
             except Exception as e:
                 return [TextContent(type="text", text=f"Error starting croc file download receiver: {str(e)}")]
         
@@ -3199,21 +3515,18 @@ async def handle_run_on_tunneled_persistent_container_async(arguments: dict, con
             if async_state:
                 _croc_async_state[environment_id] = async_state
             
-            # Extend the persistent container's idle timeout
+            # Arm the container's end time: it must outlive this async command
+            # (idle window or command timeout + slack, whichever is larger).
+            # The command runs unattended, so the idle window is re-armed from
+            # launch rather than from completion — the next command (or
+            # get_execution_status of a sync one) tightens it again.
             try:
-                idle_seconds = cfg["container_idle_timeout"]
-                hours = idle_seconds / 3600
-                if hours == int(hours):
-                    duration_str = f"PT{int(hours)}H"
-                else:
-                    total_minutes = int(idle_seconds / 60)
-                    h = total_minutes // 60
-                    m = total_minutes % 60
-                    duration_str = f"PT{h}H{m}M" if h else f"PT{m}M"
-                await client.extend_environment(env_id, duration=duration_str)
+                await client.set_scheduled_end_time(
+                    env_id, _container_deadline(cfg["container_idle_timeout"], timeout)
+                )
             except Exception:
                 pass
-        
+
         # Start background streaming of grain log to stderr
         _start_background_streamer(environment_id)
         
@@ -3304,7 +3617,7 @@ async def handle_run_on_tunneled_disposable_container_async(arguments: dict, con
         # Start croc receive locally if download is needed
         if dl_plan is not None and dl_plan.needs_download:
             try:
-                dl_process = await execute_download_receive(dl_plan)
+                dl_process = await execute_download_receive(dl_plan, command_timeout=timeout)
             except Exception as e:
                 return [TextContent(type="text", text=f"Error starting croc file download receiver: {str(e)}")]
         
@@ -3418,12 +3731,17 @@ async def handle_get_execution_status(arguments: dict):
                 dl_process = croc_state.get("dl_process")
                 dl_plan = croc_state.get("dl_plan")
                 if dl_plan is not None and dl_plan.needs_download:
-                    if dl_process is not None and dl_process.returncode is None:
-                        try:
-                            await asyncio.wait_for(dl_process.wait(), timeout=CROC_DOWNLOAD_RECEIVE_WAIT_SECONDS)
-                        except asyncio.TimeoutError:
-                            pass
-                    dl_successes, dl_errors = finalize_download(dl_plan)
+                    # The background streamer stops on terminal status and may
+                    # have missed the tail of the log; refeed the full log so
+                    # the watcher sees the final sentinels (idempotent) before
+                    # the download's fate is decided.
+                    try:
+                        async with get_torque_client() as log_client:
+                            final_log = await log_client.get_grain_log(environment_id) or ""
+                        dl_plan.observe_output("\n" + final_log + "\n")
+                    except Exception:
+                        pass
+                    dl_successes, dl_errors = await complete_download(dl_plan, dl_process)
                     # Store results for output formatting
                     _download_results[environment_id] = (dl_successes, dl_errors)
                     await cleanup_download_resources(dl_process, dl_plan.croc_receive_dir)
@@ -3945,15 +4263,21 @@ async def cli_dispatch(args):
                     for e in dl_plan.errors:
                         print(f"  - {e}", file=sys.stderr)
             
+            log_cb = cli_log_callback("")
+            if dl_plan is not None and dl_plan.needs_download:
+                # The gated receiver depends on the watcher seeing the sender's
+                # READY sentinel in the streamed output
+                log_cb = make_download_watch_callback(dl_plan, log_cb)
+
             try:
                 # Start croc send locally if needed (uploads)
                 if plan is not None and plan.needs_croc:
                     croc_process = await execute_with_croc(plan)
-                
+
                 # Start croc receive locally if needed (downloads)
                 if dl_plan is not None and dl_plan.needs_download:
-                    dl_process = await execute_download_receive(dl_plan)
-                
+                    dl_process = await execute_download_receive(dl_plan, command_timeout=timeout)
+
                 async with get_torque_client() as client:
                     result = await client.execute_remote_command(
                         target_ip=target_ip,
@@ -3963,7 +4287,7 @@ async def cli_dispatch(args):
                         agent=agent,
                         timeout=timeout,
                         auto_cleanup=_config["auto_delete_environments"],
-                        log_callback=cli_log_callback(""),
+                        log_callback=log_cb,
                         init_commands=init_commands,
                         ssh_password=ssh_password,
                         container_pre_commands=container_pre_commands,
@@ -3973,19 +4297,19 @@ async def cli_dispatch(args):
                     )
             finally:
                 await cleanup_croc_resources(croc_process, plan.croc_staging_dir if plan else "")
-            
-            # Finalize downloads
+
+            # Finalize downloads (bounded: aborts the receiver instead of
+            # letting a failed transfer burn its full deadline)
             dl_successes = []
             dl_errors = []
-            if dl_plan and dl_plan.needs_download and dl_process:
+            if dl_plan and dl_plan.needs_download:
                 try:
-                    await dl_process.wait()
-                    dl_successes, dl_errors = finalize_download(dl_plan)
+                    dl_successes, dl_errors = await complete_download(dl_plan, dl_process)
                 except Exception as e:
                     dl_errors.append(f"Download finalization error: {e}")
                 finally:
                     await cleanup_download_resources(dl_process, dl_plan.croc_receive_dir)
-            
+
             if output_json:
                 result_dict = {
                     "status": result.status,
@@ -3997,18 +4321,22 @@ async def cli_dispatch(args):
                 if dl_successes or dl_errors:
                     result_dict["downloads"] = {"successes": dl_successes, "errors": dl_errors}
                 print(json_module.dumps(result_dict))
+                if dl_errors:
+                    sys.exit(1)
             else:
                 if result.status == "completed":
                     print(result.command_output or "", end='')
                     for s in dl_successes:
                         print(f"Downloaded: {s}", file=sys.stderr)
                     for e in dl_errors:
-                        print(f"Download warning: {e}", file=sys.stderr)
-                    sys.exit(result.exit_code or 0)
+                        print(f"DOWNLOAD FAILED: {e}", file=sys.stderr)
+                    # A requested download that did not complete is a failure,
+                    # even when the remote command itself exited 0
+                    sys.exit(1 if dl_errors else (result.exit_code or 0))
                 else:
                     print(f"Error: {result.error}", file=sys.stderr)
                     sys.exit(1)
-        
+
         elif args.command == "persistent-container":
             # Persistent container command
             agent = getattr(args, 'torque_agent', None)
@@ -4190,17 +4518,33 @@ async def cli_dispatch(args):
                             print(f"  - {e}", file=sys.stderr)
                 
                 print(f"Persistent Container: {used_env_id}", file=sys.stderr)
-                
+
+                log_cb = cli_log_callback("")
+                if dl_plan is not None and dl_plan.needs_download:
+                    # The gated receiver depends on the watcher seeing the
+                    # sender's READY sentinel in the streamed output
+                    log_cb = make_download_watch_callback(dl_plan, log_cb)
+
                 try:
                     # Start croc send locally if needed (uploads)
                     if plan is not None and plan.needs_croc:
                         croc_process = await execute_with_croc(plan)
-                    
+
                     # Start croc receive locally if needed (downloads)
                     if dl_plan is not None and dl_plan.needs_download:
-                        dl_process = await execute_download_receive(dl_plan)
-                    
+                        dl_process = await execute_download_receive(dl_plan, command_timeout=timeout)
+
                     async with get_torque_client() as client:
+                        # Arm the container's end time so it cannot die under
+                        # this command
+                        try:
+                            await client.set_scheduled_end_time(
+                                used_env_id,
+                                _container_deadline(_config["container_idle_timeout"], timeout),
+                            )
+                        except Exception:
+                            pass
+
                         result = await client.execute_remote_command(
                             target_ip=container_ip,
                             ssh_user="root",
@@ -4209,7 +4553,7 @@ async def cli_dispatch(args):
                             agent=agent,
                             timeout=timeout,
                             auto_cleanup=_config["auto_delete_environments"],
-                            log_callback=cli_log_callback(""),
+                            log_callback=log_cb,
                             init_commands=init_commands,
                             container_pre_commands=container_pre_commands,
                             download_commands=dl_plan.download_commands if dl_plan and dl_plan.needs_download else None,
@@ -4217,36 +4561,32 @@ async def cli_dispatch(args):
                             environment_kind="persistent-command",
                             parent_env_id=used_env_id,
                         )
-                    
-                        # Extend idle timeout
+
+                        # Re-arm the idle timeout: the container dies
+                        # idle_timeout after its LAST USE (absolute end; the
+                        # old additive /extend accumulated lifetime instead)
                         try:
-                            idle_seconds = _config["container_idle_timeout"]
-                            hours = idle_seconds / 3600
-                            if hours == int(hours):
-                                duration_str = f"PT{int(hours)}H"
-                            else:
-                                total_minutes = int(idle_seconds / 60)
-                                h = total_minutes // 60
-                                m = total_minutes % 60
-                                duration_str = f"PT{h}H{m}M" if h else f"PT{m}M"
-                            await client.extend_environment(used_env_id, duration=duration_str)
+                            await client.set_scheduled_end_time(
+                                used_env_id,
+                                _container_deadline(_config["container_idle_timeout"]),
+                            )
                         except Exception:
                             pass
                 finally:
                     await cleanup_croc_resources(croc_process, plan.croc_staging_dir if plan else "")
                 
-                # Finalize downloads
+                # Finalize downloads (bounded: aborts the receiver instead of
+                # letting a failed transfer burn its full deadline)
                 dl_successes = []
                 dl_errors = []
-                if dl_plan and dl_plan.needs_download and dl_process:
+                if dl_plan and dl_plan.needs_download:
                     try:
-                        await dl_process.wait()
-                        dl_successes, dl_errors = finalize_download(dl_plan)
+                        dl_successes, dl_errors = await complete_download(dl_plan, dl_process)
                     except Exception as e:
                         dl_errors.append(f"Download finalization error: {e}")
                     finally:
                         await cleanup_download_resources(dl_process, dl_plan.croc_receive_dir)
-                
+
                 if output_json:
                     result_dict = {
                         "status": result.status,
@@ -4259,14 +4599,18 @@ async def cli_dispatch(args):
                     if dl_successes or dl_errors:
                         result_dict["downloads"] = {"successes": dl_successes, "errors": dl_errors}
                     print(json_module.dumps(result_dict))
+                    if dl_errors:
+                        sys.exit(1)
                 else:
                     if result.status == "completed":
                         print(result.command_output or "", end='')
                         for s in dl_successes:
                             print(f"Downloaded: {s}", file=sys.stderr)
                         for e in dl_errors:
-                            print(f"Download warning: {e}", file=sys.stderr)
-                        sys.exit(result.exit_code or 0)
+                            print(f"DOWNLOAD FAILED: {e}", file=sys.stderr)
+                        # A requested download that did not complete is a failure,
+                        # even when the remote command itself exited 0
+                        sys.exit(1 if dl_errors else (result.exit_code or 0))
                     else:
                         print(f"Error: {result.error}", file=sys.stderr)
                         sys.exit(1)
@@ -4320,41 +4664,47 @@ async def cli_dispatch(args):
                     for e in dl_plan.errors:
                         print(f"  - {e}", file=sys.stderr)
             
+            log_cb = cli_log_callback("")
+            if dl_plan is not None and dl_plan.needs_download:
+                # The gated receiver depends on the watcher seeing the sender's
+                # READY sentinel in the streamed output
+                log_cb = make_download_watch_callback(dl_plan, log_cb)
+
             try:
                 # Start croc send locally if needed (uploads)
                 if plan is not None and plan.needs_croc:
                     croc_process = await execute_with_croc(plan)
-                
+
                 # Start croc receive locally if needed (downloads)
                 if dl_plan is not None and dl_plan.needs_download:
-                    dl_process = await execute_download_receive(dl_plan)
-                
+                    dl_process = await execute_download_receive(dl_plan, command_timeout=timeout)
+
                 async with get_torque_client() as client:
                     result = await client.execute_local_command(
                         command=effective_command,
                         agent=agent,
                         timeout=timeout,
                         auto_cleanup=_config["auto_delete_environments"],
-                        log_callback=cli_log_callback(""),
+                        log_callback=log_cb,
                         init_commands=init_commands,
                         download_commands=dl_plan.download_commands if dl_plan and dl_plan.needs_download else None,
                         command_description=command_description,
                     )
             finally:
                 await cleanup_croc_resources(croc_process, plan.croc_staging_dir if plan else "")
-            
-            # Finalize downloads
+
+            # Finalize downloads (bounded: aborts the receiver instead of
+            # letting a failed transfer burn its full deadline)
             dl_successes = []
             dl_errors = []
-            if dl_plan and dl_plan.needs_download and dl_process:
+            if dl_plan and dl_plan.needs_download:
                 try:
-                    await dl_process.wait()
-                    dl_successes, dl_errors = finalize_download(dl_plan)
+                    dl_successes, dl_errors = await complete_download(dl_plan, dl_process)
                 except Exception as e:
                     dl_errors.append(f"Download finalization error: {e}")
                 finally:
                     await cleanup_download_resources(dl_process, dl_plan.croc_receive_dir)
-            
+
             if output_json:
                 result_dict = {
                     "status": result.status,
@@ -4366,18 +4716,22 @@ async def cli_dispatch(args):
                 if dl_successes or dl_errors:
                     result_dict["downloads"] = {"successes": dl_successes, "errors": dl_errors}
                 print(json_module.dumps(result_dict))
+                if dl_errors:
+                    sys.exit(1)
             else:
                 if result.status == "completed":
                     print(result.command_output or "", end='')
                     for s in dl_successes:
                         print(f"Downloaded: {s}", file=sys.stderr)
                     for e in dl_errors:
-                        print(f"Download warning: {e}", file=sys.stderr)
-                    sys.exit(result.exit_code or 0)
+                        print(f"DOWNLOAD FAILED: {e}", file=sys.stderr)
+                    # A requested download that did not complete is a failure,
+                    # even when the remote command itself exited 0
+                    sys.exit(1 if dl_errors else (result.exit_code or 0))
                 else:
                     print(f"Error: {result.error}", file=sys.stderr)
                     sys.exit(1)
-        
+
         elif args.command == "read":
             # Read remote file
             target_ip = _config["default_target_ip"]
@@ -4550,7 +4904,7 @@ def build_parser():
         "finally_commands": os.environ.get("FINALLY_COMMANDS"),
         "auto_delete_environments": os.environ.get("AUTO_DELETE_ENVIRONMENTS", "").lower() in ("true", "1", "yes"),
         "verbose": False,
-        "container_idle_timeout": int(os.environ.get("CONTAINER_IDLE_TIMEOUT", "7200")),
+        "container_idle_timeout": int(os.environ.get("CONTAINER_IDLE_TIMEOUT", "86400")),
     }
     common_parser = argparse.ArgumentParser(add_help=False)
     common_parser.add_argument(
@@ -4629,7 +4983,7 @@ def build_parser():
         "--container-idle-timeout",
         type=int,
         default=argparse.SUPPRESS,
-        help="Idle timeout in seconds for persistent containers before auto-cleanup (default: 7200 = 2 hours, env: $CONTAINER_IDLE_TIMEOUT)",
+        help="Idle timeout in seconds for persistent containers before auto-cleanup (default: 86400 = 24 hours, env: $CONTAINER_IDLE_TIMEOUT)",
     )
     
     # Main parser with subcommands - also inherits common args for when no subcommand is given
@@ -4982,10 +5336,10 @@ def main():
     _config["default_ssh_user"] = args.ssh_user or file_defaults_with_profile.get("default_ssh_user")
     _config["init_commands"] = args.init_commands or file_defaults_with_profile.get("init_commands")
     _config["finally_commands"] = args.finally_commands or file_defaults_with_profile.get("finally_commands")
-    # Boolean/numeric: argparse defaults to False/7200, so only override from file if argparse didn't set explicitly
+    # Boolean/numeric: argparse defaults to False/86400, so only override from file if argparse didn't set explicitly
     _config["auto_delete_environments"] = args.auto_delete_environments or file_defaults_with_profile.get("auto_delete_environments", False)
     _config["verbose"] = args.verbose or file_defaults_with_profile.get("verbose", False)
-    _config["container_idle_timeout"] = args.container_idle_timeout if args.container_idle_timeout != 7200 else file_defaults_with_profile.get("container_idle_timeout", 7200)
+    _config["container_idle_timeout"] = args.container_idle_timeout if args.container_idle_timeout != 86400 else file_defaults_with_profile.get("container_idle_timeout", 86400)
     
     # Record CLI overrides for hot-reload (these keys won't be changed when config file is reloaded)
     global _cli_overrides, _cli_profile, _config_explicit_path, _config_file_path, _config_file_mtime
@@ -5005,7 +5359,7 @@ def main():
     if args.finally_commands: _cli_overrides.add("finally_commands")
     if args.auto_delete_environments: _cli_overrides.add("auto_delete_environments")
     if args.verbose: _cli_overrides.add("verbose")
-    if args.container_idle_timeout != 7200: _cli_overrides.add("container_idle_timeout")
+    if args.container_idle_timeout != 86400: _cli_overrides.add("container_idle_timeout")
     # Track config file for hot-reload watcher
     cfg_path = config_module.find_config_file(_config_explicit_path)
     if cfg_path:

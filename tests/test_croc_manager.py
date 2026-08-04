@@ -53,15 +53,15 @@ class TestPlatformDetection:
 
     def test_binary_name_windows(self):
         with mock.patch("sys.platform", "win32"):
-            assert croc_manager._get_croc_binary_name() == "croc.exe"
+            assert croc_manager._get_croc_binary_name() == f"croc-{croc_manager.CROC_VERSION}.exe"
 
     def test_binary_name_linux(self):
         with mock.patch("sys.platform", "linux"):
-            assert croc_manager._get_croc_binary_name() == "croc"
+            assert croc_manager._get_croc_binary_name() == f"croc-{croc_manager.CROC_VERSION}"
 
     def test_binary_name_darwin(self):
         with mock.patch("sys.platform", "darwin"):
-            assert croc_manager._get_croc_binary_name() == "croc"
+            assert croc_manager._get_croc_binary_name() == f"croc-{croc_manager.CROC_VERSION}"
 
     def test_asset_name_linux_x86(self):
         with mock.patch("platform.system", return_value="Linux"), \

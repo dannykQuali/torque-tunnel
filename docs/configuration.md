@@ -26,7 +26,7 @@ init_commands: "export HTTP_PROXY=http://proxy:80"
 # finally_commands: ""
 # auto_delete_environments: false
 # verbose: false
-# container_idle_timeout: 7200
+# container_idle_timeout: 86400
 
 # ── Default profile ─────────────────────────────────────────────────
 # Automatically applied at startup when no --profile is specified.
@@ -88,7 +88,7 @@ These can appear at the top level and/or inside any profile:
 | `finally_commands` | Commands to run after every SSH command |
 | `auto_delete_environments` | Auto-delete environments after completion |
 | `verbose` | Show full unfiltered output |
-| `container_idle_timeout` | Idle timeout for persistent containers (seconds) |
+| `container_idle_timeout` | Idle timeout for persistent containers (seconds, default 86400 = 24h). The container's Torque scheduled end time is set to `now + idle_timeout` after every command (absolute — it both extends and shrinks), so the container dies exactly this long after its last use. At command start the end is armed to `now + max(idle_timeout, command_timeout + 30min)` so a running command can never outlive its container. The initial duration at creation is also `idle_timeout`. |
 | `retry_enabled` | Master switch for transient-error retries + idempotent creates (default `true`) |
 | `retry_budget_seconds` | Max consecutive outage tolerated while polling/monitoring, in seconds (default `600`, sized for a ~10-min Torque redeploy) |
 | `create_retry_budget_seconds` | Budget for idempotent environment create + reconcile, in seconds (default `600`) |

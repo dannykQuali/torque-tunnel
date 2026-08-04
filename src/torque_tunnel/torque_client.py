@@ -10,6 +10,7 @@ import re
 import sys
 import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Callable, Awaitable
 from dataclasses import dataclass
@@ -1163,6 +1164,7 @@ class TorqueClient:
         agent: Optional[str] = None,
         environment_name: Optional[str] = None,
         container_description: Optional[str] = None,
+        duration: str = "PT2H",
     ) -> str:
         """
         Start a persistent container with SSH access on the Torque agent.
@@ -1175,6 +1177,9 @@ class TorqueClient:
             agent: Agent name (uses default if not specified)
             environment_name: Optional explicit name (overrides the generated name)
             container_description: Optional human-oriented description embedded in the name.
+            duration: Initial ISO 8601 lifetime (callers pass the idle timeout;
+                each command then re-arms the end via set_scheduled_end_time,
+                giving true "dies N after last use" semantics).
 
         Returns:
             Environment ID
@@ -1194,7 +1199,7 @@ class TorqueClient:
         payload = {
             "blueprint_name": self.PERSISTENT_CONTAINER_BLUEPRINT,
             "environment_name": environment_name,
-            "duration": "PT24H",
+            "duration": duration,
             "inputs": {
                 "agent": agent_name,
             },
@@ -1314,8 +1319,12 @@ class TorqueClient:
         duration: str = "PT2H",
     ) -> None:
         """
-        Extend an environment's lifetime.
-        
+        Extend an environment's lifetime by ADDING duration to its scheduled end.
+
+        NOTE: this is Torque's additive "+X hours" primitive — repeated calls
+        accumulate. For idle-timeout semantics ("die N hours after last use")
+        use set_scheduled_end_time() instead.
+
         Args:
             environment_id: Environment ID
             duration: ISO 8601 duration string (e.g., "PT2H" for 2 hours)
@@ -1326,6 +1335,37 @@ class TorqueClient:
             json={"duration": duration},
         )
         # Ignore 404 (already gone) and 400 (can't extend in current state)
+        if response.status_code in (404, 400):
+            return
+        response.raise_for_status()
+
+    async def set_scheduled_end_time(
+        self,
+        environment_id: str,
+        end_time: datetime,
+    ) -> None:
+        """
+        Set an environment's ABSOLUTE scheduled end time.
+
+        Unlike extend_environment() this both lengthens and shortens the
+        remaining lifetime, which is what an idle timeout needs: after each
+        command the end is set to now + idle_timeout, so the environment dies
+        exactly idle_timeout after its last use instead of accumulating +2h
+        per executed command on top of a 24h initial duration.
+
+        Args:
+            environment_id: Environment ID
+            end_time: Absolute end time (aware or naive-UTC datetime).
+        """
+        if end_time.tzinfo is not None:
+            end_time = end_time.astimezone(timezone.utc).replace(tzinfo=None)
+        value = end_time.strftime("%Y-%m-%dT%H:%M:%SZ")
+        response = await self._request_with_retry(
+            "PUT",
+            f"/spaces/{self.space}/environments/{environment_id}/scheduled_end_time",
+            params={"value": value},
+        )
+        # Ignore 404 (already gone) and 400 (can't change in current state)
         if response.status_code in (404, 400):
             return
         response.raise_for_status()

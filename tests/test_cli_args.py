@@ -164,7 +164,7 @@ def test_common_defaults_present_when_absent(monkeypatch):
     assert args.torque_url is None
     assert args.verbose is False
     assert args.auto_delete_environments is False
-    assert args.container_idle_timeout == 7200
+    assert args.container_idle_timeout == 86400
 
 
 def test_no_subcommand_has_common_defaults(monkeypatch):
@@ -175,7 +175,7 @@ def test_no_subcommand_has_common_defaults(monkeypatch):
     assert args.command is None
     assert args.host is None
     assert hasattr(args, "torque_url")
-    assert args.container_idle_timeout == 7200
+    assert args.container_idle_timeout == 86400
 
 
 def test_common_env_default_applied(monkeypatch):

@@ -61,8 +61,8 @@ class TestGenerateCrocSendCommands:
         assert "_croc_dl_1_b.bin" in cmds
         assert "cp -r '/tmp/a.txt'" in cmds
         assert "cp -r '/opt/b.bin'" in cmds
-        # Both files in croc send command
-        assert "'_croc_dl_0_a.txt' '_croc_dl_1_b.bin'" in cmds
+        # croc sends everything that was staged (glob over the staging dir)
+        assert "croc send --no-local" in cmds
 
     def test_directory_staging_uses_cp_r(self):
         cmds = croc_manager.generate_croc_send_commands(
@@ -96,22 +96,28 @@ class TestGenerateCrocSendCommands:
             file_infos=[{"remote_source_path": "/f", "croc_filename": "f"}],
         )
         assert "__DL_RC" in cmds
-        assert "WARNING: croc file download failed" in cmds
+        # A failed transfer must be an ERROR with a machine-readable sentinel
+        # and a non-zero exit - not a swallowed warning
+        assert "ERROR: croc file download failed" in cmds
+        assert croc_manager.CROC_SENTINEL_FAILED in cmds
+        assert "exit 1" in cmds
 
-    def test_custom_timeout(self):
+    def test_custom_timeout_is_floor(self):
+        """The timeout arg is the floor; the effective value scales with payload size."""
         cmds = croc_manager.generate_croc_send_commands(
             code="code",
             file_infos=[{"remote_source_path": "/f", "croc_filename": "f"}],
             timeout=120,
         )
-        assert "timeout -k 5 120 croc send" in cmds
+        assert '[ "$__DL_TIMEOUT" -lt 120 ] && __DL_TIMEOUT=120' in cmds
+        assert 'timeout -k 5 "$__DL_TIMEOUT" croc send' in cmds
 
-    def test_default_timeout(self):
+    def test_default_timeout_is_floor(self):
         cmds = croc_manager.generate_croc_send_commands(
             code="code",
             file_infos=[{"remote_source_path": "/f", "croc_filename": "f"}],
         )
-        assert "timeout -k 5 300 croc send" in cmds
+        assert '[ "$__DL_TIMEOUT" -lt 300 ] && __DL_TIMEOUT=300' in cmds
 
     def test_special_characters_in_path(self):
         cmds = croc_manager.generate_croc_send_commands(
@@ -246,7 +252,8 @@ class TestGenerateCrocScpDownloadCommands:
             ssh_private_key="KEY",
             timeout=300,
         )
-        assert "timeout -k 5 300 croc send" in cmds
+        assert '[ "$__DL_TIMEOUT" -lt 300 ] && __DL_TIMEOUT=300' in cmds
+        assert 'timeout -k 5 "$__DL_TIMEOUT" croc send' in cmds
 
     def test_scp_uses_r_flag(self):
         """scp -r works for both files and directories."""
