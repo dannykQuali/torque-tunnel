@@ -141,7 +141,13 @@ Other properties of the send wrapper:
    - remote send failed / never registered → abort the receiver immediately (no 30-minute burn)
    - otherwise → bounded grace period (`CROC_DOWNLOAD_RECEIVE_WAIT_SECONDS`)
    - then `finalize_download()` verifies sizes and moves files to their destinations
-7. `cleanup_download_resources()` removes the temp receive dir and kills the croc process
+7. `cleanup_download_resources()` removes the temp receive dir and stops the receiver —
+   abort-signal first (so the wrapper kills its in-flight croc child — tree-kill on
+   Windows — and exits cleanly), then terminate as fallback, then delete with one
+   retry. Terminating the wrapper directly used to orphan croc, whose open handle
+   on the partial file made the receive dir undeletable (observed live: a partial
+   still being written 11 minutes after the CLI exited, and dozens of stale
+   `torque_dl_*` dirs accumulated since June).
 
 **Failure propagation:** a requested download that did not complete makes the
 CLI exit non-zero (even if the remote command exited 0) and prints

@@ -540,6 +540,24 @@ class TestReceiveWrapper:
         assert rc == 0
 
     @pytest.mark.asyncio
+    async def test_cleanup_kills_in_flight_croc_and_removes_dir(self, recv):
+        """cleanup_download_resources must not orphan the wrapper's croc child:
+        an orphan holds the partial file open, which blocks directory deletion
+        (observed live: ~58 stale torque_dl_* dirs, one with a 2.4 GB partial
+        still being written 11 minutes after the CLI exited)."""
+        recv["set_plan"]([{"sleep": 120, "rc": 0}])  # croc hangs mid-attempt
+        process = await self._start(recv, gated=False, timeout=600)
+        assert wait_until(lambda: recv["count"]() >= 1), "croc attempt never started"
+        start = time.monotonic()
+        await cleanup_download_resources(process, str(recv["receive_dir"]))
+        elapsed = time.monotonic() - start
+        assert elapsed < 15
+        assert process.returncode is not None
+        # Directory fully removed — only possible if the croc child (which
+        # holds an open handle on the log file inside it) was killed
+        assert not recv["receive_dir"].exists()
+
+    @pytest.mark.asyncio
     async def test_receive_log_records_attempts(self, recv):
         recv["set_plan"]([{"write": [{"name": "f.bin", "size": 3}], "rc": 0}])
         process = await self._start(recv, gated=False)

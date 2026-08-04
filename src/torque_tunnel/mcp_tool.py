@@ -1169,13 +1169,35 @@ async def cleanup_download_resources(
     receive_dir: str = "",
 ) -> None:
     """Clean up croc receive process and receive directory.
-    
+
+    Signals abort FIRST and waits briefly: the wrapper then kills its
+    in-flight croc child and exits cleanly. Terminating the wrapper directly
+    would orphan croc, and the orphan's open handle on the partial file
+    blocks the directory removal below (observed live: a 2.4 GB partial
+    still being written 11 minutes after the CLI exited, plus dozens of
+    stale torque_dl_* dirs).
+
     Safe to call with None/empty values.
     """
+    if receive_dir and dl_process is not None and dl_process.returncode is None:
+        try:
+            with open(os.path.join(receive_dir, croc_manager.CROC_ABORT_SIGNAL), "w") as f:
+                f.write("1")
+        except OSError:
+            pass
+        try:
+            await asyncio.wait_for(dl_process.wait(), timeout=5)
+        except asyncio.TimeoutError:
+            pass  # fall through to terminate
     if dl_process is not None:
         await croc_manager.cleanup_croc_send(dl_process)  # same cleanup logic
     if receive_dir and os.path.exists(receive_dir):
         shutil.rmtree(receive_dir, ignore_errors=True)
+        # Windows: deletion can transiently fail while handles close (child
+        # teardown, AV scans of fresh multi-GB files) — one brief retry
+        if os.path.exists(receive_dir):
+            await asyncio.sleep(1)
+            shutil.rmtree(receive_dir, ignore_errors=True)
 
 
 # Global configuration - set via command line args or environment variables
