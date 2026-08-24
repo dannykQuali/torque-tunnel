@@ -42,6 +42,32 @@ review2: { "dannyk": { access_token: "...", ... } }       ← 1 account
 
 **Verified live:** Generated long token via `shell-cmd` space, then used it to list all 12 spaces successfully.
 
+## Permissions Assumption: Account Admin
+
+torque-tunnel **assumes the Torque user account used during setup has account-admin-level
+permissions.** Non-admin accounts have never been tested or used with torque-tunnel, and
+various parts of the flow will fail for them. Supporting non-admin users is a valid scenario,
+but it is explicitly **left for the future**.
+
+**Required capabilities per endpoint** (verified in cs2018):
+
+| Endpoint | Scope | Required capability |
+|----------|-------|---------------------|
+| `GET /api/settings/agents` | Account | `ManageCloudAccounts` |
+| `POST /api/spaces` | Account | `ManageSpaces` |
+| `POST /api/spaces/{space}/agents/{agent}` | Account | `ManageCloudAccounts` |
+| `GET /api/accounts/user_spaces` | Space | space access only |
+| `GET /api/spaces/{space}/agents` | Space | space access only |
+
+The setup flow is **agent-first** (see [Login Flow v4](#login-flow-v4-agent-first-with-a-dedicated-space)),
+listing agents account-wide (`GET /api/settings/agents`) and creating a `torque-tunnel` space
+with the chosen agent associated to it. All three of those steps go through the admin-only
+endpoints above, so the flow is admin-only by construction. The space-scoped endpoints are the
+only parts a non-admin could use today.
+
+A future enhancement could probe the account agent list and fall back to the space-first flow
+when it returns `403`. That is deliberately **out of scope for now**.
+
 ## Architecture
 
 ```
@@ -527,3 +553,127 @@ space/agent/long-token API calls, and the saved profile always refer to the same
 - **Security**: the DevTools port binds to 127.0.0.1 and lives only for the duration of the
   sign-in; the temp profile (which briefly holds the session) is deleted immediately after.
   The harvested short token flows through the same localhost channel as password login.
+
+---
+
+## Login Flow v4: Agent-first with a dedicated space
+
+### Problem
+
+torque-tunnel launches a Torque environment for every tunneled command. Pointed at whatever
+space the user already had, those environments accumulate in a space that is also used for
+real work — noisy at best, confusing at worst. The old flow made this the *default*: it asked
+for a space first, then filtered agents down to that space.
+
+### Decision
+
+Steer every new profile into a **dedicated space** (default name `torque-tunnel`), created on
+demand and associated with the chosen agent. Selection is **agent-first**: the agent is the
+scarce, physically-meaningful resource (it determines network reachability); the space is
+bookkeeping we can create for free.
+
+### Flow
+
+```
+Authenticated (short token, or a reused profile token)
+    │
+    ▼
+Step "space" (agent mode — the default)
+    GET /api/accounts/user_spaces   → state.allSpaces
+    GET /api/settings/agents        → state.allAgents  (admin-only; errors shown in the UI)
+    │
+    │  Filters: "Online only" ON, "With spaces only" OFF
+    │  (space-less agents are valid now — the new space is what fixes them)
+    │
+    ├── [Choose by space instead] ──► legacy space-first path, unchanged
+    │
+    ▼  pick an agent
+Step "agent-space"  — shown for EVERY agent, no auto-skip
+    │
+    ├── (default) Create a new space  [torque-tunnel]
+    │      name not in allSpaces → "Agent <name> will be automatically allowed
+    │                               in this space."
+    │      name IS in allSpaces  → "Space '<name>' already exists — it will be
+    │                               used, and the agent will be allowed in it."
+    │      empty name → inline error on Continue
+    │
+    └── Use an existing space
+           every space from user_spaces, badged "agent already allowed"
+           where the space is in agent.spaces
+    │
+    ▼  Continue  →  state.createSpace / state.needsAssociation
+Step "confirm"
+    Space row: "<name> (will be created)"          when createSpace
+    Agent row: "<name> (will be allowed in space)" when needsAssociation
+    │
+    ▼  Save & Finish
+POST /api/ensure-space      ← only when createSpace || needsAssociation
+POST /api/generate-token
+POST /api/complete
+```
+
+On an `ensure-space` failure the error is shown in the confirm step and the button is
+re-enabled, so the user can go **Back** and pick an existing space instead. The realistic
+failures are `LICENSE_SPACES_LIMIT_REACHED` (403, account is out of space quota — verified
+live on jarvis) and a non-admin token being refused.
+
+### Endpoint: `POST /api/ensure-space`
+
+CSRF-protected like every other POST. Makes the chosen space exist and the chosen agent usable
+in it — **idempotently**, so a retry after a partial failure is harmless.
+
+```
+Request:  {"token": <short-or-long bearer>, "space": <name>,
+           "agent": <name|null>, "agent_type": <"k8s"|"vcenter"|...|null>}
+Response: {"space_created": <bool>, "agent_associated": <bool>}   200
+Error:    {"error": "<Torque's message>", ...}                    Torque's status
+```
+
+Both flags are `false` when everything already existed. Steps:
+
+1. `GET /api/accounts/user_spaces` — if `space` is listed, nothing to create.
+2. Otherwise `POST /api/spaces` with `{"name": space, "icon": "flow", "color": "midnightBlue"}`.
+   A `TAKEN_SPACE_NAME` **422** means someone else won the race → treated as success
+   (`space_created: false`). Any other failure propagates Torque's message and status.
+3. With an agent: `GET /api/executionhosts/{agent}/spaces`. If `space` is already among
+   `space-associations[].space_name`, done.
+4. Otherwise `POST /api/spaces/{space}/agents/{agent}` with a type-dependent body.
+   A `SPACE_ASSOCIATION_ALREADY_EXIST` **422** is treated as success (race-safe).
+
+Space and agent names are percent-encoded per path segment — Torque space names may contain
+spaces. Every Torque call uses the same ~15s timeout as the other proxy handlers, and any
+unexpected exception still returns a JSON `{"error": ...}` body rather than a bare 500.
+
+#### Association body per agent type
+
+| Agent type | Body | Why |
+|-----------|------|-----|
+| `vcenter`, `docker`, anything non-k8s | `{}` | Torque deserializes an empty body into default `InfraSettings` |
+| `k8s` | `{"namespace", "service_account", "internet_facing"}` | k8s associations are namespace-scoped |
+
+**Resolving the k8s spec** (in order):
+
+1. **Copy from an existing association.** The first entry of
+   `GET /api/executionhosts/{agent}/spaces` that carries both `namespace` and
+   `service_account`. `internet_facing` is then read from that space's
+   `GET /api/spaces/{that_space}/agents` → the agent's `spec.internet_facing`;
+   any failure there defaults it to `false`.
+2. **Discover, for a never-associated agent.**
+   `GET /api/executionhosts/k8s/{agent}/agent/namespaces` → `{"namespaces": [...]}`.
+   Prefer the agent's own `additional_details.agent_namespace` (looked up via
+   `GET /api/settings/agents`) when it appears in that list, else the first namespace.
+   Then `GET .../namespaces/{ns}/serviceaccounts` → `{"serviceAccounts": [...]}`, first entry.
+   `internet_facing` defaults to `false`.
+3. **Give up loudly.** If neither yields a namespace *and* a service account, return **422**
+   with a message telling the user to associate the agent with a space once in the Torque UI —
+   never guess, since a wrong namespace produces an agent that fails at runtime.
+
+### What deliberately did not change
+
+- The **space-first path** (mode toggle → space list → agents of that space → confirm) is
+  untouched, including its auto-select-single-agent behaviour. It sets
+  `createSpace = needsAssociation = false`, so it never calls `ensure-space`.
+- Auto-selecting a lone space still happens, but only when the user actively toggles into
+  space-first mode — it must not short-circuit the agent-first default.
+- Long-token generation, config write-back, the heartbeat/cancel lifecycle, and the SSO flow
+  are all unchanged.

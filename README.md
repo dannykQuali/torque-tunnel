@@ -41,6 +41,10 @@ client**. See [docs/onboarding.md](docs/onboarding.md) for details and options.
 3. A **Torque Docker agent** running on a host that can reach the target server
 4. **SSH access** to the target server (private key or password) — for the SSH tools
 
+The Torque account used during setup is assumed to have **account-admin-level permissions**;
+non-admin accounts are untested and will fail in places — see
+[docs/design-login-flow.md](docs/design-login-flow.md#permissions-assumption-account-admin).
+
 ## Manual installation
 
 If you'd rather not use the onboarding script:

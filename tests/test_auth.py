@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -26,6 +27,87 @@ from torque_tunnel.auth import TorqueAuthServer, _build_profile_result
 def tmp_config_dir(tmp_path):
     """Create a temp dir for config files and return it."""
     return tmp_path
+
+
+def _mock_resp(status, json_body=None, text=None):
+    """Build a fake httpx.Response with the given status and JSON body."""
+    m = MagicMock()
+    m.status_code = status
+    if json_body is None:
+        m.json.side_effect = ValueError("no json body")
+        m.text = text if text is not None else ""
+    else:
+        m.json.return_value = json_body
+        m.text = text if text is not None else json.dumps(json_body)
+    return m
+
+
+class FakeTorque:
+    """Stand-in for ``httpx.AsyncClient`` that routes calls by method + URL regex.
+
+    Unlike a plain AsyncMock, this lets a single test serve several different
+    Torque endpoints and then assert on which ones were actually called and with
+    what bodies -- which is what the ensure-space flow needs.
+
+        fake = FakeTorque()
+        fake.on("GET", r"/api/accounts/user_spaces$", _mock_resp(200, []))
+        with patch("torque_tunnel.auth.httpx.AsyncClient", fake):
+            ...
+    """
+
+    def __init__(self):
+        self.routes = []   # (method, compiled pattern, response)
+        self.calls = []    # (method, url, json body)
+
+    def on(self, method, pattern, response):
+        """Register a response for the first matching (method, url-regex)."""
+        self.routes.append((method.upper(), re.compile(pattern), response))
+        return self
+
+    def calls_matching(self, method, pattern):
+        rx = re.compile(pattern)
+        return [c for c in self.calls if c[0] == method.upper() and rx.search(c[1])]
+
+    # -- httpx.AsyncClient surface --
+
+    def __call__(self, *args, **kwargs):
+        return self  # httpx.AsyncClient(timeout=...) -> self
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def _dispatch(self, method, url, kwargs):
+        self.calls.append((method, url, kwargs.get("json")))
+        for m, rx, resp in self.routes:
+            if m == method and rx.search(url):
+                return resp
+        return _mock_resp(
+            404,
+            {"errors": [{"code": "NO_ROUTE", "message": f"unrouted {method} {url}"}]},
+        )
+
+    async def get(self, url, **kwargs):
+        return await self._dispatch("GET", url, kwargs)
+
+    async def post(self, url, **kwargs):
+        return await self._dispatch("POST", url, kwargs)
+
+    async def delete(self, url, **kwargs):
+        return await self._dispatch("DELETE", url, kwargs)
+
+
+# Torque endpoint URL patterns used by the ensure-space tests
+_RX_USER_SPACES = r"/api/accounts/user_spaces$"
+_RX_CREATE_SPACE = r"/api/spaces$"
+_RX_HOST_SPACES = r"/api/executionhosts/[^/]+/spaces$"
+_RX_ASSOCIATE = r"/api/spaces/[^/]+/agents/[^/]+$"
+_RX_SPACE_AGENTS = r"/api/spaces/[^/]+/agents$"
+_RX_SETTINGS_AGENTS = r"/api/settings/agents$"
+_RX_K8S_NAMESPACES = r"/api/executionhosts/k8s/[^/]+/agent/namespaces$"
+_RX_K8S_SERVICE_ACCOUNTS = r"/api/executionhosts/k8s/[^/]+/agent/namespaces/[^/]+/serviceaccounts$"
 
 
 @pytest.fixture
@@ -399,6 +481,7 @@ class TestTorqueAuthServerApp:
         assert f"/{secret}/api/cancel" in route_paths
         assert f"/{secret}/api/profiles" in route_paths
         assert f"/{secret}/api/use-profile" in route_paths
+        assert f"/{secret}/api/ensure-space" in route_paths
 
 
 # ============================================================================
@@ -1133,6 +1216,495 @@ try:
                 headers=bad_csrf_headers,
             )
             assert resp.status == 403
+
+    class TestEnsureSpaceEndpoint:
+        """Tests for POST /api/ensure-space.
+
+        The endpoint must make the chosen space exist and make the chosen agent
+        usable in it, idempotently and race-safely, so the setup flow can steer
+        users into a dedicated space instead of polluting a shared one.
+        """
+
+        async def _post(self, client, csrf_headers, **body):
+            return await client.post(
+                f"{client._base}/api/ensure-space", json=body, headers=csrf_headers,
+            )
+
+        # -- input validation / CSRF --
+
+        @pytest.mark.asyncio
+        async def test_rejects_bad_csrf(self, client, bad_csrf_headers):
+            resp = await client.post(
+                f"{client._base}/api/ensure-space",
+                json={"token": "t", "space": "s"},
+                headers=bad_csrf_headers,
+            )
+            assert resp.status == 403
+
+        @pytest.mark.asyncio
+        async def test_missing_token_is_400(self, client, csrf_headers):
+            resp = await self._post(client, csrf_headers, space="torque-tunnel")
+            assert resp.status == 400
+            data = await resp.json()
+            assert "token" in data["error"].lower()
+
+        @pytest.mark.asyncio
+        async def test_missing_space_is_400(self, client, csrf_headers):
+            resp = await self._post(client, csrf_headers, token="tok")
+            assert resp.status == 400
+            data = await resp.json()
+            assert "space" in data["error"].lower()
+
+        @pytest.mark.asyncio
+        async def test_blank_space_is_400(self, client, csrf_headers):
+            resp = await self._post(client, csrf_headers, token="tok", space="   ")
+            assert resp.status == 400
+
+        # -- space creation --
+
+        @pytest.mark.asyncio
+        async def test_creates_space_when_missing(self, client, csrf_headers):
+            fake = FakeTorque()
+            fake.on("GET", _RX_USER_SPACES, _mock_resp(200, [{"name": "other"}]))
+            fake.on("POST", _RX_CREATE_SPACE, _mock_resp(200, {"name": "torque-tunnel"}))
+
+            with patch("torque_tunnel.auth.httpx.AsyncClient", fake):
+                resp = await self._post(
+                    client, csrf_headers, token="tok", space="torque-tunnel",
+                )
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["space_created"] is True
+            assert data["agent_associated"] is False
+
+            creates = fake.calls_matching("POST", _RX_CREATE_SPACE)
+            assert len(creates) == 1
+            assert creates[0][2] == {
+                "name": "torque-tunnel", "icon": "flow", "color": "midnightBlue",
+            }
+
+        @pytest.mark.asyncio
+        async def test_does_not_create_existing_space(self, client, csrf_headers):
+            fake = FakeTorque()
+            fake.on(
+                "GET", _RX_USER_SPACES,
+                _mock_resp(200, [{"name": "torque-tunnel"}, {"name": "other"}]),
+            )
+
+            with patch("torque_tunnel.auth.httpx.AsyncClient", fake):
+                resp = await self._post(
+                    client, csrf_headers, token="tok", space="torque-tunnel",
+                )
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["space_created"] is False
+            assert fake.calls_matching("POST", _RX_CREATE_SPACE) == []
+
+        @pytest.mark.asyncio
+        async def test_taken_space_name_race_is_success(self, client, csrf_headers):
+            """Someone else created the space between our list and our create."""
+            fake = FakeTorque()
+            fake.on("GET", _RX_USER_SPACES, _mock_resp(200, []))
+            fake.on("POST", _RX_CREATE_SPACE, _mock_resp(
+                422,
+                {"errors": [{
+                    "code": "TAKEN_SPACE_NAME",
+                    "message": "Space name 'torque-tunnel' is already taken",
+                }]},
+            ))
+
+            with patch("torque_tunnel.auth.httpx.AsyncClient", fake):
+                resp = await self._post(
+                    client, csrf_headers, token="tok", space="torque-tunnel",
+                )
+            assert resp.status == 200
+            data = await resp.json()
+            # The space exists now, so the flow may continue; we did not create it.
+            assert data["space_created"] is False
+            assert "error" not in data
+
+        @pytest.mark.asyncio
+        async def test_space_creation_forbidden_propagates_message(self, client, csrf_headers):
+            fake = FakeTorque()
+            fake.on("GET", _RX_USER_SPACES, _mock_resp(200, []))
+            fake.on("POST", _RX_CREATE_SPACE, _mock_resp(
+                403,
+                {"errors": [{
+                    "code": "FORBIDDEN",
+                    "message": "User is not allowed to manage spaces",
+                }]},
+            ))
+
+            with patch("torque_tunnel.auth.httpx.AsyncClient", fake):
+                resp = await self._post(
+                    client, csrf_headers, token="tok", space="torque-tunnel",
+                )
+            assert resp.status == 403
+            data = await resp.json()
+            assert "not allowed to manage spaces" in data["error"]
+
+        # -- agent association: non-k8s --
+
+        @pytest.mark.asyncio
+        async def test_non_k8s_agent_associates_with_empty_spec(self, client, csrf_headers):
+            fake = FakeTorque()
+            fake.on("GET", _RX_USER_SPACES, _mock_resp(200, [{"name": "torque-tunnel"}]))
+            fake.on("GET", _RX_HOST_SPACES, _mock_resp(200, {"space-associations": []}))
+            fake.on("POST", _RX_ASSOCIATE, _mock_resp(200, {}))
+
+            with patch("torque_tunnel.auth.httpx.AsyncClient", fake):
+                resp = await self._post(
+                    client, csrf_headers, token="tok", space="torque-tunnel",
+                    agent="vc-agent", agent_type="vcenter",
+                )
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["agent_associated"] is True
+
+            assoc = fake.calls_matching("POST", _RX_ASSOCIATE)
+            assert len(assoc) == 1
+            assert assoc[0][1].endswith("/api/spaces/torque-tunnel/agents/vc-agent")
+            assert assoc[0][2] == {}
+
+        @pytest.mark.asyncio
+        async def test_agent_type_missing_uses_empty_spec(self, client, csrf_headers):
+            """An unknown/absent agent type must not be treated as k8s."""
+            fake = FakeTorque()
+            fake.on("GET", _RX_USER_SPACES, _mock_resp(200, [{"name": "tt"}]))
+            fake.on("GET", _RX_HOST_SPACES, _mock_resp(200, {"space-associations": []}))
+            fake.on("POST", _RX_ASSOCIATE, _mock_resp(200, {}))
+
+            with patch("torque_tunnel.auth.httpx.AsyncClient", fake):
+                resp = await self._post(
+                    client, csrf_headers, token="tok", space="tt", agent="mystery",
+                )
+            assert resp.status == 200
+            assert fake.calls_matching("POST", _RX_ASSOCIATE)[0][2] == {}
+
+        @pytest.mark.asyncio
+        async def test_url_encodes_space_and_agent_names(self, client, csrf_headers):
+            fake = FakeTorque()
+            fake.on("GET", _RX_USER_SPACES, _mock_resp(200, [{"name": "my space"}]))
+            fake.on("GET", r"/api/executionhosts/.+/spaces$",
+                    _mock_resp(200, {"space-associations": []}))
+            fake.on("POST", r"/api/spaces/.+/agents/.+$", _mock_resp(200, {}))
+
+            with patch("torque_tunnel.auth.httpx.AsyncClient", fake):
+                resp = await self._post(
+                    client, csrf_headers, token="tok", space="my space",
+                    agent="my agent", agent_type="docker",
+                )
+            assert resp.status == 200
+            assoc = fake.calls_matching("POST", r"/api/spaces/.+/agents/.+$")
+            assert assoc[0][1].endswith("/api/spaces/my%20space/agents/my%20agent")
+
+        # -- agent association: k8s --
+
+        @pytest.mark.asyncio
+        async def test_k8s_agent_copies_spec_from_existing_association(self, client, csrf_headers):
+            fake = FakeTorque()
+            fake.on("GET", _RX_USER_SPACES, _mock_resp(200, [{"name": "torque-tunnel"}]))
+            fake.on("GET", _RX_HOST_SPACES, _mock_resp(200, {"space-associations": [{
+                "host_name": "k8s-agent",
+                "host_type": "k8s",
+                "space_name": "Sample",
+                "namespace": "qualisamples",
+                "service_account": "qualisamples-sa",
+            }]}))
+            fake.on("GET", _RX_SPACE_AGENTS, _mock_resp(200, [
+                {"name": "other-agent", "spec": {"internet_facing": False}},
+                {"name": "k8s-agent", "spec": {
+                    "service_type": "k8s",
+                    "internet_facing": True,
+                    "namespace": "qualisamples",
+                    "service_account": "qualisamples-sa",
+                }},
+            ]))
+            fake.on("POST", _RX_ASSOCIATE, _mock_resp(200, {}))
+
+            with patch("torque_tunnel.auth.httpx.AsyncClient", fake):
+                resp = await self._post(
+                    client, csrf_headers, token="tok", space="torque-tunnel",
+                    agent="k8s-agent", agent_type="k8s",
+                )
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["agent_associated"] is True
+
+            assoc = fake.calls_matching("POST", _RX_ASSOCIATE)
+            assert len(assoc) == 1
+            assert assoc[0][2] == {
+                "namespace": "qualisamples",
+                "service_account": "qualisamples-sa",
+                "internet_facing": True,
+            }
+
+        @pytest.mark.asyncio
+        async def test_k8s_internet_facing_defaults_false_when_unreadable(self, client, csrf_headers):
+            fake = FakeTorque()
+            fake.on("GET", _RX_USER_SPACES, _mock_resp(200, [{"name": "tt"}]))
+            fake.on("GET", _RX_HOST_SPACES, _mock_resp(200, {"space-associations": [{
+                "space_name": "Sample",
+                "namespace": "ns1",
+                "service_account": "sa1",
+            }]}))
+            fake.on("GET", _RX_SPACE_AGENTS, _mock_resp(500, None, text="boom"))
+            fake.on("POST", _RX_ASSOCIATE, _mock_resp(200, {}))
+
+            with patch("torque_tunnel.auth.httpx.AsyncClient", fake):
+                resp = await self._post(
+                    client, csrf_headers, token="tok", space="tt",
+                    agent="k8s-agent", agent_type="k8s",
+                )
+            assert resp.status == 200
+            assert fake.calls_matching("POST", _RX_ASSOCIATE)[0][2] == {
+                "namespace": "ns1", "service_account": "sa1", "internet_facing": False,
+            }
+
+        @pytest.mark.asyncio
+        async def test_k8s_agent_without_associations_discovers_namespace(self, client, csrf_headers):
+            """A never-associated k8s agent: discover ns/SA from the k8s endpoints."""
+            fake = FakeTorque()
+            fake.on("GET", _RX_USER_SPACES, _mock_resp(200, [{"name": "tt"}]))
+            fake.on("GET", _RX_HOST_SPACES, _mock_resp(200, {"space-associations": []}))
+            fake.on("GET", _RX_SETTINGS_AGENTS, _mock_resp(200, [{
+                "name": "fresh-agent",
+                "type": "k8s",
+                "spaces": [],
+                "additional_details": {"agent_namespace": "torque"},
+            }]))
+            fake.on("GET", _RX_K8S_NAMESPACES,
+                    _mock_resp(200, {"namespaces": ["default", "torque"]}))
+            fake.on("GET", _RX_K8S_SERVICE_ACCOUNTS,
+                    _mock_resp(200, {"serviceAccounts": ["empty", "other-sa"]}))
+            fake.on("POST", _RX_ASSOCIATE, _mock_resp(200, {}))
+
+            with patch("torque_tunnel.auth.httpx.AsyncClient", fake):
+                resp = await self._post(
+                    client, csrf_headers, token="tok", space="tt",
+                    agent="fresh-agent", agent_type="k8s",
+                )
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["agent_associated"] is True
+
+            assoc = fake.calls_matching("POST", _RX_ASSOCIATE)
+            assert len(assoc) == 1
+            # agent_namespace is preferred when it is one of the reported namespaces
+            assert assoc[0][2] == {
+                "namespace": "torque",
+                "service_account": "empty",
+                "internet_facing": False,
+            }
+            # the service accounts were looked up inside the chosen namespace
+            sa_calls = fake.calls_matching("GET", _RX_K8S_SERVICE_ACCOUNTS)
+            assert len(sa_calls) == 1
+            assert "/namespaces/torque/serviceaccounts" in sa_calls[0][1]
+
+        @pytest.mark.asyncio
+        async def test_k8s_discovery_falls_back_to_first_namespace(self, client, csrf_headers):
+            fake = FakeTorque()
+            fake.on("GET", _RX_USER_SPACES, _mock_resp(200, [{"name": "tt"}]))
+            fake.on("GET", _RX_HOST_SPACES, _mock_resp(200, {"space-associations": []}))
+            fake.on("GET", _RX_SETTINGS_AGENTS, _mock_resp(200, [{
+                "name": "fresh-agent",
+                "additional_details": {"agent_namespace": "not-listed"},
+            }]))
+            fake.on("GET", _RX_K8S_NAMESPACES,
+                    _mock_resp(200, {"namespaces": ["first-ns", "second-ns"]}))
+            fake.on("GET", _RX_K8S_SERVICE_ACCOUNTS,
+                    _mock_resp(200, {"serviceAccounts": ["sa-a"]}))
+            fake.on("POST", _RX_ASSOCIATE, _mock_resp(200, {}))
+
+            with patch("torque_tunnel.auth.httpx.AsyncClient", fake):
+                resp = await self._post(
+                    client, csrf_headers, token="tok", space="tt",
+                    agent="fresh-agent", agent_type="k8s",
+                )
+            assert resp.status == 200
+            assert fake.calls_matching("POST", _RX_ASSOCIATE)[0][2]["namespace"] == "first-ns"
+
+        @pytest.mark.asyncio
+        async def test_k8s_unresolvable_spec_errors_without_associating(self, client, csrf_headers):
+            fake = FakeTorque()
+            fake.on("GET", _RX_USER_SPACES, _mock_resp(200, [{"name": "tt"}]))
+            fake.on("GET", _RX_HOST_SPACES, _mock_resp(200, {"space-associations": []}))
+            fake.on("GET", _RX_SETTINGS_AGENTS, _mock_resp(200, []))
+            fake.on("GET", _RX_K8S_NAMESPACES, _mock_resp(200, {"namespaces": []}))
+            fake.on("POST", _RX_ASSOCIATE, _mock_resp(200, {}))
+
+            with patch("torque_tunnel.auth.httpx.AsyncClient", fake):
+                resp = await self._post(
+                    client, csrf_headers, token="tok", space="tt",
+                    agent="ghost-agent", agent_type="k8s",
+                )
+            assert resp.status >= 400
+            data = await resp.json()
+            err = data["error"].lower()
+            assert "namespace" in err and "service account" in err
+            assert "ghost-agent" in data["error"]
+            # Must not blindly associate with a bogus spec
+            assert fake.calls_matching("POST", _RX_ASSOCIATE) == []
+
+        # -- idempotency --
+
+        @pytest.mark.asyncio
+        async def test_already_associated_skips_association_post(self, client, csrf_headers):
+            fake = FakeTorque()
+            fake.on("GET", _RX_USER_SPACES, _mock_resp(200, [{"name": "torque-tunnel"}]))
+            fake.on("GET", _RX_HOST_SPACES, _mock_resp(200, {"space-associations": [{
+                "host_name": "agent1",
+                "host_type": "vcenter",
+                "space_name": "torque-tunnel",
+            }]}))
+
+            with patch("torque_tunnel.auth.httpx.AsyncClient", fake):
+                resp = await self._post(
+                    client, csrf_headers, token="tok", space="torque-tunnel",
+                    agent="agent1", agent_type="vcenter",
+                )
+            assert resp.status == 200
+            data = await resp.json()
+            assert data == {"space_created": False, "agent_associated": False}
+            assert fake.calls_matching("POST", _RX_ASSOCIATE) == []
+
+        @pytest.mark.asyncio
+        async def test_association_already_exists_race_is_success(self, client, csrf_headers):
+            fake = FakeTorque()
+            fake.on("GET", _RX_USER_SPACES, _mock_resp(200, [{"name": "tt"}]))
+            fake.on("GET", _RX_HOST_SPACES, _mock_resp(200, {"space-associations": []}))
+            fake.on("POST", _RX_ASSOCIATE, _mock_resp(
+                422,
+                {"errors": [{
+                    "code": "SPACE_ASSOCIATION_ALREADY_EXIST",
+                    "message": "Execution host 'agent1' already associated with the space 'tt'",
+                }]},
+            ))
+
+            with patch("torque_tunnel.auth.httpx.AsyncClient", fake):
+                resp = await self._post(
+                    client, csrf_headers, token="tok", space="tt",
+                    agent="agent1", agent_type="vcenter",
+                )
+            assert resp.status == 200
+            data = await resp.json()
+            assert "error" not in data
+
+        @pytest.mark.asyncio
+        async def test_association_failure_propagates_message(self, client, csrf_headers):
+            fake = FakeTorque()
+            fake.on("GET", _RX_USER_SPACES, _mock_resp(200, [{"name": "tt"}]))
+            fake.on("GET", _RX_HOST_SPACES, _mock_resp(200, {"space-associations": []}))
+            fake.on("POST", _RX_ASSOCIATE, _mock_resp(
+                403,
+                {"errors": [{"code": "FORBIDDEN", "message": "Cannot manage cloud accounts"}]},
+            ))
+
+            with patch("torque_tunnel.auth.httpx.AsyncClient", fake):
+                resp = await self._post(
+                    client, csrf_headers, token="tok", space="tt",
+                    agent="agent1", agent_type="vcenter",
+                )
+            assert resp.status == 403
+            data = await resp.json()
+            assert "Cannot manage cloud accounts" in data["error"]
+
+        @pytest.mark.asyncio
+        async def test_unexpected_exception_returns_json_error(self, client, csrf_headers):
+            """A transport blow-up must still produce a JSON {error: ...} body."""
+            fake = FakeTorque()
+
+            async def boom(url, **kwargs):
+                raise RuntimeError("connection reset")
+
+            fake.get = boom
+
+            with patch("torque_tunnel.auth.httpx.AsyncClient", fake):
+                resp = await self._post(
+                    client, csrf_headers, token="tok", space="tt",
+                )
+            assert resp.status >= 400
+            data = await resp.json()
+            assert "error" in data
+
+        @pytest.mark.asyncio
+        async def test_does_not_log_the_token(self, client, csrf_headers, capsys):
+            """The paths that DO log (create + associate) must not leak the token."""
+            fake = FakeTorque()
+            fake.on("GET", _RX_USER_SPACES, _mock_resp(200, []))
+            fake.on("POST", _RX_CREATE_SPACE, _mock_resp(200, {}))
+            fake.on("GET", _RX_HOST_SPACES, _mock_resp(200, {"space-associations": []}))
+            fake.on("POST", _RX_ASSOCIATE, _mock_resp(200, {}))
+
+            with patch("torque_tunnel.auth.httpx.AsyncClient", fake):
+                resp = await self._post(
+                    client, csrf_headers, token="super-secret-token", space="tt",
+                    agent="agent1", agent_type="vcenter",
+                )
+            assert resp.status == 200
+            data = await resp.json()
+            # Both branches ran, so both log lines were emitted
+            assert data == {"space_created": True, "agent_associated": True}
+            captured = capsys.readouterr()
+            assert "super-secret-token" not in captured.out
+            assert "super-secret-token" not in captured.err
+
+        @pytest.mark.asyncio
+        async def test_token_absent_from_error_message(self, client, csrf_headers):
+            """A propagated Torque error must not echo the caller's token."""
+            fake = FakeTorque()
+            fake.on("GET", _RX_USER_SPACES, _mock_resp(200, []))
+            fake.on("POST", _RX_CREATE_SPACE, _mock_resp(403, None, text="denied"))
+
+            with patch("torque_tunnel.auth.httpx.AsyncClient", fake):
+                resp = await self._post(
+                    client, csrf_headers, token="super-secret-token", space="tt",
+                )
+            assert resp.status == 403
+            data = await resp.json()
+            assert "super-secret-token" not in json.dumps(data)
+
+    class TestSetupPageAgentFirstDefaults:
+        """The served setup page must default to the agent-first flow."""
+
+        @pytest.mark.asyncio
+        async def test_page_has_create_space_screen(self, client):
+            resp = await client.get(client._base)
+            text = await resp.text()
+            assert 'id="step-agent-space"' in text
+            assert 'id="newSpaceName"' in text
+            assert 'torque-tunnel' in text
+
+        @pytest.mark.asyncio
+        async def test_page_calls_ensure_space(self, client):
+            resp = await client.get(client._base)
+            text = await resp.text()
+            assert "api/ensure-space" in text
+
+        @pytest.mark.asyncio
+        async def test_with_spaces_filter_defaults_unchecked(self, client):
+            """Space-less agents are now valid choices, so the filter must be off."""
+            resp = await client.get(client._base)
+            text = await resp.text()
+            m = re.search(r'<input[^>]*id="hasSpacesFilter"[^>]*>', text)
+            assert m, "hasSpacesFilter checkbox not found"
+            assert "checked" not in m.group(0)
+
+        @pytest.mark.asyncio
+        async def test_online_only_filter_still_checked(self, client):
+            resp = await client.get(client._base)
+            text = await resp.text()
+            m = re.search(r'<input[^>]*id="onlineOnlyFilter"[^>]*>', text)
+            assert m, "onlineOnlyFilter checkbox not found"
+            assert "checked" in m.group(0)
+
+        @pytest.mark.asyncio
+        async def test_agent_mode_is_the_default(self, client):
+            """The page's initial selection mode must be agent-first."""
+            resp = await client.get(client._base)
+            text = await resp.text()
+            assert re.search(r"selectionMode:\s*'agent'", text), \
+                "initial state.selectionMode should be 'agent' (agent-first default)"
 
 except ImportError:
     # aiohttp test utils not available — skip HTTP tests

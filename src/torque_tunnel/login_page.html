@@ -63,6 +63,14 @@
   .filter-row { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; font-size: 13px; color: var(--muted); }
   .filter-row input[type="checkbox"] { width: auto; margin: 0; }
   .mode-toggle { font-size: 13px; margin-bottom: 12px; }
+  .choice { border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; margin-bottom: 10px; }
+  .choice.active { border-color: var(--primary); background: #f5f9ff; }
+  .choice-head { display: flex; align-items: center; gap: 8px; cursor: pointer; font-size: 14px; font-weight: 500; }
+  .choice-head input[type="radio"] { width: auto; margin: 0; cursor: pointer; }
+  .choice-body { margin-top: 10px; }
+  .choice-body input[type="text"] { margin-bottom: 6px; }
+  .notice { font-size: 12px; color: var(--muted); line-height: 1.4; }
+  .badge { font-size: 10px; text-transform: uppercase; letter-spacing: .04em; color: var(--success); border: 1px solid var(--success); border-radius: 10px; padding: 1px 7px; white-space: nowrap; }
   .cancelled-icon { font-size: 48px; text-align: center; margin-bottom: 16px; color: var(--muted); }
   .hint { font-size: 11px; color: var(--muted); margin-top: -8px; margin-bottom: 10px; }
   .init-cmd-textarea { font-size: 12px; color: var(--fg); background: #f1f3f4; padding: 8px 10px; border-radius: 4px; margin-top: 4px; word-break: break-all; font-family: monospace; width: 100%; min-height: 60px; max-height: 120px; resize: vertical; border: 1px solid var(--border); box-sizing: border-box; }
@@ -181,7 +189,7 @@
           <input type="checkbox" id="onlineOnlyFilter" checked onchange="renderAllAgents()">
           <label for="onlineOnlyFilter" style="margin:0; cursor:pointer;">Online only</label>
           <span style="margin-left:16px;"></span>
-          <input type="checkbox" id="hasSpacesFilter" checked onchange="renderAllAgents()">
+          <input type="checkbox" id="hasSpacesFilter" onchange="renderAllAgents()">
           <label for="hasSpacesFilter" style="margin:0; cursor:pointer;">With spaces only</label>
         </div>
         <ul id="allAgentList" class="selector"></ul>
@@ -211,17 +219,41 @@
       </div>
     </div>
 
-    <!-- Step 4b: Space selection for agent-first (if agent in multiple spaces) -->
+    <!-- Step 4b: Space selection for agent-first — shown for every agent choice -->
     <div id="step-agent-space" class="step">
       <div class="step-header"><h2>Select Space for Agent</h2></div>
       <p style="font-size:13px; color:var(--muted); margin-bottom:12px;">
-        Agent <strong id="agentSpaceName"></strong> is available in multiple spaces:
+        Environments launched by <strong id="agentSpaceName"></strong> will live in this space.
       </p>
-      <ul id="agentSpaceList" class="selector"></ul>
+      <div id="agentSpaceError" class="error"></div>
+
+      <div class="choice" id="newSpaceChoice">
+        <label class="choice-head" for="spaceChoiceNew">
+          <input type="radio" name="spaceChoice" id="spaceChoiceNew" checked onchange="onSpaceChoiceChange()">
+          <span>Create a new space</span>
+        </label>
+        <div class="choice-body" id="newSpaceBox">
+          <input type="text" id="newSpaceName" value="torque-tunnel" oninput="onNewSpaceNameInput()" spellcheck="false">
+          <div class="notice" id="newSpaceNotice"></div>
+        </div>
+      </div>
+
+      <div class="choice" id="existingSpaceChoice">
+        <label class="choice-head" for="spaceChoiceExisting">
+          <input type="radio" name="spaceChoice" id="spaceChoiceExisting" onchange="onSpaceChoiceChange()">
+          <span>Use an existing space</span>
+        </label>
+        <div class="choice-body" id="existingSpaceBox" style="display:none;">
+          <ul id="agentSpaceList" class="selector"></ul>
+          <div class="notice" id="existingSpaceNotice"></div>
+        </div>
+      </div>
+
       <div class="btn-row">
         <button class="btn-cancel" onclick="doCancel()">Cancel</button>
         <span class="spacer"></span>
         <button class="btn-back" onclick="goBack('agent-space')">Back</button>
+        <button class="btn-primary" onclick="confirmAgentSpace()">Continue</button>
       </div>
     </div>
 
@@ -291,6 +323,10 @@ const headers = {"Content-Type": "application/json", "X-CSRF-Token": CSRF};
 
 const PROXY_VAR_NAMES = ['HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY', 'http_proxy', 'https_proxy', 'no_proxy'];
 
+// Default name for the dedicated space the setup flow steers users into, so
+// torque-tunnel environments don't accumulate in a shared/production space.
+const DEFAULT_NEW_SPACE = 'torque-tunnel';
+
 let state = {
   torqueUrl: INITIAL_TORQUE_URL,
   shortToken: null,
@@ -303,10 +339,14 @@ let state = {
   accounts: {},
   isLongToken: false,
   allAgents: [],       // account-level agents cache
+  allSpaces: [],       // account-level spaces cache (from user_spaces)
   spaceAgents: [],     // space-level agents cache
-  selectionMode: 'space',  // 'space' or 'agent'
+  selectionMode: 'agent',  // 'space' or 'agent' — agent-first is the default
   stepHistory: [],     // for back navigation
   initCommands: '',    // extracted proxy init_commands
+  createSpace: false,      // the chosen space must be created before saving
+  needsAssociation: false, // the chosen agent must be allowed in the chosen space
+  chosenExistingSpace: null, // highlighted entry in the existing-space list
 };
 
 let cachedProfiles = [];  // fetched once from /api/profiles
@@ -726,6 +766,8 @@ function selectAccount(alias) {
 }
 
 // -- After authentication: load spaces + agents in parallel, show step 3 --
+// Agent-first is the default: the user picks an agent, then a (usually brand new)
+// dedicated space for it. Space-first stays available behind the mode toggle.
 async function afterAuth(token) {
   showStep('space');
   hideError('spaceError');
@@ -733,11 +775,7 @@ async function afterAuth(token) {
   for (const id of ['spaceList', 'agentList', 'allAgentList', 'agentSpaceList']) {
     document.getElementById(id).innerHTML = '';
   }
-  state.selectionMode = 'space';
-  document.getElementById('spaceMode').style.display = '';
-  document.getElementById('agentMode').style.display = 'none';
-  document.getElementById('modeToggleBtn').textContent = 'Choose by agent instead';
-  document.getElementById('spaceStepTitle').textContent = 'Select Space';
+  applySelectionMode('agent');
 
   // Fetch spaces + all agents in parallel
   try {
@@ -746,51 +784,71 @@ async function afterAuth(token) {
       fetch(BASE_PATH + '/api/agents', { headers: {"Authorization": "Bearer " + token} }),
     ]);
 
-    const spaces = await spacesResp.json();
-    state.allAgents = [];
-    if (agentsResp.ok) {
-      state.allAgents = await agentsResp.json();
-    }
+    const spaces = await spacesResp.json().catch(() => null);
+    const agents = await agentsResp.json().catch(() => null);
 
-    if (!spacesResp.ok || !Array.isArray(spaces) || spaces.length === 0) {
-      showError('spaceError', 'No spaces available for this account');
+    if (!spacesResp.ok || !Array.isArray(spaces)) {
+      showError('spaceError', 'Failed to load spaces: ' + apiErrText(spaces, spacesResp.status));
       return;
     }
+    // Zero spaces is fine now — the agent-first flow can create one.
+    state.allSpaces = spaces;
+    renderSpaceList(spaces);
 
-    // Auto-select if only one space
-    if (spaces.length === 1) {
-      selectSpace(spaces[0].name);
-      return;
+    state.allAgents = Array.isArray(agents) ? agents : [];
+    if (!agentsResp.ok || !Array.isArray(agents)) {
+      // Account-level agent listing needs admin rights — surface Torque's reason.
+      showError('spaceError', 'Failed to load agents: ' + apiErrText(agents, agentsResp.status));
     }
-
-    const ul = document.getElementById('spaceList');
-    ul.innerHTML = '';
-    spaces.forEach(s => {
-      const li = document.createElement('li');
-      li.textContent = s.name;
-      li.onclick = () => selectSpace(s.name);
-      ul.appendChild(li);
-    });
+    renderAllAgents();
   } catch (err) {
     showError('spaceError', 'Failed to load data: ' + err.message);
   }
 }
 
+// Extract a readable message from a Torque/proxy error body
+function apiErrText(body, status) {
+  if (body && typeof body === 'object' && !Array.isArray(body)) {
+    if (body.error) return String(body.error);
+    if (Array.isArray(body.errors) && body.errors.length) {
+      const e = body.errors[0] || {};
+      if (e.message) return String(e.message);
+    }
+  }
+  return 'HTTP ' + status;
+}
+
+function renderSpaceList(spaces) {
+  const ul = document.getElementById('spaceList');
+  ul.innerHTML = '';
+  spaces.forEach(s => {
+    const li = document.createElement('li');
+    li.textContent = s.name;
+    li.onclick = () => selectSpace(s.name);
+    ul.appendChild(li);
+  });
+}
+
 // -- Selection mode toggle (space-first vs agent-first) --
+function applySelectionMode(mode) {
+  state.selectionMode = mode;
+  const isAgent = mode === 'agent';
+  document.getElementById('spaceMode').style.display = isAgent ? 'none' : '';
+  document.getElementById('agentMode').style.display = isAgent ? '' : 'none';
+  document.getElementById('modeToggleBtn').textContent =
+    isAgent ? 'Choose by space instead' : 'Choose by agent instead';
+  document.getElementById('spaceStepTitle').textContent =
+    isAgent ? 'Select Agent' : 'Select Space';
+}
+
 function toggleSelectionMode() {
   if (state.selectionMode === 'space') {
-    state.selectionMode = 'agent';
-    document.getElementById('spaceMode').style.display = 'none';
-    document.getElementById('agentMode').style.display = '';
-    document.getElementById('modeToggleBtn').textContent = 'Choose by space instead';
-    document.getElementById('spaceStepTitle').textContent = 'Select Agent';
+    applySelectionMode('agent');
     renderAllAgents();
   } else {
-    state.selectionMode = 'space';
-    document.getElementById('spaceMode').style.display = '';
-    document.getElementById('agentMode').style.display = 'none';
-    document.getElementById('modeToggleBtn').textContent = 'Choose by agent instead';
-    document.getElementById('spaceStepTitle').textContent = 'Select Space';
+    applySelectionMode('space');
+    // Legacy space-first convenience: a single space needs no picking.
+    if (state.allSpaces.length === 1) selectSpace(state.allSpaces[0].name);
   }
 }
 
@@ -823,35 +881,148 @@ function renderAllAgents() {
   });
 }
 
+// -- Step 4b (agent-first): choose the space this agent will work in --
+// Shown for EVERY agent, including agents with no spaces at all: the whole point
+// of the redesign is that a missing space is fixable right here.
 function selectAgentFirst(agent) {
   state.agent = agent.name;
   state.agentData = agent;
-  const spaces = agent.spaces || [];
+  state.chosenExistingSpace = null;
+  state.createSpace = false;
+  state.needsAssociation = false;
+  document.getElementById('agentSpaceName').textContent = agent.name;
+
+  const nameInput = document.getElementById('newSpaceName');
+  if (!nameInput.value.trim()) nameInput.value = DEFAULT_NEW_SPACE;
+  document.getElementById('spaceChoiceNew').checked = true;
+  document.getElementById('spaceChoiceExisting').checked = false;
+
+  renderAgentSpaceOptions();
+  onSpaceChoiceChange();
+  showStep('agent-space');
+}
+
+function agentAllowedIn(spaceName) {
+  const spaces = (state.agentData && state.agentData.spaces) || [];
+  return spaces.indexOf(spaceName) >= 0;
+}
+
+function spaceExists(name) {
+  return (state.allSpaces || []).some(s => s && s.name === name);
+}
+
+// All account spaces, badged where the agent is already allowed.
+function renderAgentSpaceOptions() {
+  const ul = document.getElementById('agentSpaceList');
+  ul.innerHTML = '';
+  const spaces = state.allSpaces || [];
   if (spaces.length === 0) {
-    showError('spaceError', 'This agent is not associated with any space');
+    const li = document.createElement('li');
+    li.className = 'disabled';
+    li.textContent = 'No existing spaces in this account';
+    ul.appendChild(li);
     return;
   }
-  if (spaces.length === 1) {
-    state.space = spaces[0];
-    showConfirm();
-  } else {
-    // Multiple spaces — let user pick
-    document.getElementById('agentSpaceName').textContent = agent.name;
-    const ul = document.getElementById('agentSpaceList');
-    ul.innerHTML = '';
-    spaces.forEach(sp => {
-      const li = document.createElement('li');
-      li.textContent = sp;
-      li.onclick = () => { state.space = sp; showConfirm(); };
-      ul.appendChild(li);
-    });
-    showStep('agent-space');
+  spaces.forEach(s => {
+    const li = document.createElement('li');
+    li.dataset.spaceName = s.name;
+    const nameSpan = document.createElement('span');
+    nameSpan.className = 'agent-name';
+    nameSpan.textContent = s.name;
+    li.appendChild(nameSpan);
+    if (agentAllowedIn(s.name)) {
+      const badge = document.createElement('span');
+      badge.className = 'badge';
+      badge.textContent = 'agent already allowed';
+      li.appendChild(badge);
+    }
+    li.onclick = () => selectExistingSpace(s.name);
+    ul.appendChild(li);
+  });
+}
+
+function selectExistingSpace(name) {
+  state.chosenExistingSpace = name;
+  document.getElementById('spaceChoiceExisting').checked = true;
+  document.getElementById('spaceChoiceNew').checked = false;
+  Array.from(document.getElementById('agentSpaceList').children).forEach(li => {
+    li.classList.toggle('selected', li.dataset.spaceName === name);
+  });
+  onSpaceChoiceChange();
+}
+
+function onSpaceChoiceChange() {
+  const useNew = document.getElementById('spaceChoiceNew').checked;
+  document.getElementById('newSpaceBox').style.display = useNew ? '' : 'none';
+  document.getElementById('existingSpaceBox').style.display = useNew ? 'none' : '';
+  document.getElementById('newSpaceChoice').classList.toggle('active', useNew);
+  document.getElementById('existingSpaceChoice').classList.toggle('active', !useNew);
+  hideError('agentSpaceError');
+  if (useNew) onNewSpaceNameInput();
+  else updateExistingSpaceNotice();
+}
+
+function onNewSpaceNameInput() {
+  hideError('agentSpaceError');
+  const name = document.getElementById('newSpaceName').value.trim();
+  const notice = document.getElementById('newSpaceNotice');
+  if (!name) {
+    notice.textContent = '';
+    return;
   }
+  // textContent, not innerHTML — no escaping needed for user-typed names
+  if (spaceExists(name)) {
+    notice.textContent = "Space '" + name + "' already exists — it will be used, "
+      + 'and the agent will be allowed in it.';
+  } else {
+    notice.textContent = 'Agent ' + (state.agent || '') + ' will be automatically allowed in this space.';
+  }
+}
+
+function updateExistingSpaceNotice() {
+  const notice = document.getElementById('existingSpaceNotice');
+  const name = state.chosenExistingSpace;
+  if (!name) {
+    notice.textContent = 'Pick a space from the list above.';
+    return;
+  }
+  if (agentAllowedIn(name)) {
+    notice.textContent = 'Agent ' + (state.agent || '') + " is already allowed in '" + name + "'.";
+  } else {
+    notice.textContent = 'Agent ' + (state.agent || '')
+      + " will be automatically allowed in '" + name + "'.";
+  }
+}
+
+function confirmAgentSpace() {
+  hideError('agentSpaceError');
+  if (document.getElementById('spaceChoiceNew').checked) {
+    const name = document.getElementById('newSpaceName').value.trim();
+    if (!name) {
+      showError('agentSpaceError', 'Please enter a name for the new space');
+      return;
+    }
+    state.space = name;
+    state.createSpace = !spaceExists(name);
+  } else {
+    const name = state.chosenExistingSpace;
+    if (!name) {
+      showError('agentSpaceError', 'Please select a space, or choose "Create a new space"');
+      return;
+    }
+    state.space = name;
+    state.createSpace = false;
+  }
+  state.needsAssociation = !!state.agent && !agentAllowedIn(state.space);
+  showConfirm();
 }
 
 // -- Step 3 space-first: select space, load its agents --
 function selectSpace(name) {
   state.space = name;
+  // Space-first works only with spaces that exist and agents already allowed in them.
+  state.createSpace = false;
+  state.needsAssociation = false;
   loadSpaceAgents(name);
 }
 
@@ -951,17 +1122,25 @@ function deriveProfileName() {
 }
 
 // -- Step 5: Confirm --
-function showConfirm() {
-  showStep('confirm');
-  hideError('confirmError');
+// Rebuilds only the summary table, so it can be refreshed after ensure-space
+// without clobbering the profile name / description the user has typed.
+function renderSummary() {
   const rows = [
     ['URL', state.torqueUrl],
     ['Account', state.account || '(default)'],
-    ['Space', state.space],
-    ['Agent', state.agent || '(none)'],
+    ['Space', state.space + (state.createSpace ? ' (will be created)' : '')],
+    ['Agent', state.agent
+      ? (state.agent + (state.needsAssociation ? ' (will be allowed in space)' : ''))
+      : '(none)'],
   ];
   const table = document.getElementById('summaryTable');
   table.innerHTML = rows.map(([k, v]) => '<tr><td>' + k + '</td><td>' + escHtml(v) + '</td></tr>').join('');
+}
+
+function showConfirm() {
+  showStep('confirm');
+  hideError('confirmError');
+  renderSummary();
 
   // Pre-fill profile name
   document.getElementById('profileNameInput').value = deriveProfileName();
@@ -1007,6 +1186,41 @@ async function saveAndFinish() {
   btn.innerHTML = '<span class="spinner"></span>Saving...';
 
   try {
+    // Make the space exist and the agent usable in it before anything is saved.
+    // Idempotent server-side, so a partially-applied retry is harmless.
+    if (state.createSpace || state.needsAssociation) {
+      btn.innerHTML = '<span class="spinner"></span>Preparing space...';
+      const ensResp = await fetch(BASE_PATH + '/api/ensure-space', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          token: state.shortToken,
+          space: state.space,
+          agent: state.agent,
+          agent_type: state.agentData ? (state.agentData.type || null) : null,
+        }),
+      });
+      const ensData = await ensResp.json().catch(() => null);
+      if (!ensResp.ok) {
+        // Leave the flags set so a retry re-runs this (it is idempotent), and let
+        // the user go Back to pick an existing space instead.
+        showError('confirmError', apiErrText(ensData, ensResp.status));
+        btn.disabled = false;
+        btn.textContent = 'Save & Finish';
+        return;
+      }
+      // The space now exists and the agent is allowed in it. Record that so a
+      // retry after a later failure doesn't re-announce work already done.
+      if (!spaceExists(state.space)) state.allSpaces.push({name: state.space});
+      if (state.agentData && !agentAllowedIn(state.space)) {
+        state.agentData.spaces = (state.agentData.spaces || []).concat([state.space]);
+      }
+      state.createSpace = false;
+      state.needsAssociation = false;
+      renderSummary();
+      btn.innerHTML = '<span class="spinner"></span>Saving...';
+    }
+
     // Always generate a fresh long token so each profile gets its own independent token+ID.
     // This ensures revoking one profile's token doesn't affect other profiles.
     const genResp = await fetch(BASE_PATH + '/api/generate-token', {

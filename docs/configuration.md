@@ -78,7 +78,7 @@ These can appear at the top level and/or inside any profile:
 |-----|-------------|
 | `torque_url` | Torque base URL |
 | `torque_token` | Torque API token |
-| `torque_space` | Torque space name |
+| `torque_space` | Torque space name. The interactive `setup` flow defaults to a dedicated space named `torque-tunnel`, creating it (and allowing the chosen agent in it) if needed, so tunnel environments don't accumulate in a space used for real work. See [design-login-flow.md](design-login-flow.md#login-flow-v4-agent-first-with-a-dedicated-space). |
 | `torque_agent` | Torque agent name |
 | `ssh_key` | SSH private key (file path or content) |
 | `ssh_password` | SSH password (mutually exclusive with `ssh_key`) |
@@ -93,6 +93,11 @@ These can appear at the top level and/or inside any profile:
 | `retry_budget_seconds` | Max consecutive outage tolerated while polling/monitoring, in seconds (default `600`, sized for a ~10-min Torque redeploy) |
 | `create_retry_budget_seconds` | Budget for idempotent environment create + reconcile, in seconds (default `600`) |
 | `retry_max_backoff_seconds` | Exponential-backoff cap between retries, in seconds (default `15`) |
+
+> **Note:** `torque_token` is assumed to belong to a Torque user with **account-admin-level
+> permissions** — the interactive `setup` flow uses account-level endpoints that require it.
+> Non-admin accounts are untested and will fail in places. See
+> [design-login-flow.md](design-login-flow.md#permissions-assumption-account-admin).
 
 ### Top-level-only keys
 
