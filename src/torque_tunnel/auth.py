@@ -6,11 +6,13 @@ All Torque API calls are proxied through the local server to bypass CORS.
 """
 
 import asyncio
+import json
 import pathlib
 import platform
 import secrets
 import sys
 import time
+import traceback
 import urllib.parse
 import webbrowser
 from typing import Optional
@@ -57,6 +59,26 @@ def _build_profile_result(profile_name: str, updates: dict, *, is_default: bool 
 def _q(value: str) -> str:
     """Percent-encode a single Torque path segment (space/agent names may have spaces)."""
     return urllib.parse.quote(str(value), safe="")
+
+
+def _friendly_httpx_error(exc: httpx.HTTPError) -> str:
+    """Human-readable message for an outbound httpx failure (connect/TLS/timeout)."""
+    try:
+        target = str(exc.request.url)
+    except RuntimeError:
+        target = ""  # exc.request raises RuntimeError when the request isn't attached
+    where = target or "the Torque server"
+    msg = str(exc)
+    if "CERTIFICATE_VERIFY_FAILED" in msg:
+        return (
+            f"The TLS certificate of {where} is not trusted "
+            "(self-signed certificates are not supported)."
+        )
+    if isinstance(exc, httpx.TimeoutException):
+        return f"Request to {where} timed out."
+    if isinstance(exc, httpx.ConnectError):
+        return f"Could not connect to {where}: {msg}"
+    return f"Request to {where} failed: {msg}"
 
 
 def _torque_errors(resp) -> list[dict]:
@@ -236,8 +258,32 @@ class TorqueAuthServer:
                 print("Browser tab closed — setup cancelled.", file=sys.stderr)
                 return
 
+    @web.middleware
+    async def _error_middleware(self, request: web.Request, handler) -> web.StreamResponse:
+        """Turn unhandled handler exceptions into JSON error responses.
+
+        Without this, aiohttp returns a text/plain "500 Internal Server Error"
+        body that the browser-side fetch code cannot JSON-parse, surfacing as a
+        confusing "Unexpected non-whitespace character after JSON" message.
+        """
+        try:
+            return await handler(request)
+        except web.HTTPException:
+            raise  # deliberate responses (404, 403, ...) pass through unchanged
+        except json.JSONDecodeError:
+            return web.json_response({"error": "Invalid JSON in request body"}, status=400)
+        except httpx.HTTPError as e:
+            message = _friendly_httpx_error(e)
+            print(f"Torque request failed: {message}", file=sys.stderr)
+            return web.json_response({"error": message}, status=502)
+        except Exception as e:
+            traceback.print_exc(file=sys.stderr)
+            return web.json_response(
+                {"error": f"Internal error: {type(e).__name__}: {e}"}, status=500,
+            )
+
     def _create_app(self) -> web.Application:
-        app = web.Application()
+        app = web.Application(middlewares=[self._error_middleware])
         s = self._url_secret
         app.router.add_get(f"/{s}", self._handle_page)
         app.router.add_get(f"/{s}/health", self._handle_health)

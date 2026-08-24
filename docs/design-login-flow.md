@@ -677,3 +677,32 @@ unexpected exception still returns a JSON `{"error": ...}` body rather than a ba
   space-first mode — it must not short-circuit the agent-first default.
 - Long-token generation, config write-back, the heartbeat/cancel lifecycle, and the SSO flow
   are all unchanged.
+
+## Error Responses Are Always JSON (error middleware)
+
+**Problem observed:** connecting to `https://localhost` (self-signed cert) made
+`_handle_login`'s outbound httpx call raise `httpx.ConnectError` — unhandled, so aiohttp
+answered with its default `text/plain` body `500 Internal Server Error\n\nServer got itself
+in trouble`. The browser JS did `await resp.json()` *before* checking `resp.ok`, so
+`JSON.parse` consumed `500` as a number and choked on the `I` — surfacing the useless
+*"Network error: Unexpected non-whitespace character after JSON at position 4"*.
+
+**Fix (server):** `TorqueAuthServer._error_middleware` wraps every handler:
+
+| Escaped exception | Response |
+|---|---|
+| `web.HTTPException` | re-raised unchanged (deliberate 403/404/...) |
+| `json.JSONDecodeError` | **400** `{"error": "Invalid JSON in request body"}` |
+| `httpx.HTTPError` | **502** `{"error": <friendly message>}` (logged to stderr) |
+| anything else | **500** `{"error": "Internal error: ..."}` + traceback to stderr |
+
+`_friendly_httpx_error()` translates transport failures: `CERTIFICATE_VERIFY_FAILED` →
+"TLS certificate of <url> is not trusted (self-signed certificates are not supported)";
+timeouts and plain connect failures get similarly readable messages with the target URL.
+Self-signed Torque instances are deliberately **not** supported (no `verify=False` anywhere).
+
+**Fix (client):** every `resp.json()` in `login_page.html` is now
+`resp.json().catch(() => null)` and error branches render via `apiErrText(body, status)`,
+so a non-JSON body can never throw past the `resp.ok` check. A repo test
+(`tests/test_auth_error_middleware.py::TestLoginPageJsonParsing`) enforces this invariant —
+any new bare `.json()` call fails CI.

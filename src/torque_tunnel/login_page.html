@@ -427,7 +427,8 @@ async function loadProfiles() {
   try {
     const resp = await fetch(BASE_PATH + '/api/profiles');
     if (!resp.ok) return;
-    const data = await resp.json();
+    const data = await resp.json().catch(() => null);
+    if (!data) return;
     cachedProfiles = data.profiles || [];
     cachedHasDefaultProfile = !!data.has_default_profile;
     renderProfileLists();
@@ -505,11 +506,11 @@ async function useProfile(profileName) {
         headers,
         body: JSON.stringify({profile_name: profileName}),
       });
-      const data = await resp.json();
-      if (!resp.ok) {
+      const data = await resp.json().catch(() => null);
+      if (!resp.ok || !data) {
         // Token expired/invalid — fall back to login with the URL pre-set
         const errEl = document.querySelector('.step.active .error');
-        if (errEl) { errEl.textContent = data.error || 'Failed to use profile'; errEl.classList.add('show'); }
+        if (errEl) { errEl.textContent = apiErrText(data, resp.status); errEl.classList.add('show'); }
         if (profile.torque_url) {
           state.torqueUrl = profile.torque_url.replace(/\/+$/, '');
           document.getElementById('subtitleLine').innerHTML = 'Connect to <strong>' + escHtml(state.torqueUrl) + '</strong>';
@@ -614,9 +615,9 @@ async function doLogin() {
         torque_url: state.torqueUrl,
       }),
     });
-    const data = await resp.json();
-    if (!resp.ok) {
-      showError('loginError', data.error || 'Login failed');
+    const data = await resp.json().catch(() => null);
+    if (!resp.ok || !data) {
+      showError('loginError', apiErrText(data, resp.status));
       return;
     }
     // Clear password field immediately so the browser won't offer to save it
@@ -655,8 +656,8 @@ async function checkSsoSupport() {
   try {
     const resp = await fetch(BASE_PATH + '/api/sso-options?torque_url=' + encodeURIComponent(state.torqueUrl));
     if (!resp.ok || seq !== ssoCheckSeq) return;
-    const data = await resp.json();
-    if (data.cisco_sso && seq === ssoCheckSeq) section.style.display = '';
+    const data = await resp.json().catch(() => null);
+    if (data && data.cisco_sso && seq === ssoCheckSeq) section.style.display = '';
   } catch (_) {}
 }
 
@@ -670,9 +671,9 @@ async function startCiscoSso() {
       headers,
       body: JSON.stringify({torque_url: state.torqueUrl}),
     });
-    const data = await resp.json();
-    if (!resp.ok) {
-      showError('loginError', data.error || 'Failed to start Cisco ID sign-in');
+    const data = await resp.json().catch(() => null);
+    if (!resp.ok || !data) {
+      showError('loginError', apiErrText(data, resp.status));
       btn.disabled = false;
       return;
     }
@@ -694,7 +695,8 @@ async function pollSsoStatus() {
   try {
     const resp = await fetch(BASE_PATH + '/api/sso-status');
     if (!resp.ok) return;
-    const data = await resp.json();
+    const data = await resp.json().catch(() => null);
+    if (!data) return;
     if (data.status === 'success') {
       stopSsoUi();
       // The session's URL is authoritative — the sign-in happened against it,
@@ -734,9 +736,9 @@ async function validateToken() {
       headers,
       body: JSON.stringify({token, torque_url: state.torqueUrl}),
     });
-    const data = await resp.json();
+    const data = await resp.json().catch(() => null);
     if (!resp.ok) {
-      showError('loginError', data.error || 'Token validation failed');
+      showError('loginError', apiErrText(data, resp.status));
       return;
     }
     state.shortToken = token;
@@ -1032,10 +1034,10 @@ async function loadSpaceAgents(space) {
     const resp = await fetch(BASE_PATH + '/api/spaces/' + encodeURIComponent(space) + '/agents', {
       headers: {"Authorization": "Bearer " + state.shortToken},
     });
-    const agents = await resp.json();
+    const agents = await resp.json().catch(() => null);
     if (!resp.ok || !Array.isArray(agents)) {
       showStep('agent');
-      showError('agentError', 'Failed to load agents');
+      showError('agentError', 'Failed to load agents: ' + apiErrText(agents, resp.status));
       return;
     }
     state.spaceAgents = agents;
@@ -1228,9 +1230,9 @@ async function saveAndFinish() {
       headers,
       body: JSON.stringify({token: state.shortToken, space: state.space}),
     });
-    const genData = await genResp.json();
-    if (!genResp.ok) {
-      showError('confirmError', genData.error || 'Token generation failed');
+    const genData = await genResp.json().catch(() => null);
+    if (!genResp.ok || !genData) {
+      showError('confirmError', apiErrText(genData, genResp.status));
       btn.disabled = false;
       btn.textContent = 'Save & Finish';
       return;
@@ -1257,9 +1259,9 @@ async function saveAndFinish() {
         expose_values: document.getElementById('exposeValuesToggle').checked,
       }),
     });
-    const data = await resp.json();
-    if (!resp.ok) {
-      showError('confirmError', data.error || 'Save failed');
+    const data = await resp.json().catch(() => null);
+    if (!resp.ok || !data) {
+      showError('confirmError', apiErrText(data, resp.status));
       btn.disabled = false;
       btn.textContent = 'Save & Finish';
       return;
