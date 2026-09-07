@@ -24,7 +24,7 @@ ssh_key: "C:\\path\\to\\key.pem"
 host: 10.0.0.1
 init_commands: "export HTTP_PROXY=http://proxy:80"
 # finally_commands: ""
-# auto_delete_environments: false
+# auto_delete_environments: false   # leave off — see the warning under Available Keys
 # verbose: false
 # container_idle_timeout: 86400
 
@@ -86,7 +86,7 @@ These can appear at the top level and/or inside any profile:
 | `ssh_user` | SSH username |
 | `init_commands` | Commands to run before every SSH command |
 | `finally_commands` | Commands to run after every SSH command |
-| `auto_delete_environments` | Auto-delete environments after completion |
+| `auto_delete_environments` | **Off by default — leave it off.** Purges each environment's records from Torque's DB after termination. See [the warning below](#auto_delete_environments-use-at-your-own-risk). |
 | `verbose` | Show full unfiltered output |
 | `container_idle_timeout` | Idle timeout for persistent containers (seconds, default 86400 = 24h). The container's Torque scheduled end time is set to `now + idle_timeout` after every command (absolute — it both extends and shrinks), so the container dies exactly this long after its last use. At command start the end is armed to `now + max(idle_timeout, command_timeout + 30min)` so a running command can never outlive its container. The initial duration at creation is also `idle_timeout`. |
 | `retry_enabled` | Master switch for transient-error retries + idempotent creates (default `true`) |
@@ -98,6 +98,43 @@ These can appear at the top level and/or inside any profile:
 > permissions** — the interactive `setup` flow uses account-level endpoints that require it.
 > Non-admin accounts are untested and will fail in places. See
 > [design-login-flow.md](design-login-flow.md#permissions-assumption-account-admin).
+
+#### `auto_delete_environments`: use at your own risk
+
+**Default: `false`. Keep it that way unless you have a specific reason not to.**
+
+Ending an environment (which torque-tunnel always does, regardless of this flag) is the
+supported, maintained lifecycle operation. This flag adds a second, *different* step on
+top of it: purging the environment's records from Torque's database via
+`DELETE /spaces/{space}/environments/{id}/remove_state`.
+
+That endpoint is **admin-only and effectively unmaintained** — the Torque developers
+describe its behavior as undefined. In Torque's own source it is documented as
+*"Delete Environment from the DB. for admin usage only"* and gated behind the
+`SetEnvironmentOwner` capability. Its handler (`DeleteEnvConsumer`) deletes the
+operation, execution-thread, grain, environment and workflow rows outright:
+
+- it does **not** check the environment's status,
+- it does **not** terminate anything or release any provisioned resource,
+- it does **not** clean up everything it should (the environment-feed store is injected
+  into the handler and then never used — those rows are left dangling).
+
+So purging an environment that hasn't finished tearing down orphans its resources *and*
+destroys the only record you could have found them by.
+
+To limit the blast radius, `delete_environment` only issues the purge when teardown is
+**confirmed complete** — `Ended`, `Inactive`, `Terminated`, `Force Terminated`,
+`Released` or `Cancelled`. It polls for up to ~50s waiting for that, and if the
+environment is still `Terminating`, still running, in `Terminating Failed`, or in any
+error state, it logs a warning and leaves the environment in place rather than purging
+it. Failed environments are deliberately kept so they can be investigated.
+
+Per-call override: the MCP tools accept an `auto_delete` argument, which takes
+precedence over this config key for that one call.
+
+Note that with the flag on, the wait for a confirmed teardown adds up to ~50s per
+environment before the purge is issued (or skipped). That cost only applies when you
+opt in.
 
 ### Top-level-only keys
 

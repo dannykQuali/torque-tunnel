@@ -45,6 +45,25 @@ _TRANSIENT_EXCEPTIONS = (httpx.TransportError, httpx.TimeoutException)
 _SUSPEND_GAP_SECONDS = 120.0
 
 
+# --- Environment purge (`auto_delete_environments`) ------------------------------
+# Statuses in which an environment's teardown is CONFIRMED COMPLETE, and only in which
+# it is safe to call Torque's admin-only `/remove_state` purge (see delete_environment).
+# Deliberately excluded:
+#   terminating         - teardown still in flight; purging now orphans its resources
+#   terminating_failed  - teardown failed; resources leaked, keep the record to find them
+#   active/launching/... - still running
+#   *_with_error/error/failed - keep failed environments for post-mortem
+_PURGEABLE_STATUSES = frozenset({
+    "ended", "inactive",
+    "terminated", "force_terminated",
+    "released", "cancelled",
+})
+
+# How long to wait for teardown to settle before giving up (and NOT purging).
+_PURGE_WAIT_POLLS = 10
+_PURGE_WAIT_INTERVAL_SECONDS = 5
+
+
 # --- Idempotency key + environment naming ---------------------------------------
 # Label key carrying our client-generated idempotency id (queryable via ?labels=).
 LABEL_KEY = "torque-tunnel-id"
@@ -633,24 +652,49 @@ class TorqueClient:
     
     async def delete_environment(self, environment_id: str) -> None:
         """
-        Delete an environment from the system (remove from history/DB).
-        Uses the /remove_state endpoint to fully purge from Torque.
-        
+        Purge an environment's records from Torque's DB (`/remove_state`).
+
+        DANGEROUS AND OFF BY DEFAULT (`auto_delete_environments`). `/remove_state` is
+        documented in Torque's own source as "for admin usage only": its handler
+        (DeleteEnvConsumer) deletes the operation/execution-thread/grain/environment/
+        workflow rows outright, without checking the environment's status and without
+        releasing anything it provisioned. Purging an environment that has not finished
+        tearing down therefore orphans its resources with no record left to find them by.
+
+        So we only purge on a CONFIRMED-COMPLETE teardown (see _PURGEABLE_STATUSES).
+        Anything else - still terminating, still running, teardown failed, or a status we
+        could not read - leaves the environment in place. Termination itself
+        (`end_environment`) has already been requested by the caller regardless.
+
         Args:
             environment_id: Environment ID
         """
-        # First, wait for environment to be in ended/terminated state.
+        # Wait (up to ~50s) for teardown to complete. `terminating` is NOT enough - it
+        # means teardown is still in flight - so we keep polling until it settles.
         # retry=False: this loop already tolerates errors and polls repeatedly.
-        for _ in range(10):  # Wait up to 50 seconds
+        status = ""
+        purgeable = False
+        for attempt in range(_PURGE_WAIT_POLLS):
             try:
                 env_data = await self.get_environment_status(environment_id, retry=False)
                 status = env_data.get("details", {}).get("computed_status", "").lower().replace(" ", "_")
-                if status in ("ended", "terminating", "terminated"):
+                if status in _PURGEABLE_STATUSES:
+                    purgeable = True
                     break
             except Exception as e:
                 print(f"[WARNING] Error getting environment status (may be gone): {e}", file=sys.stderr)
                 return  # Environment may already be gone
-            await asyncio.sleep(5)
+            if attempt < _PURGE_WAIT_POLLS - 1:  # don't sleep after the final poll
+                await asyncio.sleep(_PURGE_WAIT_INTERVAL_SECONDS)
+
+        if not purgeable:
+            print(
+                f"[WARNING] Not purging environment {environment_id}: teardown not confirmed "
+                f"complete (status: {status or 'unknown'}). Leaving it in Torque - purging now "
+                f"would delete its records without releasing its resources.",
+                file=sys.stderr,
+            )
+            return
 
         # Use the /remove_state endpoint to fully delete from DB
         response = await self._request_with_retry(
@@ -1024,7 +1068,7 @@ class TorqueClient:
         ssh_private_key: str = "",
         command: str = "",
         agent: Optional[str] = None,
-        auto_cleanup: bool = True,
+        auto_cleanup: bool = False,
         timeout: Optional[int] = None,
         log_callback: Optional[Callable[[str], Awaitable[None]]] = None,
         init_commands: Optional[str] = None,
@@ -1051,7 +1095,9 @@ class TorqueClient:
             ssh_private_key: SSH private key content. Use this OR ssh_password.
             command: Command to execute
             agent: Agent name (uses default if not specified)
-            auto_cleanup: Whether to automatically end the environment after completion
+            auto_cleanup: Whether to also PURGE the environment's records from Torque
+                after termination (see delete_environment - admin-only, off by default).
+                Termination itself always happens regardless of this flag.
             timeout: Optional timeout override in seconds
             log_callback: Optional async callback for streaming log updates
             init_commands: Optional commands to run before main command (overrides instance default)
@@ -1105,7 +1151,7 @@ class TorqueClient:
         self,
         command: str,
         agent: Optional[str] = None,
-        auto_cleanup: bool = True,
+        auto_cleanup: bool = False,
         timeout: Optional[int] = None,
         log_callback: Optional[Callable[[str], Awaitable[None]]] = None,
         init_commands: Optional[str] = None,
@@ -1121,7 +1167,9 @@ class TorqueClient:
         Args:
             command: Command to execute
             agent: Agent name (uses default if not specified)
-            auto_cleanup: Whether to automatically delete the environment after completion
+            auto_cleanup: Whether to also PURGE the environment's records from Torque
+                after termination (see delete_environment - admin-only, off by default).
+                Termination itself always happens regardless of this flag.
             timeout: Optional timeout override in seconds
             log_callback: Optional async callback for streaming log updates
             init_commands: Optional commands to run before the main command
