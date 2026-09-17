@@ -35,6 +35,7 @@ from . import croc_manager
 from . import config as config_module
 from . import auth as auth_module
 from . import onboarding as onboarding_module
+from . import credentials as credentials_module
 
 
 # Shared compiled patterns for filtering grain/execution logs.
@@ -1220,6 +1221,10 @@ _config = {
     "retry_budget_seconds": 600,
     "create_retry_budget_seconds": 600,
     "retry_max_backoff_seconds": 15,
+    # Credentials: off until opted into, because using one resolves a customer's real
+    # secrets into an agent container. See docs/design-credentials.md.
+    "credentials_enabled": False,
+    "credentials_space_policy": "preconfigured",
 }
 
 # Default values for _config keys (used to reset removed keys on hot-reload)
@@ -1674,6 +1679,15 @@ docker restart/stop/kill, systemctl restart docker, reboot, shutdown, init 0/6
                             "required": ["remote_source_path", "local_destination_path"],
                         },
                     },
+                    "credential": {
+                        "type": "string",
+                        "description": "Optional: name of a credential stored in the connected Torque account. Torque injects its secrets as environment variables where the command runs, so the command can reference them (e.g. \"$VSPHERE_PASSWORD\") without them ever being shown to you or written into the command. Call list_credentials to see the available names and which variables each one provides. One credential per call — for two, make two calls.",
+                    },
+                    "credential_env_forward": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional: extra environment variable NAMES to carry to the remote host, on top of the credential's own. Only needed for a credential type torque-tunnel has not measured yet, or to correct a stale cache entry.",
+                    },
                     "torque_agent": {
                         "type": "string",
                         "description": "DO NOT set unless the user explicitly provides this value or asks you to change it. Overrides the pre-configured Torque agent.",
@@ -1776,6 +1790,10 @@ for local network/VMs use regular terminal commands):
                             "required": ["remote_source_path", "local_destination_path"],
                         },
                     },
+                    "credential": {
+                        "type": "string",
+                        "description": "Optional: name of a credential stored in the connected Torque account. Torque injects its secrets as environment variables where the command runs, so the command can reference them (e.g. \"$VSPHERE_PASSWORD\") without them ever being shown to you or written into the command. Call list_credentials to see the available names and which variables each one provides. One credential per call — for two, make two calls.",
+                    },
                     "torque_agent": {
                         "type": "string",
                         "description": "DO NOT set unless the user explicitly provides this value or asks you to change it. Overrides the pre-configured Torque agent.",
@@ -1877,6 +1895,15 @@ Without the ID, a new container is created.
                             },
                             "required": ["remote_source_path", "local_destination_path"],
                         },
+                    },
+                    "credential": {
+                        "type": "string",
+                        "description": "Optional: name of a credential stored in the connected Torque account. Torque injects its secrets as environment variables where the command runs, so the command can reference them (e.g. \"$VSPHERE_PASSWORD\") without them ever being shown to you or written into the command. Call list_credentials to see the available names and which variables each one provides. One credential per call — for two, make two calls.",
+                    },
+                    "credential_env_forward": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional: extra environment variable NAMES to carry to the remote host, on top of the credential's own. Only needed for a credential type torque-tunnel has not measured yet, or to correct a stale cache entry.",
                     },
                     "torque_agent": {
                         "type": "string",
@@ -2005,6 +2032,15 @@ systemctl restart docker, reboot, shutdown, init 0/6""",
                             "required": ["remote_source_path", "local_destination_path"],
                         },
                     },
+                    "credential": {
+                        "type": "string",
+                        "description": "Optional: name of a credential stored in the connected Torque account. Torque injects its secrets as environment variables where the command runs, so the command can reference them (e.g. \"$VSPHERE_PASSWORD\") without them ever being shown to you or written into the command. Call list_credentials to see the available names and which variables each one provides. One credential per call — for two, make two calls.",
+                    },
+                    "credential_env_forward": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional: extra environment variable NAMES to carry to the remote host, on top of the credential's own. Only needed for a credential type torque-tunnel has not measured yet, or to correct a stale cache entry.",
+                    },
                     "torque_agent": {
                         "type": "string",
                         "description": "DO NOT set unless the user explicitly provides this value or asks you to change it. Overrides the pre-configured Torque agent.",
@@ -2104,6 +2140,15 @@ After restart: pass previous `environment_id` to reconnect.""",
                             },
                             "required": ["remote_source_path", "local_destination_path"],
                         },
+                    },
+                    "credential": {
+                        "type": "string",
+                        "description": "Optional: name of a credential stored in the connected Torque account. Torque injects its secrets as environment variables where the command runs, so the command can reference them (e.g. \"$VSPHERE_PASSWORD\") without them ever being shown to you or written into the command. Call list_credentials to see the available names and which variables each one provides. One credential per call — for two, make two calls.",
+                    },
+                    "credential_env_forward": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional: extra environment variable NAMES to carry to the remote host, on top of the credential's own. Only needed for a credential type torque-tunnel has not measured yet, or to correct a stale cache entry.",
                     },
                     "torque_agent": {
                         "type": "string",
@@ -2210,6 +2255,10 @@ Only for unreachable internal network targets. For local network/VMs, use termin
                             "required": ["remote_source_path", "local_destination_path"],
                         },
                     },
+                    "credential": {
+                        "type": "string",
+                        "description": "Optional: name of a credential stored in the connected Torque account. Torque injects its secrets as environment variables where the command runs, so the command can reference them (e.g. \"$VSPHERE_PASSWORD\") without them ever being shown to you or written into the command. Call list_credentials to see the available names and which variables each one provides. One credential per call — for two, make two calls.",
+                    },
                     "torque_agent": {
                         "type": "string",
                         "description": "DO NOT set unless the user explicitly provides this value or asks you to change it. Overrides the pre-configured Torque agent.",
@@ -2269,6 +2318,30 @@ Use `wait` to avoid tight polling. Typical: wait=10, repeat until completed.""",
                     },
                 },
                 "required": ["environment_id"],
+            },
+        ),
+        Tool(
+            name="list_credentials",
+            description="""List the credentials stored in the connected Torque account that are usable from this profile's space.
+
+Use this before passing `credential` to any run_* tool: it gives you the exact credential names and, for each one, the environment variables Torque will inject where your command runs. The secrets themselves are never returned here or anywhere else — only names, types, and non-secret details such as which vCenter or AWS account a credential points at.
+
+Typical flow: call this once, pick the credential that matches the target infrastructure, then pass its name as `credential` to a run_* tool and reference the variables in your command (e.g. `govc -u "$VSPHERE_USER:$VSPHERE_PASSWORD@$VSPHERE_SERVER"`).
+
+The first call against a Torque account may take ~30s if it has to measure credential types it has not seen before; results are cached, so later calls are immediate.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "force_rediscover": {
+                        "type": "boolean",
+                        "description": "Optional: re-measure which environment variables each credential type injects, instead of using the cached result. Only needed if Torque was upgraded and the cached variable names look wrong.",
+                    },
+                    "profile": {
+                        "type": "string",
+                        "description": "Configuration profile name to use. Omit to use the default profile.",
+                    },
+                },
+                "required": [],
             },
         ),
         Tool(
@@ -2350,25 +2423,41 @@ async def call_tool(name: str, arguments: dict):
                 error_parts.append(profile_listing[0].text)
             return [TextContent(type="text", text="\n".join(error_parts))]
     
-    if name == "run_on_tunneled_ssh":
-        return await handle_run_on_tunneled_ssh(arguments, effective_config)
-    
-    elif name == "run_on_tunneled_persistent_container":
-        return await handle_run_on_tunneled_persistent_container(arguments, effective_config)
-    
-    elif name == "run_on_tunneled_disposable_container":
-        return await handle_run_on_tunneled_disposable_container(arguments, effective_config)
-    
-    elif name == "run_on_tunneled_ssh_async":
-        return await handle_run_on_tunneled_ssh_async(arguments, effective_config)
-    
-    elif name == "run_on_tunneled_persistent_container_async":
-        return await handle_run_on_tunneled_persistent_container_async(arguments, effective_config)
-    
-    elif name == "run_on_tunneled_disposable_container_async":
-        return await handle_run_on_tunneled_disposable_container_async(arguments, effective_config)
-    
-    elif name == "get_execution_status":
+    if name == "list_credentials":
+        return await handle_list_credentials(arguments, effective_config)
+
+    # A credential resolves a customer's real secrets into an agent container, so it is
+    # opted into per profile. Checked here rather than in six handlers.
+    if arguments.get("credential"):
+        disabled = _credentials_disabled_message(effective_config)
+        if disabled:
+            return [TextContent(type="text", text=disabled)]
+
+    # Credential problems carry messages meant for the caller (which space a credential is
+    # allowed in, why a type cannot be used), so they are surfaced as-is rather than
+    # flattened into a generic execution error by the handlers' own except clauses.
+    try:
+        if name == "run_on_tunneled_ssh":
+            return await handle_run_on_tunneled_ssh(arguments, effective_config)
+
+        elif name == "run_on_tunneled_persistent_container":
+            return await handle_run_on_tunneled_persistent_container(arguments, effective_config)
+
+        elif name == "run_on_tunneled_disposable_container":
+            return await handle_run_on_tunneled_disposable_container(arguments, effective_config)
+
+        elif name == "run_on_tunneled_ssh_async":
+            return await handle_run_on_tunneled_ssh_async(arguments, effective_config)
+
+        elif name == "run_on_tunneled_persistent_container_async":
+            return await handle_run_on_tunneled_persistent_container_async(arguments, effective_config)
+
+        elif name == "run_on_tunneled_disposable_container_async":
+            return await handle_run_on_tunneled_disposable_container_async(arguments, effective_config)
+    except credentials_module.CredentialError as e:
+        return [TextContent(type="text", text=f"Credential error: {e}")]
+
+    if name == "get_execution_status":
         return await handle_get_execution_status(arguments)
     
     elif name == "cancel_execution":
@@ -2376,6 +2465,166 @@ async def call_tool(name: str, arguments: dict):
     
     else:
         return [TextContent(type="text", text=f"Unknown tool: {name}")]
+
+
+# --- Credentials --------------------------------------------------------------------
+
+
+def _credentials_space_policy(cfg: dict) -> str:
+    """The configured space policy, falling back to the safe one on a bad value."""
+    policy = (cfg or {}).get("credentials_space_policy") or credentials_module.SPACE_POLICY_PRECONFIGURED
+    if policy not in credentials_module.SPACE_POLICIES:
+        return credentials_module.SPACE_POLICY_PRECONFIGURED
+    return policy
+
+
+def _credentials_disabled_message(cfg: dict) -> Optional[str]:
+    """Why credentials cannot be used at all, or None when they can.
+
+    Off by default: using a credential resolves a customer's real secrets into an agent
+    container, so it is opted into per profile rather than assumed.
+    """
+    if (cfg or {}).get("credentials_enabled"):
+        return None
+    return (
+        "Torque credentials are not enabled for this profile. Set `credentials_enabled: true` "
+        "in ~/.torque-tunnel/config.yaml (at the top level or inside the profile), or re-run "
+        "the `setup` tool and tick \"Allow using Torque credentials\"."
+    )
+
+
+async def _prepare_credential(arguments: dict, cfg: dict, client, *, forward: bool):
+    """Resolve the `credential` argument into (name, context) for a run_* call.
+
+    Returns (None, None) when no credential was requested. Raises CredentialError with a
+    caller-facing message when the credential cannot be used.
+    """
+    name = arguments.get("credential")
+    if not name:
+        return None, None
+    if isinstance(name, (list, tuple)):
+        raise credentials_module.CredentialError(
+            "Only one credential can be used per call, because Torque merges credential "
+            "environment variables and a second credential of the same type would silently "
+            "overwrite the first. Make one call per credential."
+        )
+    prep = await credentials_module.prepare_credential(
+        client,
+        name=name,
+        space=client.space,
+        space_policy=_credentials_space_policy(cfg),
+        agent=arguments.get("torque_agent") or cfg.get("default_agent"),
+        forward=forward,
+        extra_forward=arguments.get("credential_env_forward"),
+        enabled=bool((cfg or {}).get("credentials_enabled")),
+    )
+    return prep["credential"]["name"], prep["context"]
+
+
+def _format_credential_entry(credential: dict, type_entry: Optional[dict]) -> list[str]:
+    """Render one credential for list_credentials output."""
+    name = credential.get("name")
+    ctype = credential.get("type") or "unknown"
+    head = f"- **{name}** ({ctype}"
+    if credential.get("cloud_identifier"):
+        head += f", {credential['cloud_identifier']}"
+    head += ")"
+    if credential.get("description"):
+        head += f" - {credential['description']}"
+    lines = [head]
+
+    fields = credentials_module.displayable_fields(credential)
+    if fields:
+        lines.append("  " + ", ".join(f"{k}={v}" for k, v in sorted(fields.items())))
+
+    status = (type_entry or {}).get("status")
+    if type_entry is None:
+        lines.append("  env vars: not measured yet - will be measured on first use")
+    elif status == credentials_module.STATUS_OK:
+        lines.append("  env vars: " + " ".join(type_entry.get("vars") or []))
+    elif status == credentials_module.STATUS_NO_ENV_VARS:
+        lines.append("  env vars: none - this type cannot be used with run_* tools")
+    else:
+        lines.append("  UNUSABLE: Torque cannot inject this credential type as env vars")
+
+    if not credential.get("all_spaces_allowed"):
+        allowed = credential.get("allowed_space_names") or []
+        if allowed:
+            lines.append("  allowed spaces: " + ", ".join(allowed))
+    return lines
+
+
+async def handle_list_credentials(arguments: dict, config: dict = None):
+    """List the Torque credentials usable from this profile's space."""
+    cfg = config or _config
+    disabled = _credentials_disabled_message(cfg)
+    if disabled:
+        return [TextContent(type="text", text=disabled)]
+
+    force = bool(arguments.get("force_rediscover"))
+    try:
+        async with get_torque_client(config=cfg) as client:
+            cache = credentials_module.load_cache()
+            if force:
+                credentials_module.drop_measured_types(cache, client.base_url)
+                credentials_module.save_cache(cache)
+
+            # An explicit query always re-fetches the list, so a credential added a moment
+            # ago shows up. Measurements are separate and are not re-run unless forced.
+            cache, creds_list = await credentials_module.get_credentials(
+                client, client.space, force_refresh=True, cache=cache
+            )
+
+            probe_targets: dict[str, str] = {}
+            for c in creds_list:
+                ctype = c.get("type")
+                if ctype and ctype not in probe_targets:
+                    probe_targets[ctype] = c["name"]
+            if force:
+                # The seed is the cache's initial shape, so "don't trust what I have" has to
+                # reach seeded types too - otherwise forcing a rediscover on an account whose
+                # types are all seeded would do nothing at all.
+                pending = list(probe_targets)
+            else:
+                pending = credentials_module.unmeasured_types(
+                    cache, client.base_url, list(probe_targets)
+                )
+
+            notes: list[str] = []
+            if pending:
+                notes.append(
+                    f"Measuring {len(pending)} credential type(s) "
+                    f"({', '.join(pending)}). This launches one short Torque environment "
+                    f"and takes ~30s; the result is cached permanently."
+                )
+                try:
+                    cache = await credentials_module.ensure_types_measured(
+                        client, cache,
+                        {t: probe_targets[t] for t in pending},
+                        agent=cfg.get("default_agent"),
+                        force=force,
+                    )
+                except Exception as e:
+                    notes.append(f"Measurement failed: {e}")
+
+            lines = [f"## Torque credentials in space '{client.space}'", ""]
+            if notes:
+                lines.extend(notes + [""])
+            if not creds_list:
+                lines.append("(none - this space has no credentials available)")
+            for c in sorted(creds_list, key=lambda x: (x.get("name") or "").lower()):
+                entry = credentials_module.get_type_entry(cache, client.base_url, c.get("type"))
+                lines.extend(_format_credential_entry(c, entry))
+
+            lines += [
+                "",
+                "Pass a name as `credential` to any run_* tool. Torque injects the listed "
+                "variables where the command runs; reference them in the command "
+                "(e.g. \"$VSPHERE_PASSWORD\") rather than pasting values.",
+            ]
+            return [TextContent(type="text", text="\n".join(lines))]
+    except Exception as e:
+        return [TextContent(type="text", text=f"Error listing credentials: {e}")]
 
 
 def _format_profile_entry(p: dict, default_profile: str | None = None) -> list[str]:
@@ -2400,6 +2649,11 @@ def _format_profile_entry(p: dict, default_profile: str | None = None) -> list[s
     else:
         overrides = ", ".join(p['overrides']) if p['overrides'] else "(none)"
         lines.append(f"  Overrides: {overrides}")
+        # Whether credentials may be used is not a secret, and the caller needs it to know
+        # whether passing `credential` is even an option - so it is shown regardless of
+        # expose_values, unlike the connection details.
+        if p.get('values', {}).get('credentials_enabled'):
+            lines.append("  credentials_enabled: true (see list_credentials)")
     return lines
 
 
@@ -2486,16 +2740,16 @@ async def handle_setup(arguments: dict):
 
 async def handle_run_on_tunneled_ssh(arguments: dict, config: dict = None):
     """Execute a remote command via SSH, optionally uploading files first."""
-    config = config or _config
-    target_ip = arguments.get("host") or config["default_target_ip"]
-    ssh_user = arguments.get("user") or config["default_ssh_user"]
+    cfg = config or _config
+    target_ip = arguments.get("host") or cfg["default_target_ip"]
+    ssh_user = arguments.get("user") or cfg["default_ssh_user"]
     # SSH auth mutual exclusion: if args specify either auth method, use only args;
     # only fall back to config defaults when neither is provided in args.
     private_key_value = arguments.get("private_key")
     ssh_password = arguments.get("password")
     if not private_key_value and not ssh_password:
-        private_key_value = config.get("default_ssh_key")
-        ssh_password = config.get("default_ssh_password")
+        private_key_value = cfg.get("default_ssh_key")
+        ssh_password = cfg.get("default_ssh_password")
     command = arguments.get("command")
     command_description = arguments.get("command_description")
     files = arguments.get("upload_files", [])
@@ -2506,12 +2760,12 @@ async def handle_run_on_tunneled_ssh(arguments: dict, config: dict = None):
     # Per-call auto_delete overrides global config if specified
     auto_delete = arguments.get("auto_delete")
     if auto_delete is None:
-        auto_delete = config["auto_delete_environments"]
+        auto_delete = cfg["auto_delete_environments"]
     
     # Per-call Torque config overrides
-    torque_url = arguments.get("torque_url") or config["torque_url"]
-    torque_token = arguments.get("torque_token") or config["torque_token"]
-    torque_space = arguments.get("torque_space") or config["torque_space"]
+    torque_url = arguments.get("torque_url") or cfg["torque_url"]
+    torque_token = arguments.get("torque_token") or cfg["torque_token"]
+    torque_space = arguments.get("torque_space") or cfg["torque_space"]
     
     # Must have at least command OR upload_files OR download_files
     if not command and not files and not download_files:
@@ -2622,20 +2876,21 @@ async def handle_run_on_tunneled_ssh(arguments: dict, config: dict = None):
             except Exception as e:
                 return [TextContent(type="text", text=f"Error starting croc file download receiver: {str(e)}")]
         
-        # Create client with per-call or global config
+        # Create client with per-call or global cfg
         client = TorqueClient(
             base_url=torque_url,
             token=torque_token,
             space=torque_space,
-            default_agent=config["default_agent"],
-            init_commands=config["init_commands"],
-            finally_commands=config["finally_commands"],
-            retry_enabled=config.get("retry_enabled", True),
-            retry_budget_seconds=config.get("retry_budget_seconds", 600),
-            create_retry_budget_seconds=config.get("create_retry_budget_seconds", 600),
-            retry_max_backoff_seconds=config.get("retry_max_backoff_seconds", 15),
+            default_agent=cfg["default_agent"],
+            init_commands=cfg["init_commands"],
+            finally_commands=cfg["finally_commands"],
+            retry_enabled=cfg.get("retry_enabled", True),
+            retry_budget_seconds=cfg.get("retry_budget_seconds", 600),
+            create_retry_budget_seconds=cfg.get("create_retry_budget_seconds", 600),
+            retry_max_backoff_seconds=cfg.get("retry_max_backoff_seconds", 15),
         )
         async with client:
+            __cred_name, __cred_ctx = await _prepare_credential(arguments, cfg, client, forward=True)
             result = await client.execute_remote_command(
                 target_ip=target_ip,
                 ssh_user=ssh_user,
@@ -2651,6 +2906,8 @@ async def handle_run_on_tunneled_ssh(arguments: dict, config: dict = None):
                 download_commands=dl_plan.download_commands if dl_plan else None,
                 command_description=command_description,
                 environment_kind="ssh",
+                credential_name=__cred_name,
+                credential_context=__cred_ctx,
             )
             
             # Try to get grain log for additional context (especially useful on failures)
@@ -2733,6 +2990,10 @@ async def handle_run_on_tunneled_ssh(arguments: dict, config: dict = None):
         return [TextContent(type="text", text=output_text)]
     
     except Exception as e:
+        # A credential problem carries a message written for the caller (which space
+        # allows it, why its type cannot be used) - pass it through verbatim.
+        if isinstance(e, credentials_module.CredentialError):
+            return [TextContent(type="text", text=f"Credential error: {e}")]
         return [TextContent(type="text", text=f"Error executing remote command: {str(e)}")]
     finally:
         await cleanup_croc_resources(croc_process, plan.croc_staging_dir if plan else "")
@@ -2975,6 +3236,7 @@ async def handle_run_on_tunneled_persistent_container(arguments: dict, config: d
             except Exception:
                 pass  # Non-critical
 
+            __cred_name, __cred_ctx = await _prepare_credential(arguments, cfg, client, forward=True)
             result = await client.execute_remote_command(
                 target_ip=container_ip,
                 ssh_user="root",
@@ -2990,6 +3252,8 @@ async def handle_run_on_tunneled_persistent_container(arguments: dict, config: d
                 command_description=command_description,
                 environment_kind="persistent-command",
                 parent_env_id=env_id,
+                credential_name=__cred_name,
+                credential_context=__cred_ctx,
             )
 
             grain_log = None
@@ -3080,6 +3344,10 @@ async def handle_run_on_tunneled_persistent_container(arguments: dict, config: d
         return [TextContent(type="text", text=output_text)]
     
     except Exception as e:
+        # A credential problem carries a message written for the caller (which space
+        # allows it, why its type cannot be used) - pass it through verbatim.
+        if isinstance(e, credentials_module.CredentialError):
+            return [TextContent(type="text", text=f"Credential error: {e}")]
         return [TextContent(type="text", text=f"Error executing command on container: {str(e)}")]
     finally:
         await cleanup_croc_resources(croc_process, plan.croc_staging_dir if plan else "")
@@ -3171,6 +3439,7 @@ async def handle_run_on_tunneled_disposable_container(arguments: dict, config: d
                 return [TextContent(type="text", text=f"Error starting croc file download receiver: {str(e)}")]
         
         async with get_torque_client(torque_url, torque_token, torque_space, config=cfg) as client:
+            __cred_name, __cred_ctx = await _prepare_credential(arguments, cfg, client, forward=False)
             result = await client.execute_local_command(
                 command=effective_command,
                 agent=agent,
@@ -3180,6 +3449,8 @@ async def handle_run_on_tunneled_disposable_container(arguments: dict, config: d
                 init_commands=init_commands,
                 download_commands=dl_plan.download_commands if dl_plan else None,
                 command_description=command_description,
+                credential_name=__cred_name,
+                credential_context=__cred_ctx,
             )
 
             # Try to get grain log for additional context (especially useful on failures)
@@ -3263,6 +3534,10 @@ async def handle_run_on_tunneled_disposable_container(arguments: dict, config: d
         return [TextContent(type="text", text=output_text)]
     
     except Exception as e:
+        # A credential problem carries a message written for the caller (which space
+        # allows it, why its type cannot be used) - pass it through verbatim.
+        if isinstance(e, credentials_module.CredentialError):
+            return [TextContent(type="text", text=f"Credential error: {e}")]
         return [TextContent(type="text", text=f"Error executing command on agent: {str(e)}")]
     finally:
         await cleanup_croc_resources(croc_process, plan.croc_staging_dir if plan else "")
@@ -3365,6 +3640,7 @@ async def handle_run_on_tunneled_ssh_async(arguments: dict, config: dict = None)
                 return [TextContent(type="text", text=f"Error starting croc file download receiver: {str(e)}")]
         
         async with get_torque_client(torque_url, torque_token, torque_space, config=cfg) as client:
+            __cred_name, __cred_ctx = await _prepare_credential(arguments, cfg, client, forward=True)
             environment_id = await client.start_environment(
                 target_ip=target_ip,
                 ssh_user=ssh_user,
@@ -3378,6 +3654,8 @@ async def handle_run_on_tunneled_ssh_async(arguments: dict, config: dict = None)
                 download_commands=dl_plan.download_commands if dl_plan else None,
                 command_description=command_description,
                 environment_kind="ssh",
+                credential_name=__cred_name,
+                credential_context=__cred_ctx,
             )
 
         # Track croc state for cleanup when execution completes
@@ -3423,6 +3701,10 @@ Use `cancel_execution` with the same environment_id to abort if needed."""
         # Clean up croc on error (not tracked for async cleanup)
         await cleanup_croc_resources(croc_process, plan.croc_staging_dir if plan else "")
         await cleanup_download_resources(dl_process, dl_plan.croc_receive_dir if dl_plan else "")
+        # A credential problem carries a message written for the caller (which space
+        # allows it, why its type cannot be used) - pass it through verbatim.
+        if isinstance(e, credentials_module.CredentialError):
+            return [TextContent(type="text", text=f"Credential error: {e}")]
         return [TextContent(type="text", text=f"Error starting async command: {str(e)}")]
 
 
@@ -3509,6 +3791,7 @@ async def handle_run_on_tunneled_persistent_container_async(arguments: dict, con
         
         # Start the SSH command asynchronously - SSH from disposable grain into persistent container
         async with get_torque_client(torque_url, torque_token, torque_space, config=cfg) as client:
+            __cred_name, __cred_ctx = await _prepare_credential(arguments, cfg, client, forward=True)
             environment_id = await client.start_environment(
                 target_ip=container_ip,
                 ssh_user="root",
@@ -3522,6 +3805,8 @@ async def handle_run_on_tunneled_persistent_container_async(arguments: dict, con
                 command_description=command_description,
                 environment_kind="persistent-command",
                 parent_env_id=env_id,
+                credential_name=__cred_name,
+                credential_context=__cred_ctx,
             )
             
             # Track croc state for cleanup when execution completes
@@ -3580,6 +3865,10 @@ Use `cancel_execution` with the same environment_id to abort if needed."""
         # Clean up croc on error (not tracked for async cleanup)
         await cleanup_croc_resources(croc_process, plan.croc_staging_dir if plan else "")
         await cleanup_download_resources(dl_process, dl_plan.croc_receive_dir if dl_plan else "")
+        # A credential problem carries a message written for the caller (which space
+        # allows it, why its type cannot be used) - pass it through verbatim.
+        if isinstance(e, credentials_module.CredentialError):
+            return [TextContent(type="text", text=f"Credential error: {e}")]
         return [TextContent(type="text", text=f"Error starting async command on container: {str(e)}")]
 
 
@@ -3644,6 +3933,7 @@ async def handle_run_on_tunneled_disposable_container_async(arguments: dict, con
                 return [TextContent(type="text", text=f"Error starting croc file download receiver: {str(e)}")]
         
         async with get_torque_client(torque_url, torque_token, torque_space, config=cfg) as client:
+            __cred_name, __cred_ctx = await _prepare_credential(arguments, cfg, client, forward=False)
             environment_id = await client.start_local_environment(
                 command=effective_command,
                 agent=agent,
@@ -3651,6 +3941,8 @@ async def handle_run_on_tunneled_disposable_container_async(arguments: dict, con
                 timeout=timeout,
                 download_commands=dl_plan.download_commands if dl_plan else None,
                 command_description=command_description,
+                credential_name=__cred_name,
+                credential_context=__cred_ctx,
             )
 
         # Track croc state for cleanup when execution completes
@@ -3696,6 +3988,10 @@ Use `cancel_execution` with the same environment_id to abort if needed."""
         # Clean up croc on error (not tracked for async cleanup)
         await cleanup_croc_resources(croc_process, plan.croc_staging_dir if plan else "")
         await cleanup_download_resources(dl_process, dl_plan.croc_receive_dir if dl_plan else "")
+        # A credential problem carries a message written for the caller (which space
+        # allows it, why its type cannot be used) - pass it through verbatim.
+        if isinstance(e, credentials_module.CredentialError):
+            return [TextContent(type="text", text=f"Credential error: {e}")]
         return [TextContent(type="text", text=f"Error starting async command: {str(e)}")]
 
 
@@ -4205,6 +4501,44 @@ async def cli_dispatch(args):
         return files
     
     try:
+        if args.command == "credentials":
+            # Same output as the MCP list_credentials tool, so the two flavours agree.
+            result = await handle_list_credentials(
+                {"force_rediscover": getattr(args, "force_rediscover", False)}, _config
+            )
+            text = result[0].text if result else ""
+            if getattr(args, "json", False):
+                disabled = _credentials_disabled_message(_config)
+                if disabled:
+                    print(json_module.dumps({"error": disabled}, indent=2))
+                    sys.exit(1)
+                async with get_torque_client() as client:
+                    # handle_list_credentials just refreshed the list and ran any needed
+                    # measurement, so read the cache rather than fetching twice.
+                    cache, creds_list = await credentials_module.get_credentials(
+                        client, client.space
+                    )
+                    payload = []
+                    for c in sorted(creds_list, key=lambda x: (x.get("name") or "").lower()):
+                        entry = credentials_module.get_type_entry(
+                            cache, client.base_url, c.get("type"))
+                        payload.append({
+                            "name": c.get("name"),
+                            "type": c.get("type"),
+                            "cloud_type": c.get("cloud_type"),
+                            "cloud_identifier": c.get("cloud_identifier"),
+                            "description": c.get("description"),
+                            "all_spaces_allowed": c.get("all_spaces_allowed"),
+                            "allowed_space_names": c.get("allowed_space_names"),
+                            "fields": credentials_module.displayable_fields(c),
+                            "env_vars": (entry or {}).get("vars"),
+                            "status": (entry or {}).get("status"),
+                        })
+                    print(json_module.dumps(payload, indent=2))
+            else:
+                print(text)
+            return
+
         if args.command == "ssh":
             # SSH command execution (with optional file uploads)
             target_ip = _config["default_target_ip"]
@@ -4301,6 +4635,10 @@ async def cli_dispatch(args):
                     dl_process = await execute_download_receive(dl_plan, command_timeout=timeout)
 
                 async with get_torque_client() as client:
+                    __cred_args = {"credential": getattr(args, "credential", None),
+                                    "credential_env_forward": getattr(args, "credential_env_forward", None)}
+                    __cred_name, __cred_ctx = await _prepare_credential(
+                        __cred_args, _config, client, forward=True)
                     result = await client.execute_remote_command(
                         target_ip=target_ip,
                         ssh_user=ssh_user,
@@ -4316,6 +4654,8 @@ async def cli_dispatch(args):
                         download_commands=dl_plan.download_commands if dl_plan and dl_plan.needs_download else None,
                         command_description=command_description,
                         environment_kind="ssh",
+                        credential_name=__cred_name,
+                        credential_context=__cred_ctx,
                     )
             finally:
                 await cleanup_croc_resources(croc_process, plan.croc_staging_dir if plan else "")
@@ -4567,6 +4907,10 @@ async def cli_dispatch(args):
                         except Exception:
                             pass
 
+                        __cred_args = {"credential": getattr(args, "credential", None),
+                                        "credential_env_forward": getattr(args, "credential_env_forward", None)}
+                        __cred_name, __cred_ctx = await _prepare_credential(
+                            __cred_args, _config, client, forward=True)
                         result = await client.execute_remote_command(
                             target_ip=container_ip,
                             ssh_user="root",
@@ -4582,6 +4926,8 @@ async def cli_dispatch(args):
                             command_description=command_description,
                             environment_kind="persistent-command",
                             parent_env_id=used_env_id,
+                            credential_name=__cred_name,
+                            credential_context=__cred_ctx,
                         )
 
                         # Re-arm the idle timeout: the container dies
@@ -4702,6 +5048,10 @@ async def cli_dispatch(args):
                     dl_process = await execute_download_receive(dl_plan, command_timeout=timeout)
 
                 async with get_torque_client() as client:
+                    __cred_args = {"credential": getattr(args, "credential", None),
+                                    "credential_env_forward": getattr(args, "credential_env_forward", None)}
+                    __cred_name, __cred_ctx = await _prepare_credential(
+                        __cred_args, _config, client, forward=False)
                     result = await client.execute_local_command(
                         command=effective_command,
                         agent=agent,
@@ -4711,6 +5061,8 @@ async def cli_dispatch(args):
                         init_commands=init_commands,
                         download_commands=dl_plan.download_commands if dl_plan and dl_plan.needs_download else None,
                         command_description=command_description,
+                        credential_name=__cred_name,
+                        credential_context=__cred_ctx,
                     )
             finally:
                 await cleanup_croc_resources(croc_process, plan.croc_staging_dir if plan else "")
@@ -5118,6 +5470,13 @@ PERFORMANCE TIP:
     
     # profiles subcommand (list configuration profiles)
     subparsers.add_parser("profiles", parents=[common_parser], help="List available configuration profiles")
+
+    creds_parser = subparsers.add_parser(
+        "credentials", parents=[common_parser],
+        help="List Torque credentials usable from this profile's space")
+    creds_parser.add_argument("--force-rediscover", action="store_true",
+                              help="Re-measure which env vars each credential type injects, ignoring the cache")
+    creds_parser.add_argument("--json", "-j", action="store_true", help="Output as JSON")
     
     # setup subcommand (interactive Torque setup)
     subparsers.add_parser("setup", parents=[common_parser], help="Set up Torque connection interactively (opens browser)")
@@ -5161,6 +5520,8 @@ PERFORMANCE TIP:
     ssh_parser.add_argument("--download", action="append", metavar="REMOTE:LOCAL",
                               help="Download remote file/dir to local path after command runs (can be repeated)")
     ssh_parser.add_argument("--description", help="Optional short description embedded in the Torque environment name (for finding it in the UI)")
+    ssh_parser.add_argument("--credential", help="Name of a Torque credential to attach; its secrets are injected as environment variables where the command runs (see `torque-tunnel credentials`)")
+    ssh_parser.add_argument("--credential-env-forward", action="append", metavar="VAR", help="Extra env var NAME to carry to the remote host (repeatable); only needed for an unmeasured credential type")
 
     # persistent-container subcommand (run on persistent Torque agent container)
     pc_parser = subparsers.add_parser("persistent-container", parents=[common_parser],
@@ -5177,6 +5538,8 @@ PERFORMANCE TIP:
     pc_parser.add_argument("--all", action="store_true", help="Release all containers (used with 'release' action)")
     pc_parser.add_argument("--description", help="Optional short description of the command, embedded in the command's Torque environment name")
     pc_parser.add_argument("--container-description", help="Optional short description of the persistent container itself; used only when a new container is created")
+    pc_parser.add_argument("--credential", help="Name of a Torque credential to attach; its secrets are injected as environment variables where the command runs (see `torque-tunnel credentials`)")
+    pc_parser.add_argument("--credential-env-forward", action="append", metavar="VAR", help="Extra env var NAME to carry to the remote host (repeatable); only needed for an unmeasured credential type")
 
     # disposable-container subcommand (run on fresh Torque agent container)
     dc_parser = subparsers.add_parser("disposable-container", parents=[common_parser],
@@ -5189,6 +5552,7 @@ PERFORMANCE TIP:
     dc_parser.add_argument("--download", action="append", metavar="REMOTE:LOCAL",
                              help="Download file/dir from container to local path after command runs (can be repeated)")
     dc_parser.add_argument("--description", help="Optional short description embedded in the Torque environment name (for finding it in the UI)")
+    dc_parser.add_argument("--credential", help="Name of a Torque credential to attach; its secrets are injected as environment variables where the command runs (see `torque-tunnel credentials`)")
 
     # read subcommand
     read_parser = subparsers.add_parser("read", parents=[common_parser], help="Read a file from remote server")
@@ -5362,7 +5726,12 @@ def main():
     _config["auto_delete_environments"] = args.auto_delete_environments or file_defaults_with_profile.get("auto_delete_environments", False)
     _config["verbose"] = args.verbose or file_defaults_with_profile.get("verbose", False)
     _config["container_idle_timeout"] = args.container_idle_timeout if args.container_idle_timeout != 86400 else file_defaults_with_profile.get("container_idle_timeout", 86400)
-    
+    # No CLI flags for these by design: they are set in the config file or by the setup UI,
+    # because enabling credentials is a deliberate per-profile decision rather than a
+    # per-invocation one.
+    _config["credentials_enabled"] = file_defaults_with_profile.get("credentials_enabled", False)
+    _config["credentials_space_policy"] = file_defaults_with_profile.get("credentials_space_policy", "preconfigured")
+
     # Record CLI overrides for hot-reload (these keys won't be changed when config file is reloaded)
     global _cli_overrides, _cli_profile, _config_explicit_path, _config_file_path, _config_file_mtime
     _config_explicit_path = getattr(args, 'config', None)

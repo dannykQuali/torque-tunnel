@@ -47,6 +47,11 @@ inputs:
     type: string
     description: Gzip-compressed and base64-encoded commands to run ON THE CONTAINER after SSH completes (e.g., SCP from target + croc send to local)
     default: ""
+  credential_context_b64:
+    type: string
+    description: Gzip-compressed and base64-encoded JSON describing the attached Torque credential (variable names and non-secret values only - never a secret). Empty when no credential is used.
+    default: ""
+  # __TT_CREDENTIAL_INPUT__
 
 outputs:
   command_output:
@@ -62,6 +67,7 @@ grains:
     spec:
       agent:
         name: '{{ .inputs.agent }}'
+      # __TT_CREDENTIAL_AUTH__
       activities:
         deploy:
           commands:
@@ -90,7 +96,103 @@ grains:
                 echo '{{ .inputs.init_commands_b64 }}' | base64 -d 2>/dev/null | gzip -d > "$INIT_FILE" 2>/dev/null || true
                 FINALLY_FILE=$(mktemp)
                 echo '{{ .inputs.finally_commands_b64 }}' | base64 -d 2>/dev/null | gzip -d > "$FINALLY_FILE" 2>/dev/null || true
-                
+
+                # --- Attached Torque credential ----------------------------------------------
+                # Two jobs here, both driven by the same context blob:
+                #
+                #  1. FORWARDING. The credential's variables are injected into THIS container,
+                #     but the command runs on the target host over SSH, so they have to be
+                #     re-exported into the remote script. The blob carries variable NAMES only
+                #     (names are not secret); the VALUES are read here, from this container's
+                #     own environment, and never travel from the caller.
+                #  2. REDACTION. Torque has no log masking, so a command that prints a secret
+                #     would leak it into the returned output and the Torque UI log alike. The
+                #     execution stream is piped through a redactor that rewrites those values.
+                #     A value that is NOT among the blob's non-secret values came from a field
+                #     Torque returned as null, i.e. a secret - which is what lets this work
+                #     without a per-credential-type table of which field is which.
+                __TT_CRED_CTX=$(mktemp)
+                echo '{{ .inputs.credential_context_b64 }}' | base64 -d 2>/dev/null | gzip -d > "$__TT_CRED_CTX" 2>/dev/null || true
+                export __TT_CRED_CTX
+                __TT_REDACT_PY=$(mktemp)
+                cat > "$__TT_REDACT_PY" <<'__TT_REDACT_EOF'
+                import json, os, sys
+
+                try:
+                    with open(os.environ.get("__TT_CRED_CTX", ""), "r") as _f:
+                        ctx = json.load(_f)
+                except Exception:
+                    ctx = {}
+
+                names = ctx.get("vars") or []
+                public = set(str(v) for v in (ctx.get("public_values") or []))
+                minlen = int(ctx.get("min_len") or 8)
+
+                secrets, skipped, present = [], [], []
+                for n in names:
+                    v = os.environ.get(n)
+                    if not v:
+                        continue
+                    present.append(n)
+                    if v in public:
+                        continue
+                    if len(v) < minlen:
+                        skipped.append(n)
+                        continue
+                    secrets.append(v)
+
+                # Longest first, so a secret that contains another is masked whole.
+                secrets = sorted(set(secrets), key=len, reverse=True)
+
+                warnings = []
+                if names and not present:
+                    warnings.append(
+                        "WARNING: none of the expected variables for credential type '%s' are set (%s). "
+                        "The cached variable list may be stale - output was NOT redacted. "
+                        "Re-run list_credentials with force_rediscover to refresh." % (ctx.get("type"), ", ".join(names)))
+                if skipped:
+                    warnings.append(
+                        "NOTE: values shorter than %d characters are not redacted, so these were left as-is: %s"
+                        % (minlen, ", ".join(skipped)))
+
+                out = sys.stdout.buffer
+                for w in warnings:
+                    out.write(("[torque-tunnel] " + w + "\n").encode("utf-8"))
+                out.flush()
+
+                # Operate on bytes so arbitrary command output cannot break the filter on decoding.
+                secrets_b = [s.encode("utf-8", "surrogateescape") for s in secrets]
+                stdin = sys.stdin.buffer
+                while True:
+                    line = stdin.readline()
+                    if not line:
+                        break
+                    for s in secrets_b:
+                        if s in line:
+                            line = line.replace(s, b"***")
+                    out.write(line)
+                    out.flush()
+                __TT_REDACT_EOF
+                if [ -s "$__TT_CRED_CTX" ] && command -v python3 >/dev/null 2>&1; then
+                  __tt_filter() { python3 -u "$__TT_REDACT_PY"; }
+                else
+                  if [ -s "$__TT_CRED_CTX" ]; then
+                    echo "[torque-tunnel] WARNING: python3 is unavailable on this agent - credential values will NOT be redacted from output."
+                  fi
+                  __tt_filter() { cat; }
+                fi
+
+                # Names of the variables to re-export on the remote host. Derived from the
+                # context blob plus MGMT_SERVER_* (forwarded by design - existing blueprint
+                # contract). Names only; nothing secret is in this variable.
+                __TT_FORWARD_VARS=""
+                if [ -s "$__TT_CRED_CTX" ] && command -v python3 >/dev/null 2>&1; then
+                  __TT_FORWARD_VARS=$(python3 -c 'import json,os;print(" ".join((json.load(open(os.environ["__TT_CRED_CTX"])).get("forward") or [])))' 2>/dev/null || echo "")
+                fi
+                for __v in $(compgen -e | grep '^MGMT_SERVER_' 2>/dev/null); do
+                  __TT_FORWARD_VARS="$__TT_FORWARD_VARS $__v"
+                done
+
                 # Run container pre-commands (e.g., croc file receive + SCP to target)
                 # These run ON THE CONTAINER before any SSH connection to the target.
                 __CONTAINER_PRE=$(mktemp)
@@ -184,7 +286,18 @@ grains:
 
                   # Build remote script
                   echo '#!/bin/bash' > "$REMOTE_SCRIPT"
-                  
+
+                  # Forward the attached credential's variables (and MGMT_SERVER_*) to the
+                  # target. Emitted FIRST so init/command/finally can all use them. printf %q
+                  # quotes each value safely; a variable that is not set is skipped rather than
+                  # exported empty. Note this writes secrets into the remote script, which is
+                  # the point - it is how the command on the target gets to use them.
+                  for __v in $__TT_FORWARD_VARS; do
+                    if [ -n "${!__v+x}" ]; then
+                      printf 'export %s=%q\n' "$__v" "${!__v}" >> "$REMOTE_SCRIPT"
+                    fi
+                  done
+
                   # Track exit code for proper propagation
                   echo '__EXIT_CODE=0' >> "$REMOTE_SCRIPT"
                   
@@ -232,7 +345,7 @@ grains:
                         -o LogLevel=ERROR \
                         -o PubkeyAuthentication=no \
                         "{{ .inputs.ssh_user }}@{{ .inputs.target_ip }}" \
-                        "bash -s" < "$REMOTE_SCRIPT" 2>&1 | tee "$OUTPUT_FILE"
+                        "bash -s" < "$REMOTE_SCRIPT" 2>&1 | __tt_filter | tee "$OUTPUT_FILE"
                   else
                     timeout "${TIMEOUT_SECONDS}" \
                     ssh -o StrictHostKeyChecking=no \
@@ -240,7 +353,7 @@ grains:
                         -o LogLevel=ERROR \
                         -i "$KEY_FILE" \
                         "{{ .inputs.ssh_user }}@{{ .inputs.target_ip }}" \
-                        "bash -s" < "$REMOTE_SCRIPT" 2>&1 | tee "$OUTPUT_FILE"
+                        "bash -s" < "$REMOTE_SCRIPT" 2>&1 | __tt_filter | tee "$OUTPUT_FILE"
                   fi
                   SSH_STATUS=${PIPESTATUS[0]}
                   # timeout returns 124 when the command times out
@@ -281,7 +394,7 @@ grains:
                 # Always export outputs - this section MUST be reached
                 COMMAND_OUTPUT_B64=$(base64 < "$OUTPUT_FILE" 2>/dev/null | tr -d '\n' || echo "")
                 SSH_EXIT_CODE=$(cat "$EXIT_CODE_FILE" 2>/dev/null || echo "1")
-                rm -f "$KEY_FILE" "$OUTPUT_FILE" "$EXIT_CODE_FILE" "$REMOTE_SCRIPT" "$CMD_FILE" "$INIT_FILE" "$FINALLY_FILE" 2>/dev/null || true
+                rm -f "$KEY_FILE" "$OUTPUT_FILE" "$EXIT_CODE_FILE" "$REMOTE_SCRIPT" "$CMD_FILE" "$INIT_FILE" "$FINALLY_FILE" "$__TT_CRED_CTX" "$__TT_REDACT_PY" 2>/dev/null || true
                 
                 export command_output="$COMMAND_OUTPUT_B64"
                 export exit_code="$SSH_EXIT_CODE"

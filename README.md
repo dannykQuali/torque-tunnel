@@ -104,6 +104,19 @@ Full reference: [docs/configuration.md](docs/configuration.md).
 |------|-------------|
 | `setup` | Interactively set up or add a Torque connection profile (opens a browser) |
 | `list_profiles` | List available configuration profiles and base configuration |
+| `list_credentials` | List the Torque credentials usable from this profile's space, and the environment variables each one injects |
+
+### Credentials
+
+Any execution tool accepts a `credential` parameter naming a credential stored in the
+connected Torque account. Torque resolves it inside the agent and injects its secrets as
+environment variables where the command runs, so a command can use `"$VSPHERE_PASSWORD"`
+without the value ever reaching the AI, the MCP client, or this machine. Values that would
+otherwise appear in the command output are replaced with `***` before it leaves the agent.
+
+Off by default — set `credentials_enabled: true` (see
+[docs/configuration.md](docs/configuration.md)) or tick the box during `setup`. One
+credential per call. Full design: [docs/design-credentials.md](docs/design-credentials.md).
 
 ## CLI usage
 
@@ -114,6 +127,7 @@ The same entry point is a CLI outside of any AI client:
 torque-tunnel register-mcp-client --list          # show supported clients + detection
 torque-tunnel setup                      # interactive Torque login (browser)
 torque-tunnel profiles                   # list configured profiles
+torque-tunnel credentials                # list Torque credentials usable from this space
 torque-tunnel serve                      # run as an MCP server (stdio)
 
 # Run commands

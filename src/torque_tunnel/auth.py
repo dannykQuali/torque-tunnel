@@ -292,6 +292,7 @@ class TorqueAuthServer:
         app.router.add_get(f"/{s}/api/spaces", self._handle_list_spaces)
         app.router.add_get(f"/{s}/api/spaces/{{space}}/agents", self._handle_list_agents)
         app.router.add_get(f"/{s}/api/agents", self._handle_list_all_agents)
+        app.router.add_get(f"/{s}/api/spaces/{{space}}/credentials", self._handle_space_credentials)
         app.router.add_post(f"/{s}/api/ensure-space", self._handle_ensure_space)
         app.router.add_post(f"/{s}/api/generate-token", self._handle_generate_token)
         app.router.add_post(f"/{s}/api/complete", self._handle_complete)
@@ -546,6 +547,46 @@ class TorqueAuthServer:
                 headers={"Authorization": token},
             )
         return web.json_response(resp.json(), status=resp.status_code)
+
+    async def _handle_space_credentials(self, request: web.Request) -> web.Response:
+        """How many credentials are usable in a space, and whether we may authorize more.
+
+        Both answers drive the credentials section of the confirm step: a space with zero
+        usable credentials makes the feature useless unless the `authorize` policy is
+        picked, and `authorize` itself needs an account-admin token.
+        """
+        space = request.match_info["space"]
+        token = request.headers.get("Authorization", "")
+        count = None
+        error = None
+        async with httpx.AsyncClient(timeout=15.0, verify=False) as client:
+            try:
+                resp = await client.get(
+                    f"{self.torque_url}/api/spaces/{_q(space)}/settings/credentialstore/overridden_values",
+                    headers={"Authorization": token},
+                )
+                if resp.status_code == 200 and isinstance(resp.json(), list):
+                    count = len(resp.json())
+                else:
+                    error = f"HTTP {resp.status_code}"
+            except Exception as e:
+                error = str(e)
+
+            # Account-level listing requires Account.ManageCredentials, the same capability
+            # the `authorize` policy needs to widen a credential's allowed spaces.
+            can_authorize = False
+            try:
+                probe = await client.get(
+                    f"{self.torque_url}/api/settings/credentialstore",
+                    headers={"Authorization": token},
+                )
+                can_authorize = probe.status_code == 200
+            except Exception:
+                can_authorize = False
+
+        return web.json_response(
+            {"count": count, "can_authorize": can_authorize, "error": error}
+        )
 
     # -- Ensure space exists and the chosen agent is allowed in it --
 
@@ -871,6 +912,8 @@ class TorqueAuthServer:
         init_commands = body.get("init_commands", "")
         set_as_default = body.get("set_as_default", False)
         expose_values = body.get("expose_values", False)
+        credentials_enabled = bool(body.get("credentials_enabled", False))
+        credentials_space_policy = body.get("credentials_space_policy") or "preconfigured"
 
         if not long_token or not space:
             return web.json_response({"error": "token and space are required"}, status=400)
@@ -892,6 +935,11 @@ class TorqueAuthServer:
         if init_commands:
             updates["init_commands"] = init_commands
         updates["expose_values"] = expose_values
+        # Ordinary config values (not profile metadata like expose_values), so they inherit
+        # through `extends` and can be overridden per profile.
+        updates["credentials_enabled"] = credentials_enabled
+        if credentials_enabled:
+            updates["credentials_space_policy"] = credentials_space_policy
 
         # Update self for revocation context
         self.torque_url = torque_url.rstrip("/")

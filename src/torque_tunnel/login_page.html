@@ -288,6 +288,25 @@
         </label>
         <div class="hint">When set, the calling AI agent can see this profile's connection details (tokens, URLs, etc.).</div>
       </div>
+      <div style="margin-top:8px; margin-bottom:4px;">
+        <label style="display:flex; align-items:center; gap:8px; cursor:pointer; font-weight:normal;">
+          <input type="checkbox" id="credentialsEnabledToggle" onchange="onCredentialsToggle()">
+          Allow using Torque credentials
+        </label>
+        <div class="hint">Tools may attach one credential from this Torque account per call. Torque injects its secrets as environment variables on the agent &mdash; they are never shown to the AI.</div>
+        <div id="credentialsPolicyBlock" style="display:none; margin-top:8px; margin-left:24px;">
+          <label style="display:flex; align-items:center; gap:8px; cursor:pointer; font-weight:normal;">
+            <input type="radio" name="credentialsSpacePolicy" value="preconfigured" checked>
+            Only credentials already allowed in this space<span id="credentialsCount" style="color:var(--muted);"></span>
+          </label>
+          <label style="display:flex; align-items:center; gap:8px; cursor:pointer; font-weight:normal; margin-top:4px;">
+            <input type="radio" name="credentialsSpacePolicy" value="authorize" id="credentialsAuthorizeRadio">
+            Also authorize this space when a credential needs it<span id="credentialsAdminNote" style="color:var(--muted);"></span>
+          </label>
+          <div class="hint">"Authorize" edits the credential's allowed-spaces list in Torque (the secret is never read or rewritten). Torque records the change in its audit log.</div>
+          <div id="credentialsWarning" class="hint" style="display:none; color:#b45309;"></div>
+        </div>
+      </div>
       <div id="confirmError" class="error" style="margin-top:12px;"></div>
       <div class="btn-row">
         <button class="btn-cancel" onclick="doCancel()">Cancel</button>
@@ -1153,6 +1172,12 @@ function showConfirm() {
   // Expose values toggle: default unchecked (opt-in)
   document.getElementById('exposeValuesToggle').checked = false;
 
+  // Credentials: default off (opt-in), policy defaults to the non-mutating one
+  document.getElementById('credentialsEnabledToggle').checked = false;
+  document.getElementById('credentialsPolicyBlock').style.display = 'none';
+  document.querySelector('input[name="credentialsSpacePolicy"][value="preconfigured"]').checked = true;
+  loadCredentialAvailability();
+
   // Extract and show proxy init commands
   state.initCommands = extractProxyEnvVars(state.agentData);
   const preview = document.getElementById('initCommandsPreview');
@@ -1163,6 +1188,47 @@ function showConfirm() {
   } else {
     initInput.value = '';
     preview.style.display = '';
+  }
+}
+
+function onCredentialsToggle() {
+  const on = document.getElementById('credentialsEnabledToggle').checked;
+  document.getElementById('credentialsPolicyBlock').style.display = on ? '' : 'none';
+}
+
+// How many credentials the chosen space can already use, and whether this token could
+// widen a credential's allowed spaces. A space with none — which is the normal case for
+// the dedicated space the setup flow creates — makes 'preconfigured' a dead end, so say so
+// rather than letting the user find out on their first call.
+async function loadCredentialAvailability() {
+  const countEl = document.getElementById('credentialsCount');
+  const adminEl = document.getElementById('credentialsAdminNote');
+  const warnEl = document.getElementById('credentialsWarning');
+  const authorizeRadio = document.getElementById('credentialsAuthorizeRadio');
+  countEl.textContent = '';
+  adminEl.textContent = '';
+  warnEl.style.display = 'none';
+  authorizeRadio.disabled = false;
+  try {
+    const resp = await fetch(BASE_PATH + '/api/spaces/' + encodeURIComponent(state.space) + '/credentials', {
+      headers: {"Authorization": "Bearer " + state.shortToken},
+    });
+    const data = await resp.json().catch(() => null);
+    if (!resp.ok || !data) return;
+
+    if (typeof data.count === 'number') {
+      countEl.textContent = ' — ' + data.count + ' available';
+      if (data.count === 0) {
+        warnEl.textContent = 'This space has no credentials available. Choose "Also authorize this space", or go back and pick a space that already has some.';
+        warnEl.style.display = '';
+      }
+    }
+    if (!data.can_authorize) {
+      authorizeRadio.disabled = true;
+      adminEl.textContent = ' — needs an account-admin token';
+    }
+  } catch (err) {
+    // Availability is advisory; setup must still be completable without it.
   }
 }
 
@@ -1257,6 +1323,8 @@ async function saveAndFinish() {
         init_commands: document.getElementById('initCommandsInput').value.trim() || undefined,
         set_as_default: document.getElementById('setDefaultToggle').checked,
         expose_values: document.getElementById('exposeValuesToggle').checked,
+        credentials_enabled: document.getElementById('credentialsEnabledToggle').checked,
+        credentials_space_policy: (document.querySelector('input[name="credentialsSpacePolicy"]:checked') || {}).value || 'preconfigured',
       }),
     });
     const data = await resp.json().catch(() => null);

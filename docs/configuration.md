@@ -93,6 +93,8 @@ These can appear at the top level and/or inside any profile:
 | `retry_budget_seconds` | Max consecutive outage tolerated while polling/monitoring, in seconds (default `600`, sized for a ~10-min Torque redeploy) |
 | `create_retry_budget_seconds` | Budget for idempotent environment create + reconcile, in seconds (default `600`) |
 | `retry_max_backoff_seconds` | Exponential-backoff cap between retries, in seconds (default `15`) |
+| `credentials_enabled` | Allow tools to use credentials stored in the connected Torque account (default `false` — opt in). When off, `list_credentials` and the `credential` parameter refuse. See [design-credentials.md](design-credentials.md). |
+| `credentials_space_policy` | What to do when a requested credential isn't allowed in this profile's space: `preconfigured` (default) fails and names the spaces where it *is* allowed; `authorize` adds this space to the credential's allowed list and proceeds (requires account admin, and Torque audits the change). |
 
 > **Note:** `torque_token` is assumed to belong to a Torque user with **account-admin-level
 > permissions** — the interactive `setup` flow uses account-level endpoints that require it.

@@ -37,6 +37,10 @@ CONFIG_KEY_MAP = {
     "retry_budget_seconds": "retry_budget_seconds",
     "create_retry_budget_seconds": "create_retry_budget_seconds",
     "retry_max_backoff_seconds": "retry_max_backoff_seconds",
+    # Credentials. Ordinary config values, deliberately NOT profile metadata like
+    # expose_values: they must inherit through `extends` and be overridable per profile.
+    "credentials_enabled": "credentials_enabled",
+    "credentials_space_policy": "credentials_space_policy",
 }
 
 # Profile YAML keys → MCP tool argument names (for injection into tool arguments)

@@ -21,6 +21,12 @@ import httpx
 # src/torque_tunnel/torque_client.py -> ../../.. -> project root -> /blueprints
 _BLUEPRINTS_DIR = Path(__file__).resolve().parent.parent.parent / "blueprints"
 
+# Anchor lines in the executor blueprints, replaced (or dropped) at load time so the
+# credential input and `authentication` block are present only when one is requested.
+# See _apply_credential_anchors and docs/design-credentials.md §2.
+_CREDENTIAL_INPUT_ANCHOR = "# __TT_CREDENTIAL_INPUT__"
+_CREDENTIAL_AUTH_ANCHOR = "# __TT_CREDENTIAL_AUTH__"
+
 
 # --- Resilience: transient-error classification ---------------------------------
 # Status codes we treat as transient (worth retrying). Per design decision we retry
@@ -119,6 +125,112 @@ def build_environment_name(kind: str, description: Optional[str], key: str) -> s
     return f"tunneled-{kind}-{key}"
 
 
+def _encode_credential_context(context: Optional[dict]) -> str:
+    """Encode the grain's credential context the same way the command payloads are.
+
+    Returns "" when there is no credential, which the blueprint treats as "no credential
+    attached" (the redaction filter degrades to `cat`). The context holds variable names
+    and non-secret values only - see credentials.build_context.
+    """
+    if not context:
+        return ""
+    import json as _json
+
+    raw = _json.dumps(context, separators=(",", ":")).encode("utf-8")
+    return base64.b64encode(gzip.compress(raw)).decode("ascii")
+
+
+#: Marker the discovery grains print their result on. Environment-level outputs are only
+#: published once the WHOLE environment settles, so one wedged runner would hide every other
+#: grain's result; the per-grain deploy log is readable as soon as that grain finishes.
+#: Assembled from two halves at runtime so the literal never appears in the echoed script
+#: source, which would otherwise match the parser.
+_DISCOVERY_MARKER = "TORQUE_TUNNEL::VARS="
+
+#: What every discovery grain runs. `compgen -e` lists exported variable NAMES, never
+#: values, so the result is safe to print and to keep.
+_DISCOVERY_GRAIN_COMMAND = (
+    "__M=\"TORQUE_TUNNEL\"\"::VARS=\"\n"
+    "printf '%s%s\\n' \"$__M\" \"$(compgen -e | sort | tr '\\n' ' ')\"\n"
+    "export env_names=\"$(compgen -e | sort | tr '\\n' ' ')\"\n"
+)
+
+#: Bash sets these itself in every grain, so they are not evidence of anything. They cancel
+#: in the baseline subtraction anyway; listing them makes that independent of grain layout.
+_SHELL_INTRINSIC_VARS = frozenset({"PWD", "OLDPWD", "SHLVL", "_"})
+
+#: How many discovery grains may deploy at once. An agent's runner pool is finite - eight
+#: simultaneous grains left two stuck in Preparation on a live agent - so the type grains
+#: are chained into waves of this size instead of all being launched together.
+DISCOVERY_MAX_PARALLEL_GRAINS = 4
+
+#: Discovery runs in waves and each wave needs a runner, so the ceiling has to allow for
+#: several rounds of runner allocation on a busy agent.
+DISCOVERY_TIMEOUT_SECONDS = 900
+
+#: Stop waiting early once no grain has changed state for this long and both baselines are
+#: in. A runner wedged in Preparation would otherwise cost the whole timeout for a result
+#: that is already as complete as it is going to get.
+DISCOVERY_STALL_SECONDS = 90
+
+
+def _interpret_discovery_outputs(
+    outputs: dict, slugs: dict[str, str], grain_states: Optional[dict] = None
+) -> dict[str, dict]:
+    """Turn a discovery environment's outputs into per-type cache entries.
+
+    **Only successful measurements are returned.** A grain that produced nothing is omitted,
+    so its type stays unmeasured and is retried later.
+
+    It is tempting to read a failed grain as "Torque has no env-var creator for this type",
+    since that is exactly how such a type behaves - it dies in Preparation. But a runner
+    that wedges on a busy agent fails the same way, and this result is cached *permanently*:
+    a single infrastructure hiccup would brand a working credential type unusable until
+    someone thought to run force_rediscover. Observed live - `vsphere__basic`, used
+    successfully all session, was recorded `unsupported` after its grain wedged.
+
+    Types Torque genuinely cannot inject are covered by the seed instead, which is
+    knowledge rather than inference.
+    """
+    from . import credentials as creds
+
+    def names(value) -> Optional[set]:
+        if not isinstance(value, str):
+            return None
+        text = value.strip()
+        if not text or "{{" in text:
+            return None  # unresolved template => the grain produced nothing
+        return set(text.split())
+
+    base_a = names(outputs.get("baseline_a"))
+    base_b = names(outputs.get("baseline_b"))
+    if base_a is None or base_b is None:
+        raise RuntimeError(
+            "Credential discovery failed: the baseline grains produced no output, so the "
+            "measurement has nothing to subtract against."
+        )
+    baseline = (base_a & base_b) | _SHELL_INTRINSIC_VARS
+
+    result: dict[str, dict] = {}
+    for ctype, slug in slugs.items():
+        measured = names(outputs.get(slug))
+        if measured is None:
+            continue  # nothing measured - retry later rather than cache a guess
+        injected = sorted(measured - baseline)
+        # MGMT_SERVER_*/API_TOKEN are injected per-operation by Torque itself, not by the
+        # credential, so they can show up on one side of the subtraction. They are never
+        # part of a credential's variable set.
+        injected = [
+            v for v in injected
+            if not v.startswith(creds.MGMT_SERVER_PREFIX) and v not in creds.NEVER_FORWARD
+        ]
+        result[ctype] = {
+            "status": creds.STATUS_OK if injected else creds.STATUS_NO_ENV_VARS,
+            "vars": injected,
+        }
+    return result
+
+
 @dataclass
 class EnvironmentResult:
     """Result of an environment execution."""
@@ -138,18 +250,59 @@ class TorqueClient:
     PERSISTENT_CONTAINER_BLUEPRINT = "persistent-container"
     
     @staticmethod
-    def _load_standalone_blueprint(blueprint_name: str) -> str:
+    def _apply_credential_anchors(yaml_content: str, with_credential: bool) -> str:
+        """Fill in or strip the two credential anchor lines in an executor blueprint.
+
+        Torque rejects an `authentication` entry that resolves to empty, and a
+        `type: credentials` input cannot be optional (verified: no value, a blank-allowing
+        pattern, and an explicit "" are all rejected at launch). So both the input and the
+        `authentication` block have to be present-or-absent rather than filled-or-blank.
+
+        Plain text substitution of the anchor line, deliberately not a YAML round-trip: these
+        blueprints carry several hundred lines of shell in block scalars, and reserialising
+        them risks changing whitespace the scripts depend on.
+        """
+        input_block = (
+            "  credential:\n"
+            "    type: credentials\n"
+            "    description: Torque credential whose secrets Torque injects into the grain "
+            "as environment variables. Never leaves the agent."
+        )
+        auth_block = (
+            "      authentication:\n"
+            "        - '{{ .inputs.credential }}'"
+        )
+        replacements = {
+            _CREDENTIAL_INPUT_ANCHOR: input_block if with_credential else None,
+            _CREDENTIAL_AUTH_ANCHOR: auth_block if with_credential else None,
+        }
+
+        out_lines = []
+        for line in yaml_content.split("\n"):
+            stripped = line.strip()
+            if stripped in replacements:
+                block = replacements[stripped]
+                if block is not None:
+                    out_lines.append(block)
+                # else: drop the anchor line entirely
+                continue
+            out_lines.append(line)
+        return "\n".join(out_lines)
+
+    @classmethod
+    def _load_standalone_blueprint(cls, blueprint_name: str, with_credential: bool = False) -> str:
         """Load a blueprint YAML from the blueprints directory and return base64-encoded content.
-        
+
         This enables 'standalone blueprint' mode: the full YAML is sent inline with
         the API request, so users don't need to add the GitHub repo to their Torque space.
-        
+
         Args:
             blueprint_name: Name of the blueprint (without .yaml extension)
-            
+            with_credential: Emit the credential input and `authentication` block
+
         Returns:
             Base64-encoded blueprint YAML content
-            
+
         Raises:
             FileNotFoundError: If the blueprint file doesn't exist
         """
@@ -160,6 +313,7 @@ class TorqueClient:
                 f"Expected blueprints directory at: {_BLUEPRINTS_DIR}"
             )
         yaml_content = blueprint_path.read_text(encoding="utf-8")
+        yaml_content = cls._apply_credential_anchors(yaml_content, with_credential)
         return base64.b64encode(yaml_content.encode("utf-8")).decode("ascii")
     
     def __init__(
@@ -401,6 +555,8 @@ class TorqueClient:
         command_description: Optional[str] = None,
         environment_kind: str = "ssh",
         parent_env_id: Optional[str] = None,
+        credential_name: Optional[str] = None,
+        credential_context: Optional[dict] = None,
     ) -> str:
         """
         Start a new environment to execute remote command.
@@ -461,7 +617,12 @@ class TorqueClient:
             "ssh_password": ssh_password or "",
             "command_b64": base64.b64encode(gzip.compress(command.encode())).decode(),
             "timeout_minutes": str(timeout_minutes),
+            # Always sent (possibly empty), like the ssh_private_key/ssh_password pair:
+            # an input declared with `default: ""` accepts "" but must still be present.
+            "credential_context_b64": _encode_credential_context(credential_context),
         }
+        if credential_name:
+            inputs["credential"] = credential_name
         # Only include optional inputs if they have values
         # All b64 inputs are gzip-compressed before base64 encoding to reduce payload size.
         # The blueprints decode with: base64 -d | gzip -d
@@ -481,7 +642,9 @@ class TorqueClient:
             "inputs": inputs,
             "labels": self._build_labels(key, parent_env_id),
             # Standalone blueprint: send YAML inline so no GitHub repo is needed
-            "base64_standalone_blueprint": self._load_standalone_blueprint(self.BLUEPRINT_NAME),
+            "base64_standalone_blueprint": self._load_standalone_blueprint(
+                self.BLUEPRINT_NAME, with_credential=bool(credential_name)
+            ),
         }
 
         return await self._create_environment_idempotent(payload, key)
@@ -503,6 +666,8 @@ class TorqueClient:
         timeout: Optional[int] = None,
         download_commands: Optional[str] = None,
         command_description: Optional[str] = None,
+        credential_name: Optional[str] = None,
+        credential_context: Optional[dict] = None,
     ) -> str:
         """
         Start a new environment to execute command locally on the agent container.
@@ -549,7 +714,10 @@ class TorqueClient:
             "agent": agent_name,
             "command_b64": base64.b64encode(gzip.compress(command.encode())).decode(),
             "timeout_minutes": str(timeout_minutes),
+            "credential_context_b64": _encode_credential_context(credential_context),
         }
+        if credential_name:
+            inputs["credential"] = credential_name
         # Only include optional inputs if they have values
         # All b64 inputs are gzip-compressed before base64 encoding to reduce payload size.
         # The blueprints decode with: base64 -d | gzip -d
@@ -567,7 +735,9 @@ class TorqueClient:
             "inputs": inputs,
             "labels": self._build_labels(key),
             # Standalone blueprint: send YAML inline so no GitHub repo is needed
-            "base64_standalone_blueprint": self._load_standalone_blueprint(self.LOCAL_BLUEPRINT_NAME),
+            "base64_standalone_blueprint": self._load_standalone_blueprint(
+                self.LOCAL_BLUEPRINT_NAME, with_credential=bool(credential_name)
+            ),
         }
 
         return await self._create_environment_idempotent(payload, key)
@@ -1031,6 +1201,341 @@ class TorqueClient:
             # Still launching/deploying - wait and poll again
             await asyncio.sleep(self.poll_interval)
     
+    # --- Credentials ------------------------------------------------------------
+
+    async def fetch_credentials(self) -> list[dict]:
+        """Every credential usable in this client's space, raw as Torque returns it.
+
+        Uses the two space-scoped endpoints, both of which need only `Policy.SpaceAccess`:
+
+        * `.../credentialstore/overridden_values` - account credentials already filtered to
+          this space (the account-level list would need `Account.ManageCredentials`),
+        * `.../credentialstore` - credentials defined in the space itself.
+
+        Secret fields come back as null and descriptive ones populated, which is what lets
+        redaction work without a per-type table of which field is secret.
+        """
+        results: list[dict] = []
+        seen: set[str] = set()
+
+        for url in (
+            f"/spaces/{self.space}/settings/credentialstore/overridden_values",
+            f"/spaces/{self.space}/settings/credentialstore",
+        ):
+            try:
+                response = await self._request_with_retry("GET", url)
+                response.raise_for_status()
+                items = response.json()
+            except httpx.HTTPStatusError as e:
+                # A space with no space-level credentials 404s on the second endpoint;
+                # that is not an error, just an empty set.
+                if e.response is not None and e.response.status_code == 404:
+                    continue
+                raise
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                name = (item or {}).get("name")
+                if not name or name.lower() in seen:
+                    continue
+                seen.add(name.lower())
+                results.append(item)
+
+        return results
+
+    async def fetch_account_credentials(self) -> Optional[list[dict]]:
+        """Every credential in the account, including ones not allowed in this space.
+
+        The space-scoped listing deliberately hides credentials this space may not use, so
+        without this a credential restricted to other spaces is indistinguishable from one
+        that does not exist - and the `authorize` policy could never find it to widen it.
+
+        Needs `Account.ManageCredentials`, the same capability `authorize` needs. Returns
+        None when the token does not have it, so callers can fall back rather than fail.
+        """
+        try:
+            response = await self._request_with_retry("GET", "/settings/credentialstore")
+            response.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            if e.response is not None and e.response.status_code in (401, 403, 404):
+                return None
+            raise
+        except httpx.HTTPError:
+            return None
+        items = response.json()
+        return items if isinstance(items, list) else None
+
+    async def authorize_credential_for_space(self, credential_name: str, allowed_space_names: list[str]) -> None:
+        """Add this client's space to a credential's allowed spaces.
+
+        Safe without knowing the secret: the update validator skips validation when
+        `credential_data` is null and `UpdateCredentialBase` uses `request.X ?? credential.X`
+        throughout, so a minimal body preserves the secret, description, cloud identifier and
+        scopes. The list is read-modify-written - never sent partially - because Torque
+        replaces the array wholesale and drops space overrides absent from it.
+
+        Requires `Account.ManageCredentials`; the write is audited on Torque's side.
+        """
+        merged = list(allowed_space_names)
+        if not any(s.lower() == self.space.lower() for s in merged):
+            merged.append(self.space)
+        response = await self._request_with_retry(
+            "PUT",
+            f"/settings/credentialstore/{credential_name}",
+            json={"allowed_space_names": merged},
+        )
+        response.raise_for_status()
+
+    def _build_discovery_blueprint(
+        self, type_to_credential: dict[str, str]
+    ) -> tuple[str, dict[str, str]]:
+        """A blueprint that measures which variables each credential type injects.
+
+        Two baseline grains and one grain per type, none with `depends-on` so they all
+        deploy concurrently. A type's variables are `names_i - (baseline_a ∩ baseline_b)`:
+        the two baselines cancel out everything the agent contributes on its own - the
+        compute service's configured variables and the members `BaseShellStepper` expands
+        out of RUNNER_INPUTS - neither of which torque-tunnel can enumerate.
+
+        One grain per type so a type whose grain dies (an unsupported type we have not seen
+        before) fails alone and the rest still report.
+        """
+        import json as _json
+
+        def grain(name: str, credential_input: Optional[str],
+                  depends_on: Optional[str] = None) -> str:
+            auth = ""
+            if credential_input:
+                auth = (
+                    "      authentication:\n"
+                    f"        - '{{{{ .inputs.{credential_input} }}}}'\n"
+                )
+            dep = f"    depends-on: {depends_on}\n" if depends_on else ""
+            return (
+                f"  {name}:\n"
+                "    kind: shell\n"
+                f"{dep}"
+                "    spec:\n"
+                "      agent:\n"
+                "        name: '{{ .inputs.agent }}'\n"
+                f"{auth}"
+                "      activities:\n"
+                "        deploy:\n"
+                "          commands:\n"
+                "            - name: probe\n"
+                "              command: |\n"
+                "                # Names only - never values. Safe to surface anywhere.\n"
+                + "".join(
+                    f"                {line}\n"
+                    for line in _DISCOVERY_GRAIN_COMMAND.strip().split("\n")
+                )
+                + "              outputs:\n"
+                "                - env_names\n"
+            )
+
+        # Grain and input names must be YAML-safe; credential type strings are not.
+        slugs = {ctype: f"t{i}" for i, ctype in enumerate(sorted(type_to_credential))}
+
+        inputs = [
+            "inputs:\n",
+            "  agent:\n    type: agent\n    description: Agent to probe on\n",
+        ]
+        grains = [
+            "grains:\n",
+            grain("baseline_a", None),
+            grain("baseline_b", None),
+        ]
+        outputs = [
+            "outputs:\n",
+            "  baseline_a:\n    value: '{{ .grains.baseline_a.activities.deploy.commands.probe.outputs.env_names }}'\n",
+            "  baseline_b:\n    value: '{{ .grains.baseline_b.activities.deploy.commands.probe.outputs.env_names }}'\n",
+        ]
+
+        # Grains without depends-on all deploy at once, and an agent has a bounded runner
+        # pool - eight at once left two wedged in Preparation on a live agent. So the type
+        # grains run in waves: each wave depends on the previous one, capping how many
+        # runners are asked for simultaneously. The baselines sit in the first wave, where
+        # contention is lowest, because a missing baseline invalidates the whole run.
+        wave_size = max(1, DISCOVERY_MAX_PARALLEL_GRAINS - 2)
+        ordered = list(slugs.items())
+        for index, (ctype, slug) in enumerate(ordered):
+            inputs.append(
+                f"  {slug}:\n    type: credentials\n"
+                f"    description: A credential of type {ctype}\n"
+            )
+            wave = index // wave_size
+            depends_on = ordered[(wave - 1) * wave_size][1] if wave > 0 else None
+            grains.append(grain(slug, slug, depends_on))
+            outputs.append(
+                f"  {slug}:\n    value: '{{{{ .grains.{slug}.activities.deploy.commands.probe.outputs.env_names }}}}'\n"
+            )
+
+        yaml_text = (
+            "spec_version: 2\n"
+            "description: |\n"
+            "  torque-tunnel credential discovery. Records which environment VARIABLE NAMES\n"
+            "  each credential type injects, so commands can use them and their values can be\n"
+            "  redacted from output. Prints names only - never values.\n"
+            + "".join(inputs)
+            + "".join(outputs)
+            + "".join(grains)
+        )
+        return yaml_text, slugs
+
+    async def discover_credential_types(
+        self,
+        type_to_credential: dict[str, str],
+        agent: Optional[str] = None,
+        timeout_seconds: int = DISCOVERY_TIMEOUT_SECONDS,
+    ) -> dict[str, dict]:
+        """Measure the variables each credential type injects, on this account's agent.
+
+        Returns `{credential_type: {"status": ..., "vars": [...]}}`. A type whose grain
+        failed comes back as `unsupported`, which is how a credential type Torque cannot
+        inject is learned rather than retried forever.
+        """
+        if not type_to_credential:
+            return {}
+        agent_name = agent or self.default_agent
+        if not agent_name:
+            raise ValueError(
+                "Credential discovery needs an agent, and no agent is configured for this "
+                "profile."
+            )
+
+        yaml_text, slugs = self._build_discovery_blueprint(type_to_credential)
+
+        key = generate_idempotency_key()
+        inputs = {"agent": agent_name}
+        for ctype, slug in slugs.items():
+            inputs[slug] = type_to_credential[ctype]
+
+        payload = {
+            "blueprint_name": "torque-tunnel-credential-discovery",
+            "environment_name": build_environment_name("credential-discovery", None, key),
+            "duration": "PT1H",
+            "inputs": inputs,
+            "labels": self._build_labels(key),
+            "base64_standalone_blueprint": base64.b64encode(
+                yaml_text.encode("utf-8")
+            ).decode("ascii"),
+        }
+
+        env_id = await self._create_environment_idempotent(payload, key)
+        try:
+            await self._wait_for_discovery(env_id, timeout_seconds)
+            env_data = await self.get_environment_status(env_id)
+            grains = env_data.get("details", {}).get("state", {}).get("grains", [])
+            grain_states = {
+                g.get("name"): (g.get("state") or {}).get("current_state") for g in grains
+            }
+            # Environment-level outputs are only published once the WHOLE environment
+            # settles, so one wedged runner would hide every finished grain's result. Each
+            # grain's own deploy log is readable as soon as that grain finishes, so it comes
+            # first and the environment outputs are only a fallback.
+            outputs = dict(self._extract_outputs(env_data))
+            for g in grains:
+                name = g.get("name")
+                if not name or outputs.get(name):
+                    continue
+                measured = await self._read_discovery_marker(g)
+                if measured is not None:
+                    outputs[name] = measured
+            return _interpret_discovery_outputs(outputs, slugs, grain_states)
+        finally:
+            # Release rather than end: a probe environment has nothing to tear down, and
+            # release works in transitional states where end returns 409 - which is exactly
+            # the state a timed-out probe is in, so ending it would leak it.
+            try:
+                await self.release_environment(env_id, force=True)
+            except Exception:
+                try:
+                    await self.end_environment(env_id, force=True)
+                except Exception:
+                    pass  # a leaked probe environment is untidy, not incorrect
+
+    async def _read_discovery_marker(self, grain: dict) -> Optional[str]:
+        """The variable names a discovery grain printed, from that grain's own deploy log.
+
+        Returns None when the grain has no log yet, or never got as far as printing.
+        """
+        for stage in (grain.get("state") or {}).get("stages", []) or []:
+            for activity in stage.get("activities", []) or []:
+                log_url = activity.get("log")
+                if not log_url:
+                    continue
+                if log_url.startswith("/api/"):
+                    log_url = log_url[4:]
+                try:
+                    response = await self._client.get(log_url)
+                    if response.status_code != 200:
+                        continue
+                    text = response.text
+                except httpx.HTTPError:
+                    continue
+                for line in text.splitlines():
+                    idx = line.find(_DISCOVERY_MARKER)
+                    if idx >= 0:
+                        return line[idx + len(_DISCOVERY_MARKER):].strip()
+        return None
+
+    async def _wait_for_discovery(self, environment_id: str, timeout_seconds: int) -> bool:
+        """Wait until the discovery environment settles. True if it did, False on timeout.
+
+        `Active With Error` is a normal, useful outcome here: it means one grain failed -
+        typically a credential type Torque cannot inject - while the others reported.
+
+        A timeout is NOT an error either. Runners occasionally wedge in Preparation on a
+        busy agent, and whatever the other grains measured is still worth keeping, so the
+        caller reads the partial result rather than throwing it away.
+        """
+        deadline = time.monotonic() + timeout_seconds
+        terminal = {"active", "active with error", "ended", "failed", "terminated",
+                    "ended with error", "force_terminated", "inactive"}
+        last_signature = None
+        last_change = time.monotonic()
+        while True:
+            env_data = await self.get_environment_status(environment_id, retry=False)
+            status = (env_data.get("details", {}).get("computed_status") or "").lower()
+            if status in terminal:
+                return True
+
+            # A wedged runner would otherwise cost the full timeout. Once nothing has moved
+            # for a while and both baselines are in, the rest is not coming - take what the
+            # finished grains measured instead of waiting out the deadline.
+            grains = env_data.get("details", {}).get("state", {}).get("grains", [])
+            states = {
+                g.get("name"): ((g.get("state") or {}).get("current_state") or "").lower()
+                for g in grains
+            }
+            signature = tuple(sorted(states.items()))
+            if signature != last_signature:
+                last_signature, last_change = signature, time.monotonic()
+            baselines_done = all(
+                states.get(name) in ("deployed", "deployfailed")
+                for name in ("baseline_a", "baseline_b")
+            )
+            if baselines_done and time.monotonic() - last_change > DISCOVERY_STALL_SECONDS:
+                stuck = [n for n, st in states.items()
+                         if st not in ("deployed", "deployfailed")]
+                print(
+                    f"[torque-tunnel] Credential discovery stalled on {', '.join(stuck)} "
+                    f"for {DISCOVERY_STALL_SECONDS}s; keeping what the other grains "
+                    f"measured.",
+                    file=sys.stderr, flush=True,
+                )
+                return False
+
+            if time.monotonic() > deadline:
+                print(
+                    f"[torque-tunnel] Credential discovery environment {environment_id} did "
+                    f"not settle within {timeout_seconds}s (status '{status}'); keeping "
+                    f"whatever the finished grains measured.",
+                    file=sys.stderr, flush=True,
+                )
+                return False
+            await asyncio.sleep(self.poll_interval)
+
     def _extract_outputs(self, env_data: dict) -> dict:
         """Extract outputs from environment data.
         
@@ -1079,6 +1584,8 @@ class TorqueClient:
         command_description: Optional[str] = None,
         environment_kind: str = "ssh",
         parent_env_id: Optional[str] = None,
+        credential_name: Optional[str] = None,
+        credential_context: Optional[dict] = None,
     ) -> EnvironmentResult:
         """
         Execute a remote command and wait for result.
@@ -1126,6 +1633,8 @@ class TorqueClient:
             command_description=command_description,
             environment_kind=environment_kind,
             parent_env_id=parent_env_id,
+            credential_name=credential_name,
+            credential_context=credential_context,
         )
         
         result = None
@@ -1157,6 +1666,8 @@ class TorqueClient:
         init_commands: Optional[str] = None,
         download_commands: Optional[str] = None,
         command_description: Optional[str] = None,
+        credential_name: Optional[str] = None,
+        credential_context: Optional[dict] = None,
     ) -> EnvironmentResult:
         """
         Execute a command locally on the Torque agent container.
@@ -1186,6 +1697,8 @@ class TorqueClient:
             init_commands=init_commands,
             download_commands=download_commands,
             command_description=command_description,
+            credential_name=credential_name,
+            credential_context=credential_context,
         )
         
         result = None

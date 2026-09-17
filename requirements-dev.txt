@@ -7,3 +7,8 @@
 pytest>=8.2
 pytest-asyncio>=0.23
 hypothesis>=6.100
+
+# Static-analysis gate (tests/test_static_analysis.py). Scope-aware, so it catches an
+# undefined name in one function even when another function defines that name - the
+# exact shape of the `cfg` regression a flat AST walk would miss.
+pyflakes>=3.2
