@@ -16,6 +16,7 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 from torque_tunnel import croc_manager
+from torque_tunnel import mcp_tool
 from torque_tunnel.mcp_tool import (
     FileDeploymentPlan,
     prepare_files_with_croc,
@@ -365,9 +366,291 @@ class TestExecuteWithCroc:
             result = await execute_with_croc(plan)
             
             mock_ensure.assert_called_once()
-            mock_start.assert_called_once_with(
-                croc_path=mock_path,
-                code="test-code",
-                files=["file1.txt"],
-            )
+            mock_start.assert_called_once()
+            kwargs = mock_start.call_args.kwargs
+            assert kwargs["croc_path"] == mock_path
+            assert kwargs["code"] == "test-code"
+            assert kwargs["files"] == ["file1.txt"]
             assert result is mock_process
+
+    @pytest.mark.asyncio
+    async def test_sends_on_the_relay_pinned_by_the_plan(self):
+        plan = FileDeploymentPlan(
+            needs_croc=True,
+            croc_code="test-code",
+            croc_local_files=["file1.txt"],
+            croc_relay="relay.internal:9009",
+            croc_relay_password="s3kr1t",
+            croc_transfers=1,
+        )
+        with mock.patch.object(croc_manager, "ensure_local_croc",
+                               new_callable=mock.AsyncMock, return_value=Path("/usr/bin/croc")), \
+             mock.patch.object(croc_manager, "start_croc_send",
+                               new_callable=mock.AsyncMock) as mock_start:
+            await execute_with_croc(plan)
+
+        kwargs = mock_start.call_args.kwargs
+        assert kwargs["relay"] == "relay.internal:9009"
+        assert kwargs["relay_password"] == "s3kr1t"
+        assert kwargs["transfers"] == 1
+
+
+class TestRelayConfigReachesBothSides:
+    """Sender and receiver must agree on the relay, or the transfer silently hangs."""
+
+    def _big_file(self, temp_dir):
+        path = os.path.join(temp_dir, "big.bin")
+        create_file_of_size(path, 500_000, compressible=False)
+        return path
+
+    def test_configured_relay_lands_in_the_receive_commands(self, temp_dir):
+        overrides = {
+            "croc_relay": "relay.internal:9009",
+            "croc_relay_password": "s3kr1t",
+            "croc_transfers": 1,
+        }
+        with mock.patch.dict(mcp_tool._config, overrides):
+            plan = prepare_files_with_croc([{
+                "remote_destination_path": "/tmp/big.bin",
+                "local_source_path": self._big_file(temp_dir),
+            }])
+        try:
+            assert plan.needs_croc
+            assert plan.croc_relay == "relay.internal:9009"
+            assert plan.croc_relay_password == "s3kr1t"
+            assert plan.croc_transfers == 1
+            assert "--relay relay.internal:9009" in plan.croc_init_commands
+            assert "CROC_PASS=" in plan.croc_init_commands
+        finally:
+            shutil.rmtree(plan.croc_staging_dir, ignore_errors=True)
+
+    def test_unset_relay_means_crocs_public_one(self, temp_dir):
+        with mock.patch.dict(mcp_tool._config,
+                             {"croc_relay": None, "croc_relay_password": None,
+                              "croc_transfers": None}):
+            plan = prepare_files_with_croc([{
+                "remote_destination_path": "/tmp/big.bin",
+                "local_source_path": self._big_file(temp_dir),
+            }])
+        try:
+            assert plan.croc_relay == ""
+            assert plan.croc_transfers is None
+            assert "--relay" not in plan.croc_init_commands
+            assert "CROC_PASS" not in plan.croc_init_commands
+        finally:
+            shutil.rmtree(plan.croc_staging_dir, ignore_errors=True)
+
+    @pytest.mark.asyncio
+    async def test_a_config_reload_mid_transfer_cannot_split_the_two_sides(self, temp_dir):
+        """The config is hot-reloaded every 2s; the local send starts after the
+        receive commands are already generated. Re-reading the config there would
+        put the two ends on different relays and hang the transfer."""
+        with mock.patch.dict(mcp_tool._config, {"croc_relay": "relay-a:9009"}):
+            plan = prepare_files_with_croc([{
+                "remote_destination_path": "/tmp/big.bin",
+                "local_source_path": self._big_file(temp_dir),
+            }])
+
+        try:
+            assert "--relay relay-a:9009" in plan.croc_init_commands
+
+            # Config changes before the local sender starts.
+            with mock.patch.dict(mcp_tool._config, {"croc_relay": "relay-b:9009"}), \
+                 mock.patch.object(croc_manager, "ensure_local_croc",
+                                   new_callable=mock.AsyncMock,
+                                   return_value=Path("/usr/bin/croc")), \
+                 mock.patch.object(croc_manager, "start_croc_send",
+                                   new_callable=mock.AsyncMock) as mock_start:
+                await execute_with_croc(plan)
+
+            assert mock_start.call_args.kwargs["relay"] == "relay-a:9009"
+        finally:
+            shutil.rmtree(plan.croc_staging_dir, ignore_errors=True)
+
+
+# ============================================================================
+# Inline-vs-croc decision must not load the file into memory
+# ============================================================================
+
+class TestThresholdDecisionIsStreamed:
+    """The decision used to be made by ``gzip.compress(open(p,'rb').read())``.
+
+    That held the whole file plus its compressed copy in RAM just to compare the
+    result against 300 KB: ~2.5 GB for a 1.27 GB upload and ~31 GB (i.e.
+    MemoryError) for the 15.7 GB images this tool is meant to move.
+    """
+
+    def _peak_mb(self, fn):
+        import tracemalloc
+        tracemalloc.start()
+        try:
+            result = fn()
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        return result, peak / (1024 * 1024)
+
+    def test_large_incompressible_file_decided_without_loading_it(self, temp_dir):
+        path = os.path.join(temp_dir, "big.bin")
+        create_file_of_size(path, 40 * 1024 * 1024, compressible=False)
+
+        plan, peak_mb = self._peak_mb(lambda: prepare_files_with_croc([
+            {"local_source_path": path, "remote_destination_path": "/tmp/big.bin"}
+        ]))
+        try:
+            assert plan.needs_croc, "40 MB of random data cannot fit inline"
+            assert peak_mb < 8, (
+                f"deciding croc for a 40 MB file held {peak_mb:.1f} MB — the file "
+                f"is being read into memory instead of streamed"
+            )
+        finally:
+            shutil.rmtree(plan.croc_staging_dir, ignore_errors=True)
+
+    def test_large_compressible_file_still_goes_inline(self, temp_dir):
+        """The decision is about COMPRESSED size - that semantic must not change.
+
+        A short-circuit on raw size would push this 8 MB of zeros (which gzips to
+        a few KB) onto the croc path, burning a relay admission for nothing.
+        """
+        path = os.path.join(temp_dir, "zeros.bin")
+        create_file_of_size(path, 8 * 1024 * 1024, compressible=True)
+
+        plan = prepare_files_with_croc([
+            {"local_source_path": path, "remote_destination_path": "/tmp/zeros.bin"}
+        ])
+        try:
+            assert not plan.needs_croc
+            assert not plan.errors
+            assert "/tmp/zeros.bin" in plan.inline_commands
+        finally:
+            shutil.rmtree(plan.croc_staging_dir, ignore_errors=True)
+
+    def test_inline_payload_still_round_trips(self, temp_dir):
+        """Whatever the compression path, the bytes the remote gets must match."""
+        path = os.path.join(temp_dir, "payload.bin")
+        original = os.urandom(50 * 1024)
+        with open(path, "wb") as f:
+            f.write(original)
+
+        specs = [{"local_source_path": path, "remote_destination_path": "/tmp/payload.bin"}]
+        plan = prepare_files_with_croc(specs)
+        assert not plan.needs_croc
+
+        # Pull the base64 gzip blob back out of the generated shell and decode it
+        import re
+        blobs = re.findall(r"echo '([A-Za-z0-9+/=]{40,})'", plan.inline_commands)
+        assert blobs, "expected a base64 payload in the inline commands"
+        assert gzip.decompress(base64.b64decode(blobs[0])) == original
+
+    def test_directory_decision_is_also_streamed(self, temp_dir):
+        src = os.path.join(temp_dir, "tree")
+        os.makedirs(src)
+        for i in range(4):
+            create_file_of_size(os.path.join(src, f"f{i}.bin"), 8 * 1024 * 1024,
+                                compressible=False)
+
+        plan, peak_mb = self._peak_mb(lambda: prepare_files_with_croc([
+            {"local_source_path": src, "remote_destination_path": "/tmp/tree"}
+        ]))
+        try:
+            assert plan.needs_croc
+            assert peak_mb < 8, (
+                f"tarring a 32 MB directory held {peak_mb:.1f} MB in memory"
+            )
+        finally:
+            shutil.rmtree(plan.croc_staging_dir, ignore_errors=True)
+
+    def test_threshold_boundary_is_unchanged(self, temp_dir):
+        """Just under the threshold stays inline; just over switches to croc."""
+        under = os.path.join(temp_dir, "under.bin")
+        create_file_of_size(under, croc_manager.CROC_THRESHOLD_BYTES - 50_000,
+                            compressible=False)
+        over = os.path.join(temp_dir, "over.bin")
+        create_file_of_size(over, croc_manager.CROC_THRESHOLD_BYTES + 50_000,
+                            compressible=False)
+
+        plan_under = prepare_files_with_croc([
+            {"local_source_path": under, "remote_destination_path": "/tmp/u"}])
+        plan_over = prepare_files_with_croc([
+            {"local_source_path": over, "remote_destination_path": "/tmp/o"}])
+        try:
+            assert not plan_under.needs_croc
+            assert plan_over.needs_croc
+        finally:
+            shutil.rmtree(plan_under.croc_staging_dir, ignore_errors=True)
+            shutil.rmtree(plan_over.croc_staging_dir, ignore_errors=True)
+
+
+# ============================================================================
+# The provable size bound (no I/O at all for obviously-too-big payloads)
+# ============================================================================
+
+class TestGzipRatioShortCircuit:
+    """DEFLATE cannot do better than 1032:1, so anything above cap * 1032 needs
+    croc no matter what is in it. A 15.7 GB image must be decided by a stat call,
+    not by gzipping 15.7 GB.
+    """
+
+    def test_oversized_file_is_decided_without_opening_it(self, temp_dir):
+        from torque_tunnel.mcp_tool import compress_file_if_inline, MAX_GZIP_RATIO
+
+        cap = 100
+        path = os.path.join(temp_dir, "big.bin")
+        create_file_of_size(path, cap * MAX_GZIP_RATIO + 1, compressible=True)
+
+        def refuse(*a, **kw):
+            raise AssertionError("the file was opened despite being provably too big")
+
+        with mock.patch("builtins.open", refuse):
+            assert compress_file_if_inline(path, cap) is None
+
+    def test_a_file_at_the_bound_is_still_read(self, temp_dir):
+        """The bound must only skip work it can prove is pointless.
+
+        At exactly cap * 1032 a file could in principle still fit, so the answer
+        has to come from actually compressing it.
+        """
+        from torque_tunnel.mcp_tool import compress_file_if_inline, MAX_GZIP_RATIO
+
+        cap = 4096
+        path = os.path.join(temp_dir, "atbound.bin")
+        create_file_of_size(path, cap * MAX_GZIP_RATIO, compressible=True)
+
+        real_open = open
+        opened = []
+
+        def spy(file, *a, **kw):
+            opened.append(str(file))
+            return real_open(file, *a, **kw)
+
+        with mock.patch("builtins.open", spy):
+            compress_file_if_inline(path, cap)
+
+        assert any(path in o for o in opened), "the file at the bound was not read"
+
+    def test_compressible_file_well_under_the_bound_fits_inline(self, temp_dir):
+        from torque_tunnel.mcp_tool import compress_file_if_inline
+
+        cap = croc_manager.CROC_THRESHOLD_BYTES
+        path = os.path.join(temp_dir, "zeros.bin")
+        create_file_of_size(path, 8 * 1024 * 1024, compressible=True)
+
+        result = compress_file_if_inline(path, cap)
+        assert result is not None
+        assert len(result) <= cap
+        assert gzip.decompress(result) == b"A" * (8 * 1024 * 1024)
+
+    def test_oversized_directory_is_decided_without_taring_it(self, temp_dir):
+        from torque_tunnel.mcp_tool import compress_dir_if_inline, MAX_GZIP_RATIO
+
+        cap = 100
+        src = os.path.join(temp_dir, "tree")
+        os.makedirs(src)
+        create_file_of_size(os.path.join(src, "a.bin"), cap * MAX_GZIP_RATIO + 1,
+                            compressible=True)
+
+        def refuse(*a, **kw):
+            raise AssertionError("the tree was read despite being provably too big")
+
+        with mock.patch("builtins.open", refuse):
+            assert compress_dir_if_inline(src, cap) is None

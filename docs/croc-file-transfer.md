@@ -14,6 +14,19 @@ This threshold was determined empirically:
 - Shell grain hangs at ~450KB payloads
 - 300KB provides a safe margin
 
+The decision is made on **compressed** size, so a large but highly compressible
+file still goes inline. Deciding it never loads the file into memory:
+
+1. `os.path.getsize()` first — DEFLATE cannot beat 1032:1, so anything above
+   `300KB * 1032` (~317 MB) provably cannot fit inline and is routed to croc
+   without reading a byte.
+2. Otherwise the file is gzipped in 1 MB chunks into a buffer that stops storing
+   once it passes 300KB.
+
+Before this, the check was `gzip.compress(open(path).read())` — which held the
+whole file *and* its compressed copy in RAM just to compare against 300KB
+(~2.5 GB for a 1.27 GB upload; a `MemoryError` for a 15.7 GB image).
+
 ### Downloads
 Downloads **always** use croc regardless of file size. There is no inline alternative for downloads since the remote file content cannot be embedded in API responses reliably.
 
@@ -176,6 +189,82 @@ Download results for async executions are stored in `_download_results[environme
 - Filenames and paths are shell-escaped using single-quote escaping
 - SSH credentials (keys, passwords) are handled with proper quoting
 
+## Relay rate limiting
+
+The public relay (`croc.schollz.com`, currently `142.132.189.179:9009`) runs a
+newer croc than the pinned client and enforces an admission limiter the pinned
+client knows nothing about — so the client only ever sees the rejection.
+
+From croc `master`, `src/tcp/defaults.go`:
+
+```go
+DEFAULT_SOURCE_JOIN_LIMIT = 30
+DEFAULT_ROOM_JOIN_LIMIT   = 30
+DEFAULT_JOIN_LIMIT_WINDOW = time.Minute
+```
+
+`canonicalSource()` keys the limiter on the sender's **exact IP** (not a subnet),
+over a rolling 60 seconds. Over the limit, the relay replies with the literal
+string `rate limited` and croc exits 1 after printing:
+
+```
+could not connect to 142.132.189.179:9009: got bad response: rate limited
+```
+
+**Measured 2026-09-17** (laptop, one public IP, sends 3s apart): sends 1-8 from a
+cold window succeeded, the 9th was rejected. One `croc send` therefore costs
+about **four admissions** — the control connection plus the `--transfers`
+parallel streams, all opened when the room is registered, before any receiver
+shows up. That budget is **~7-8 transfers per minute per public IP**, shared by
+every session behind it, and a *failed* attempt spends its admissions too.
+
+This is not size-dependent. A 400KB file is rejected exactly as often as a 30MB
+one; size only decides whether croc is used at all. The symptom looked
+size-dependent only because files under the threshold never touch croc.
+
+### How this is handled
+
+1. **croc's output is captured, not discarded.** `start_croc_send()` sends
+   stdout and stderr to a temp file (not a pipe — nothing drains it while croc
+   runs, and croc's progress output would eventually deadlock on a full pipe
+   buffer, which is why this was `DEVNULL` and why the failure said nothing).
+   The tail is quoted in the `RuntimeError`, scrubbed of the transfer code.
+   `cleanup_croc_send()` removes the file — after the process exits, because
+   Windows will not unlink a file croc still holds open.
+2. **Rate-limited sends retry with backoff** — `CROC_SEND_RATE_LIMIT_BACKOFF_SECONDS`
+   = `(20, 45, 70)`, four attempts in total, the last wait outlasting the relay's
+   rolling minute. Any other failure raises immediately: it would fail the same
+   way on a retry, and a retry would spend admissions for nothing.
+3. **The receiving side retries too.** The limiter applies to the agent
+   container as well, keyed on *its* egress IP — which behind a corporate NAT is
+   shared with everything else on it. `generate_croc_receive_attempt()` wraps the
+   receive in the same bounded loop (`CROC_RECEIVE_RATE_LIMIT_BACKOFF_SECONDS`),
+   retrying only when croc's output contains `rate limited`. Output goes through
+   `tee`, so transfer progress is still streamed live while the loop keeps a copy
+   to grep; the exit code travels through a small file because a pipeline would
+   swallow it and `PIPESTATUS` is not portable to a plain `sh` grain. Without
+   this, one rejection failed the whole upload with nothing but
+   `croc file receive failed (exit code: 1)`.
+4. **The relay is configurable** — see `croc_relay` in
+   [configuration.md](configuration.md). A private relay (`croc relay` on any host
+   both sides can reach) has its own budget and is the real fix for heavy use.
+5. **`croc_transfers` trades throughput for admissions** — each stream costs one
+   admission, so `croc_transfers: 1` gives roughly four times as many transfers
+   per minute at the price of single-stream speed. Left unset, croc's default
+   (4) applies. On high-latency paths (e.g. through `proxy.esl.cisco.com`)
+   parallel streams matter a great deal, so do not lower this by reflex.
+
+### What is *not* a problem
+
+Reaching the relay from inside Cisco's network. croc has HTTP-proxy support
+(`--connect`, which defaults from `$HTTP_PROXY`), and the agent container already
+has `HTTP_PROXY` exported by the profile's `init_commands`. Verified 2026-09-17
+from the tunnel container: `CONNECT 142.132.189.179:9009` through
+`proxy.esl.cisco.com:80` returns `200 Connection established`, and `croc send`
+registers its room normally. Note the receiving side is the **agent container**,
+not the SSH target — croc is never installed on the target, so `command -v croc`
+there is empty by design.
+
 ## Performance
 
 ### Remote croc Installation
@@ -204,6 +293,11 @@ Download results for async executions are stored in `_download_results[environme
 | `CROC_SEND_STARTUP_SECONDS` | 3 | Wait time for croc to register with relay (uploads) |
 | `CROC_SEND_RETRY_DELAY_SECONDS` | 8 | Delay before the remote sender's single retry |
 | `CROC_SEND_MIN_RATE_BYTES_PER_SEC` | 1,000,000 | Assumed relay rate for scaling the send timeout |
+| `CROC_RATE_LIMIT_MARKER` | `rate limited` | The relay's literal rejection string |
+| `CROC_SEND_RATE_LIMIT_BACKOFF_SECONDS` | (20, 45, 70) | Waits between rate-limit retries (local send) |
+| `CROC_RECEIVE_RATE_LIMIT_BACKOFF_SECONDS` | (20, 45, 70) | Waits between rate-limit retries (remote receive) |
+| `CROC_OUTPUT_TAIL_BYTES` | 4,096 | How much croc output is quoted back in an error |
+| `MAX_GZIP_RATIO` (mcp_tool) | 1032 | DEFLATE's best possible ratio; bounds the inline check |
 | `CROC_DOWNLOAD_RECEIVE_WAIT_SECONDS` | 120 | Post-command grace for the receiver to flush |
 | `CROC_DOWNLOAD_ABORT_WAIT_SECONDS` | 10 | Post-abort wait for the receiver to exit |
 

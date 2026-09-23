@@ -7,11 +7,13 @@ by tunneling through Torque's agent infrastructure into unreachable networks.
 
 import base64
 import gzip
+import io
 import json
 import os
 import re
 import shutil
 import sys
+import tarfile
 import time
 import asyncio
 import argparse
@@ -288,6 +290,117 @@ def resolve_ssh_private_key(value: str) -> str:
     )
 
 
+# DEFLATE cannot compress by more than 1032:1, so anything larger than
+# cap * MAX_GZIP_RATIO provably cannot fit inline and needs croc — no need to
+# read a byte of it. This is what keeps a 15.7 GB image from being gzipped (and
+# held in memory) purely to discover it is bigger than 300 KB.
+MAX_GZIP_RATIO = 1032
+
+# Chunk size for streaming compression. Bounds memory regardless of file size.
+_COMPRESS_CHUNK_BYTES = 1024 * 1024
+
+
+class _SinkBuffer(io.BytesIO):
+    """A BytesIO that stops storing (and flags) once more than ``cap`` bytes arrive.
+
+    Compressed output only ever grows, so passing the cap settles the question:
+    the payload needs croc. Later writes are dropped rather than refused, so the
+    compressor above still closes cleanly — raising from ``write`` leaves gzip's
+    write buffer half-flushed and its finalizer throwing during GC.
+    """
+
+    def __init__(self, cap: int):
+        super().__init__()
+        self._cap = cap
+        self.overflowed = False
+
+    def write(self, b):  # type: ignore[override]
+        if self.overflowed:
+            return len(b)
+        written = super().write(b)
+        if super().tell() > self._cap:
+            self.overflowed = True
+        return written
+
+
+def compress_file_if_inline(path: str, cap: int) -> Optional[bytes]:
+    """Gzip a file, stopping as soon as the result cannot fit inline.
+
+    Returns the gzipped bytes when the file fits within ``cap``, or None when it
+    has to go over croc. The decision is the same one the old code made by
+    gzipping the whole file and measuring — but that held the entire file plus
+    its compressed copy in memory (~2.5 GB for a 1.27 GB upload, a MemoryError
+    for a multi-GB image) just to compare against 300 KB.
+    """
+    if os.path.getsize(path) > cap * MAX_GZIP_RATIO:
+        return None
+
+    buffer = _SinkBuffer(cap)
+    with gzip.GzipFile(fileobj=buffer, mode="wb") as gz:
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(_COMPRESS_CHUNK_BYTES), b""):
+                gz.write(chunk)
+                if buffer.overflowed:
+                    break
+    if buffer.overflowed:
+        return None
+    data = buffer.getvalue()
+    return data if len(data) <= cap else None
+
+
+def _tree_size(path: str) -> int:
+    """Bytes tar would have to write for the files under ``path``.
+
+    Symlinks are not followed, and hardlinks are counted once — tar stores the
+    second and later names as links. Counting them once keeps this an
+    *under*-estimate of the tar payload, which is the safe direction: the caller
+    only uses it to skip work it can prove is pointless.
+    """
+    total = 0
+    seen: set = set()
+    for _root, _dirs, filenames in os.walk(path):
+        for filename in filenames:
+            try:
+                st = os.lstat(os.path.join(_root, filename))
+            except OSError:
+                continue
+            if st.st_nlink > 1:
+                key = (st.st_dev, st.st_ino)
+                if key in seen:
+                    continue
+                seen.add(key)
+            total += st.st_size
+    return total
+
+
+def compress_dir_if_inline(path: str, cap: int) -> Optional[bytes]:
+    """Tar+gzip a directory, stopping as soon as the result cannot fit inline.
+
+    Same contract (and same reason) as compress_file_if_inline.
+    """
+    if _tree_size(path) > cap * MAX_GZIP_RATIO:
+        return None
+
+    buffer = _SinkBuffer(cap)
+    with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+        for root, dirs, filenames in os.walk(path):
+            for filename in filenames:
+                full_path = os.path.join(root, filename)
+                tar.add(full_path, arcname=os.path.relpath(full_path, path))
+                if buffer.overflowed:
+                    break
+            for dirname in dirs:
+                full_path = os.path.join(root, dirname)
+                tar.add(full_path, arcname=os.path.relpath(full_path, path),
+                        recursive=False)
+            if buffer.overflowed:
+                break
+    if buffer.overflowed:
+        return None
+    data = buffer.getvalue()
+    return data if len(data) <= cap else None
+
+
 def prepare_files_deployment(files: list[dict]) -> tuple[str, list[str]]:
     """
     Prepare shell commands to deploy files before command execution.
@@ -306,8 +419,6 @@ def prepare_files_deployment(files: list[dict]) -> tuple[str, list[str]]:
         Tuple of (shell_commands_string, error_messages)
         If errors exist, the shell_commands_string will be empty.
     """
-    import tarfile
-    import io
     
     if not files:
         return "", []
@@ -430,12 +541,36 @@ class FileDeploymentPlan:
     croc_local_files: list[str] = field(default_factory=list)
     # Temp staging directory for uniquely-named files (cleaned up after transfer)
     croc_staging_dir: str = ""
+    # Relay settings resolved once, when the receive commands were generated.
+    # Both sides MUST agree on the relay, and config hot-reload could otherwise
+    # change it between generating those commands and starting the local send.
+    croc_relay: str = ""
+    croc_relay_password: str = ""
+    croc_transfers: Optional[int] = None
     # Whether croc transfer is needed
     needs_croc: bool = False
     # Errors during preparation
     errors: list[str] = field(default_factory=list)
     # File info strings for output reporting
     files_info: list[str] = field(default_factory=list)
+
+
+def _croc_relay_settings() -> dict:
+    """Relay options for every croc invocation, resolved from the active profile.
+
+    Empty values mean croc's public relay, whose admission limiter is keyed on
+    this machine's public IP and shared with every other session behind it.
+    """
+    transfers = _config.get("croc_transfers")
+    try:
+        transfers = int(transfers) if transfers else None
+    except (TypeError, ValueError):
+        transfers = None
+    return {
+        "relay": str(_config.get("croc_relay") or ""),
+        "relay_password": str(_config.get("croc_relay_password") or ""),
+        "transfers": transfers,
+    }
 
 
 def prepare_files_with_croc(
@@ -464,8 +599,6 @@ def prepare_files_with_croc(
     Returns:
         FileDeploymentPlan with deployment commands and croc transfer info.
     """
-    import tarfile
-    import io
     
     plan = FileDeploymentPlan()
     
@@ -508,40 +641,25 @@ def prepare_files_with_croc(
             plan.errors.append(f"File {i+1}: local path not found: {local_path}")
             continue
         
+        # The inline-vs-croc decision is made on COMPRESSED size, and the
+        # compression stops the moment it passes the threshold — a multi-GB
+        # upload must never be read into memory just to be told it needs croc.
         if os.path.isdir(expanded):
-            # For directories, estimate compressed size by creating the tar in memory
             try:
-                tar_buffer = io.BytesIO()
-                with tarfile.open(fileobj=tar_buffer, mode='w:gz') as tar:
-                    for root, dirs, filenames in os.walk(expanded):
-                        for filename in filenames:
-                            full_path = os.path.join(root, filename)
-                            arcname = os.path.relpath(full_path, expanded)
-                            tar.add(full_path, arcname=arcname)
-                        for dirname in dirs:
-                            full_path = os.path.join(root, dirname)
-                            arcname = os.path.relpath(full_path, expanded)
-                            tar.add(full_path, arcname=arcname, recursive=False)
-                compressed_size = tar_buffer.tell()
-                
-                if compressed_size > croc_manager.CROC_THRESHOLD_BYTES:
+                tar_gz = compress_dir_if_inline(expanded, croc_manager.CROC_THRESHOLD_BYTES)
+                if tar_gz is None:
                     croc_files.append(file_spec)
                 else:
                     # Store pre-computed tar for inline use
-                    file_spec["_tar_b64"] = base64.b64encode(tar_buffer.getvalue()).decode("ascii")
+                    file_spec["_tar_b64"] = base64.b64encode(tar_gz).decode("ascii")
                     inline_files.append(file_spec)
             except Exception as e:
                 plan.errors.append(f"File {i+1}: error reading directory: {e}")
                 continue
         else:
-            # Regular file — check compressed size
             try:
-                with open(expanded, 'rb') as f:
-                    file_bytes = f.read()
-                compressed = gzip.compress(file_bytes)
-                compressed_size = len(compressed)
-                
-                if compressed_size > croc_manager.CROC_THRESHOLD_BYTES:
+                compressed = compress_file_if_inline(expanded, croc_manager.CROC_THRESHOLD_BYTES)
+                if compressed is None:
                     croc_files.append(file_spec)
                 else:
                     # Store pre-computed compressed data for inline use
@@ -612,6 +730,12 @@ def prepare_files_with_croc(
     if croc_files:
         plan.needs_croc = True
         plan.croc_code = croc_manager.generate_croc_code()
+        # Pin the relay for this transfer; execute_with_croc reads it back so the
+        # two sides cannot end up on different relays.
+        relay_settings = _croc_relay_settings()
+        plan.croc_relay = relay_settings["relay"]
+        plan.croc_relay_password = relay_settings["relay_password"]
+        plan.croc_transfers = relay_settings["transfers"]
         
         # Create a staging directory with uniquely-named files to avoid basename collisions.
         # Directories are tarred to match the inline extraction semantics.
@@ -671,6 +795,8 @@ def prepare_files_with_croc(
                 ssh_private_key=ssh_private_key,
                 ssh_password=ssh_password,
                 timeout=croc_timeout,
+                relay=plan.croc_relay,
+                relay_password=plan.croc_relay_password,
             )
             plan.croc_container_pre_commands = croc_install + "\n" + croc_scp
         else:
@@ -679,6 +805,8 @@ def prepare_files_with_croc(
                 code=plan.croc_code,
                 file_transfers=croc_transfer_info,
                 timeout=croc_timeout,
+                relay=plan.croc_relay,
+                relay_password=plan.croc_relay_password,
             )
             plan.croc_init_commands = croc_install + "\n" + croc_recv
     
@@ -708,6 +836,9 @@ async def execute_with_croc(plan: FileDeploymentPlan) -> asyncio.subprocess.Proc
         croc_path=croc_path,
         code=plan.croc_code,
         files=plan.croc_local_files,
+        relay=plan.croc_relay,
+        relay_password=plan.croc_relay_password,
+        transfers=plan.croc_transfers,
     )
     return process
 
@@ -745,6 +876,11 @@ class DownloadPlan:
     croc_code: str = ""
     # Local directory where croc receive will save files
     croc_receive_dir: str = ""
+    # Relay settings pinned when the remote send commands were generated, for the
+    # same reason as FileDeploymentPlan: both sides must agree on the relay.
+    croc_relay: str = ""
+    croc_relay_password: str = ""
+    croc_transfers: Optional[int] = None
     # Mapping from croc_filename → local_destination_path for post-receive file placement
     file_mappings: list[dict] = field(default_factory=list)
     # Whether download is needed
@@ -914,6 +1050,10 @@ def prepare_download_with_croc(
     
     plan.needs_download = True
     plan.croc_code = croc_manager.generate_croc_code()
+    _dl_relay = _croc_relay_settings()
+    plan.croc_relay = _dl_relay["relay"]
+    plan.croc_relay_password = _dl_relay["relay_password"]
+    plan.croc_transfers = _dl_relay["transfers"]
     
     # Create local receive directory
     receive_dir = tempfile.mkdtemp(prefix="torque_dl_")
@@ -949,12 +1089,18 @@ def prepare_download_with_croc(
             ssh_user=ssh_user,
             ssh_private_key=ssh_private_key,
             ssh_password=ssh_password,
+            relay=plan.croc_relay,
+            relay_password=plan.croc_relay_password,
+            transfers=plan.croc_transfers,
         )
     else:
         # For containers: croc send directly from the container
         croc_send = croc_manager.generate_croc_send_commands(
             code=plan.croc_code,
             file_infos=file_infos,
+            relay=plan.croc_relay,
+            relay_password=plan.croc_relay_password,
+            transfers=plan.croc_transfers,
         )
     
     plan.download_commands = croc_install + "\n" + croc_send
@@ -992,6 +1138,8 @@ async def execute_download_receive(
         receive_dir=plan.croc_receive_dir,
         timeout=receive_timeout,
         gated=True,
+        relay=plan.croc_relay,
+        relay_password=plan.croc_relay_password,
     )
     return process
 
@@ -1225,6 +1373,12 @@ _config = {
     # secrets into an agent container. See docs/design-credentials.md.
     "credentials_enabled": False,
     "credentials_space_policy": "preconfigured",
+    # croc large-file transfer. Empty relay = croc's public one, whose admission
+    # limiter is shared by everything behind this machine's public IP.
+    # See docs/croc-file-transfer.md.
+    "croc_relay": None,
+    "croc_relay_password": None,
+    "croc_transfers": None,
 }
 
 # Default values for _config keys (used to reset removed keys on hot-reload)
@@ -5731,6 +5885,11 @@ def main():
     # per-invocation one.
     _config["credentials_enabled"] = file_defaults_with_profile.get("credentials_enabled", False)
     _config["credentials_space_policy"] = file_defaults_with_profile.get("credentials_space_policy", "preconfigured")
+    # Same reasoning for the croc relay: a per-profile piece of infrastructure,
+    # not something to pass on every invocation.
+    _config["croc_relay"] = file_defaults_with_profile.get("croc_relay")
+    _config["croc_relay_password"] = file_defaults_with_profile.get("croc_relay_password")
+    _config["croc_transfers"] = file_defaults_with_profile.get("croc_transfers")
 
     # Record CLI overrides for hot-reload (these keys won't be changed when config file is reloaded)
     global _cli_overrides, _cli_profile, _config_explicit_path, _config_file_path, _config_file_mtime

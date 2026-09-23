@@ -41,6 +41,11 @@ CONFIG_KEY_MAP = {
     # expose_values: they must inherit through `extends` and be overridable per profile.
     "credentials_enabled": "credentials_enabled",
     "credentials_space_policy": "credentials_space_policy",
+    # croc large-file transfer. The public relay admits ~30 room joins per minute
+    # per public IP; pointing these at a private relay removes that shared budget.
+    "croc_relay": "croc_relay",
+    "croc_relay_password": "croc_relay_password",
+    "croc_transfers": "croc_transfers",
 }
 
 # Profile YAML keys → MCP tool argument names (for injection into tool arguments)

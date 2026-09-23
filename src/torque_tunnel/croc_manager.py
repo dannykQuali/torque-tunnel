@@ -21,6 +21,7 @@ Benchmarks (from Cisco proxy network):
 import asyncio
 import os
 import platform
+import re
 import secrets
 import shutil
 import stat
@@ -44,6 +45,31 @@ REMOTE_INSTALL_CHUNKS = 7
 
 # How long to wait for croc to register with the relay before launching the remote receive
 CROC_SEND_STARTUP_SECONDS = 3
+
+# The public relay answers with this literal when its admission limiter rejects a
+# join (croc master, src/tcp/tcp.go: sendAdmission("rate limited")); croc then
+# prints "could not connect to <relay>: got bad response: rate limited" and exits 1.
+CROC_RATE_LIMIT_MARKER = "rate limited"
+
+# The limiter is keyed on the sender's EXACT public IP: 30 joins per rolling
+# minute (src/tcp/defaults.go — DEFAULT_SOURCE_JOIN_LIMIT / DEFAULT_JOIN_LIMIT_WINDOW).
+# One `croc send` costs roughly four joins (the control connection plus the
+# --transfers parallel streams), so a single IP sustains only ~7-8 transfers per
+# minute, shared by every session behind it. Measured 2026-09-17: 8 sends from a
+# cold window succeeded, the 9th was rejected. A failed attempt still spends its
+# joins, so retries back off past the rolling window instead of hammering.
+# The pinned client has no limiter of its own, so it only ever sees the rejection.
+CROC_SEND_RATE_LIMIT_BACKOFF_SECONDS = (20, 45, 70)
+
+# How much of croc's captured output is quoted back in an error message. croc
+# redraws progress with \r and can produce megabytes; only the tail is useful.
+CROC_OUTPUT_TAIL_BYTES = 4096
+
+# The same limiter applies to the RECEIVING side, keyed on the agent container's
+# egress IP — which behind a corporate NAT is shared by everything on it. Without
+# a retry there, one rejection failed the whole upload with nothing but
+# "croc file receive failed (exit code: 1)".
+CROC_RECEIVE_RATE_LIMIT_BACKOFF_SECONDS = (20, 45, 70)
 
 # How long the croc receive retry loop waits between attempts.
 # Croc exits immediately when no sender room exists; this controls the retry interval.
@@ -343,6 +369,148 @@ def _shell_escape_single(s: str) -> str:
     return s.replace("'", "'\\''")
 
 
+# A relay address is interpolated unquoted into generated shell, so it is
+# restricted to what a host:port can legitimately contain (including the
+# bracketed IPv6 form) rather than escaped.
+_RELAY_ADDRESS_RE = re.compile(r"^[A-Za-z0-9_.:\[\]-]+$")
+
+
+def _validate_relay(relay: str) -> str:
+    """Return the relay address, rejecting anything that isn't a plain host:port."""
+    if not relay:
+        return ""
+    if not _RELAY_ADDRESS_RE.match(relay):
+        raise ValueError(
+            f"Invalid croc relay address {relay!r}: expected host:port "
+            f"(letters, digits, '.', '-', '_', ':' and IPv6 brackets only)"
+        )
+    return relay
+
+
+def _relay_env_export(relay_password: str) -> list[str]:
+    """Shell lines exporting the relay password, or nothing when unset.
+
+    The password goes through the environment rather than croc's ``--pass`` flag
+    so it never shows up in the container's process list.
+    """
+    if not relay_password:
+        return []
+    return [f"export CROC_PASS='{_shell_escape_single(relay_password)}'"]
+
+
+def _croc_global_flags(relay: str) -> str:
+    """croc's GLOBAL options for a relay override — these must precede any subcommand."""
+    return f"--relay {_validate_relay(relay)} " if relay else ""
+
+
+# Scratch files the receive retry loop uses inside the croc receive directory.
+# Dot-prefixed so they can never collide with a received file.
+_RECEIVE_RC_FILE = ".croc_recv.rc"
+_RECEIVE_LOG_FILE = ".croc_recv.log"
+
+
+def generate_croc_receive_attempt(code: str, timeout: int, relay: str = "") -> list[str]:
+    """Shell lines that receive via croc, retrying while the relay rate-limits us.
+
+    Sets ``__CROC_RC`` to croc's exit code. croc's output still reaches stdout
+    (through ``tee``) so transfer progress stays visible in the streamed grain
+    log; the copy on disk is only there so the loop can tell a rate-limit
+    rejection apart from a real failure.
+
+    Must run with the croc receive directory as the working directory.
+    """
+    waits = list(CROC_RECEIVE_RATE_LIMIT_BACKOFF_SECONDS) + ["final"]
+    return [
+        '__CROC_RC=1',
+        f'for __CROC_WAIT in {" ".join(str(w) for w in waits)}; do',
+        f'  rm -f {_RECEIVE_RC_FILE} {_RECEIVE_LOG_FILE}',
+        # The exit code goes through a file because the pipe into tee would
+        # otherwise hide it, and PIPESTATUS is not portable to a plain sh grain.
+        f'  {{ timeout {timeout} bash -c \'CROC_SECRET="{code}" '
+        f'croc {_croc_global_flags(relay)}--yes --overwrite\'; '
+        f'echo $? > {_RECEIVE_RC_FILE}; }} 2>&1 | tee {_RECEIVE_LOG_FILE}',
+        f'  __CROC_RC=$(cat {_RECEIVE_RC_FILE} 2>/dev/null || echo 1)',
+        '  [ "$__CROC_RC" = "0" ] && break',
+        f'  grep -q "{CROC_RATE_LIMIT_MARKER}" {_RECEIVE_LOG_FILE} 2>/dev/null || break',
+        '  [ "$__CROC_WAIT" = "final" ] && break',
+        '  echo "[croc receive] relay rate-limited this host; retrying in ${__CROC_WAIT}s"',
+        '  sleep "$__CROC_WAIT"',
+        'done',
+        f'rm -f {_RECEIVE_RC_FILE} {_RECEIVE_LOG_FILE}',
+    ]
+
+
+# croc prints the transfer code on startup ("Code is: ...", plus ready-made
+# receive commands containing it). That code IS the PAKE password, so it must
+# never reach an error message or a log. The remote send wrapper strips the same
+# lines from the streamed grain log; this is the local equivalent.
+_CROC_SECRET_LINE_MARKERS = (
+    "CROC_SECRET=",
+    "Code is:",
+    "On the other computer",
+    "(For ",
+    "Code copied to clipboard",
+)
+
+
+def _is_progress_line(line: str) -> bool:
+    """True for croc's redrawn progress bars, e.g. `x... 65% |####  | (655 kB/1.0 MB)`.
+
+    They carry no diagnostic value and are full of box-drawing characters, which
+    a legacy console codepage cannot even encode.
+    """
+    return "|" in line and "%" in line
+
+
+def _scrub_croc_output(text: str) -> list[str]:
+    """Split croc output into meaningful lines, dropping any that carry the code."""
+    lines = []
+    for raw in text.replace("\r", "\n").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("croc ") or _is_progress_line(line):
+            continue
+        if any(marker in line for marker in _CROC_SECRET_LINE_MARKERS):
+            continue
+        lines.append(line)
+    return lines
+
+
+def read_croc_output_tail(
+    log_path: str,
+    limit: int = CROC_OUTPUT_TAIL_BYTES,
+    secret: str = "",
+    max_lines: int = 6,
+) -> str:
+    """Read the tail of a croc output capture, scrubbed of the transfer code.
+
+    Returns "" when the file is missing or unreadable — a diagnostic must never
+    be the reason a transfer fails.
+    """
+    try:
+        size = os.path.getsize(log_path)
+        with open(log_path, "rb") as f:
+            if size > limit:
+                f.seek(size - limit)
+            data = f.read()
+    except OSError:
+        return ""
+
+    text = data.decode("utf-8", "replace")
+    if secret:
+        # Belt and braces: the line filters above cover croc's known banner, this
+        # covers any line they don't.
+        text = text.replace(secret, "<transfer code>")
+    return " | ".join(_scrub_croc_output(text)[-max_lines:])
+
+
+def _remove_quietly(path: str) -> None:
+    """Delete a file, ignoring the case where it is already gone or still locked."""
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
 def _validate_mode(mode: str) -> bool:
     """Validate a Unix file permission mode string (e.g., '755', '0644')."""
     import re
@@ -353,6 +521,8 @@ def generate_croc_receive_commands(
     code: str,
     file_transfers: list[dict],
     timeout: int = 600,
+    relay: str = "",
+    relay_password: str = "",
 ) -> str:
     """Generate shell commands to receive files via croc and place them at destinations.
 
@@ -364,6 +534,8 @@ def generate_croc_receive_commands(
             - mode: Optional file permissions (e.g. "755"). Must match ^[0-7]{3,4}$.
             - is_dir_tar: If True, the file is a gzipped tar of a directory; extract instead of move.
         timeout: Timeout in seconds for croc receive (default 600s).
+        relay: Optional "host:port" of a private relay; must match the sender's.
+        relay_password: Optional password for that relay.
 
     Returns:
         Shell commands string.
@@ -372,9 +544,9 @@ def generate_croc_receive_commands(
     commands.append("# === Croc file receive ===")
     commands.append('__CROC_DIR=$(mktemp -d)')
     commands.append('cd "$__CROC_DIR"')
+    commands.extend(_relay_env_export(relay_password))
     # Use CROC_SECRET env var (not command-line arg) to avoid leaking code in process list
-    commands.append(f'timeout {timeout} bash -c \'CROC_SECRET="{code}" croc --yes --overwrite\'')
-    commands.append('__CROC_RC=$?')
+    commands.extend(generate_croc_receive_attempt(code, timeout, relay))
     commands.append('if [ $__CROC_RC -ne 0 ]; then')
     commands.append('  echo "ERROR: croc file receive failed (exit code: $__CROC_RC)" >&2')
     commands.append('  rm -rf "$__CROC_DIR"')
@@ -405,6 +577,10 @@ def generate_croc_receive_commands(
             commands.append(f"chmod {mode} '{escaped_dest}'")
 
     commands.append('rm -rf "$__CROC_DIR"')
+    if relay_password:
+        # These lines are prepended to the user's own commands; don't leave the
+        # relay password in their environment.
+        commands.append("unset CROC_PASS")
     commands.append("# === End croc file receive ===")
     return "\n".join(commands)
 
@@ -417,6 +593,8 @@ def generate_croc_scp_commands(
     ssh_private_key: str = "",
     ssh_password: str = "",
     timeout: int = 600,
+    relay: str = "",
+    relay_password: str = "",
 ) -> str:
     """Generate shell commands to receive files via croc on the CONTAINER, then SCP to SSH target.
 
@@ -434,6 +612,8 @@ def generate_croc_scp_commands(
         ssh_private_key: SSH private key content (PEM format).
         ssh_password: SSH password (alternative to key).
         timeout: Timeout in seconds for croc receive (default 600s).
+        relay: Optional "host:port" of a private relay; must match the sender's.
+        relay_password: Optional password for that relay.
 
     Returns:
         Shell commands string to run on the agent container (not on the target).
@@ -471,8 +651,8 @@ def generate_croc_scp_commands(
     # Receive files via croc
     commands.append('__CROC_DIR=$(mktemp -d)')
     commands.append('cd "$__CROC_DIR"')
-    commands.append(f'timeout {timeout} bash -c \'CROC_SECRET="{code}" croc --yes --overwrite\'')
-    commands.append('__CROC_RC=$?')
+    commands.extend(_relay_env_export(relay_password))
+    commands.extend(generate_croc_receive_attempt(code, timeout, relay))
     commands.append('if [ $__CROC_RC -ne 0 ]; then')
     commands.append('  echo "ERROR: croc file receive failed (exit code: $__CROC_RC)" >&2')
     if ssh_private_key:
@@ -528,6 +708,8 @@ def generate_croc_scp_commands(
     if ssh_private_key:
         commands.append('rm -f "$__SCP_KEY"')
     commands.append('rm -rf "$__CROC_DIR"')
+    if relay_password:
+        commands.append("unset CROC_PASS")
     commands.append("# === End croc receive + SCP ===")
     return "\n".join(commands)
 
@@ -537,77 +719,159 @@ async def start_croc_send(
     code: str,
     files: list[str],
     timeout: float = 600,
+    relay: str = "",
+    relay_password: str = "",
+    transfers: Optional[int] = None,
 ) -> asyncio.subprocess.Process:
     """Start croc send as a background process.
 
-    The process connects to the public relay and waits for a receiver.
-    Caller must manage the process lifecycle (await completion or cleanup).
+    The process connects to the relay and waits for a receiver. Caller must
+    manage the process lifecycle (await completion or cleanup_croc_send).
+
+    croc's output is captured to a temp file rather than discarded, so a startup
+    failure can say *why*. It goes to a file and not a pipe because nothing
+    drains the pipe while croc runs, and croc's progress output would eventually
+    fill the buffer and deadlock it — that deadlock is why this used to be
+    DEVNULL, which in turn is why a rate-limited send reported nothing but
+    "exited immediately with code 1". The path is stashed on the returned
+    process as ``croc_log_path`` and removed by cleanup_croc_send.
+
+    A send rejected by the relay's admission limiter is retried after a backoff
+    (see CROC_SEND_RATE_LIMIT_BACKOFF_SECONDS); any other failure raises at once,
+    because it will fail identically on a retry.
 
     Args:
         croc_path: Path to local croc binary.
         code: The croc secret code.
         files: List of local file paths to send.
         timeout: Not used directly; croc will wait for receiver.
+        relay: Optional "host:port" of a private relay (default: croc's public one).
+        relay_password: Optional password for that relay. Passed via CROC_PASS so
+            it never appears in the process list.
+        transfers: Optional number of parallel transfer streams. Each stream costs
+            a relay admission, so lowering it buys more transfers per minute at
+            the price of throughput. None leaves croc's default (4).
 
     Returns:
         The asyncio subprocess Process handle.
+
+    Raises:
+        RuntimeError: If croc exits during startup, with croc's own output.
     """
     cmd = [
         str(croc_path),
         "--yes",       # No interactive prompts (global option, must precede subcommand)
+    ]
+    if relay:
+        cmd += ["--relay", _validate_relay(relay)]  # global option: must precede `send`
+    cmd += [
         "send",
         "--no-local",  # Skip local network discovery (we always use the relay)
-    ] + [str(f) for f in files]
+    ]
+    if transfers:
+        cmd += ["--transfers", str(transfers)]
+    cmd += [str(f) for f in files]
 
-    # Pass code via environment variable to avoid exposing it in process list
+    # Pass secrets via environment variables to avoid exposing them in process list
     env = os.environ.copy()
     env["CROC_SECRET"] = code
+    if relay_password:
+        env["CROC_PASS"] = relay_password
 
-    process = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdin=asyncio.subprocess.DEVNULL,   # Prevent parent stdin (e.g., MCP protocol) leaking in
-        stdout=asyncio.subprocess.DEVNULL,  # Discard progress output to avoid pipe buffer deadlock
-        stderr=asyncio.subprocess.DEVNULL,  # Discard stderr too — croc sends progress there
-        env=env,
-    )
+    log_fd, log_path = tempfile.mkstemp(prefix="torque_croc_send_", suffix=".log")
+    os.close(log_fd)
 
-    # Give croc a few seconds to connect to the relay and register the code
-    await asyncio.sleep(CROC_SEND_STARTUP_SECONDS)
+    max_attempts = len(CROC_SEND_RATE_LIMIT_BACKOFF_SECONDS) + 1
+    attempt = 0
+    while True:
+        attempt += 1
+        # The handle is closed as soon as croc has inherited it; croc keeps
+        # writing through its own copy.
+        with open(log_path, "wb") as log:
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=asyncio.subprocess.DEVNULL,  # Prevent parent stdin (e.g. MCP protocol) leaking in
+                stdout=log,
+                stderr=log,
+                env=env,
+            )
 
-    # Check if it crashed during startup
-    if process.returncode is not None:
-        raise RuntimeError(
-            f"croc send exited immediately with code {process.returncode}"
-        )
+        # Give croc a few seconds to connect to the relay and register the code
+        await asyncio.sleep(CROC_SEND_STARTUP_SECONDS)
 
-    return process
+        if process.returncode is None:
+            # Registered and waiting for the receiver.
+            process.croc_log_path = log_path
+            return process
+
+        output = read_croc_output_tail(log_path, secret=code)
+        rate_limited = CROC_RATE_LIMIT_MARKER in output
+
+        if rate_limited and attempt < max_attempts:
+            wait = CROC_SEND_RATE_LIMIT_BACKOFF_SECONDS[attempt - 1]
+            print(
+                f"[croc] relay rate-limited this IP; retrying in {wait}s "
+                f"(attempt {attempt + 1} of {max_attempts})",
+                file=sys.stderr,
+            )
+            await asyncio.sleep(wait)
+            continue
+
+        _remove_quietly(log_path)
+        message = f"croc send exited immediately with code {process.returncode}"
+        if output:
+            message += f": {output}"
+        if rate_limited:
+            message += (
+                " - the relay admits about 30 room joins per minute per public IP"
+                " and each send costs roughly four, shared with every other session"
+                " behind that IP. Wait a minute and retry, or set 'croc_relay' in the"
+                " config to a private relay to leave the shared budget behind."
+            )
+        raise RuntimeError(message)
 
 
 async def cleanup_croc_send(process: Optional[asyncio.subprocess.Process]) -> None:
-    """Clean up a croc send background process.
+    """Clean up a croc send background process and its captured output.
 
     Safe to call even if process is None or already terminated.
     """
     if process is None:
         return
-    if process.returncode is not None:
-        return  # Already finished
+
+    # Only a process we started carries this; getattr on anything else (including
+    # the mocks other call sites pass) must not be mistaken for a path.
+    log_path = getattr(process, "croc_log_path", None)
 
     try:
-        process.terminate()
-        try:
-            await asyncio.wait_for(process.wait(), timeout=5)
-        except asyncio.TimeoutError:
-            process.kill()
-            await process.wait()
-    except ProcessLookupError:
-        pass  # Process already gone
+        if process.returncode is None:
+            try:
+                process.terminate()
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=5)
+                except asyncio.TimeoutError:
+                    process.kill()
+                    await process.wait()
+            except ProcessLookupError:
+                pass  # Process already gone
+    finally:
+        # Deleting has to wait until croc is gone: Windows refuses to unlink a
+        # file the process still holds open.
+        if isinstance(log_path, str) and log_path:
+            _remove_quietly(log_path)
 
 
 # --- Download (remote→local) support ---
 
 
-def _generate_croc_send_core(code: str, timeout: int, cleanup_commands: list[str]) -> list[str]:
+def _generate_croc_send_core(
+    code: str,
+    timeout: int,
+    cleanup_commands: list[str],
+    relay: str = "",
+    relay_password: str = "",
+    transfers: Optional[int] = None,
+) -> list[str]:
     """Shared croc-send block used by both download command generators.
 
     Expects staged files to already exist in $__DL_DIR. Implements the
@@ -631,6 +895,9 @@ def _generate_croc_send_core(code: str, timeout: int, cleanup_commands: list[str
         timeout: Minimum (floor) croc send timeout in seconds.
         cleanup_commands: Extra cleanup lines to run after the send (e.g.
             removing a temporary SSH key), before the final status is emitted.
+        relay: Optional "host:port" of a private relay; must match the receiver's.
+        relay_password: Optional password for that relay (via CROC_PASS).
+        transfers: Optional number of parallel transfer streams.
 
     Returns:
         List of shell command lines (bash).
@@ -659,6 +926,10 @@ def _generate_croc_send_core(code: str, timeout: int, cleanup_commands: list[str
     c.append('  fi')
     c.append('done')
     c.append(f'export CROC_SECRET="{code}"')
+    c.extend(_relay_env_export(relay_password))
+    croc_send = f"croc {_croc_global_flags(relay)}send --no-local"
+    if transfers:
+        croc_send += f" --transfers {int(transfers)}"
     # Scale the send timeout with the payload size; `timeout` is the floor
     c.append('__DL_BYTES=$(du -sb . 2>/dev/null | cut -f1)')
     c.append(f'__DL_TIMEOUT=$(( ${{__DL_BYTES:-0}} / {CROC_SEND_MIN_RATE_BYTES_PER_SEC} + 120 ))')
@@ -675,7 +946,7 @@ def _generate_croc_send_core(code: str, timeout: int, cleanup_commands: list[str
              " -e 'On the other computer' -e '(For ' -e '^[[:space:]]*croc '; }")
     # -k 5: SIGKILL 5s after SIGTERM if croc ignores it. Croc sometimes hangs
     # after 100% when going through a proxy relay.
-    c.append('  timeout -k 5 "$__DL_TIMEOUT" croc send --no-local "$@" > .croc_send.log 2>&1 &')
+    c.append(f'  timeout -k 5 "$__DL_TIMEOUT" {croc_send} "$@" > .croc_send.log 2>&1 &')
     c.append('  __CROC_PID=$!')
     c.append('  __CROC_READY=0')
     c.append('  __CROC_TICK=0')
@@ -764,6 +1035,8 @@ def _generate_croc_send_core(code: str, timeout: int, cleanup_commands: list[str
     c.append('  __croc_send_once')
     c.append('fi')
     c.append('unset CROC_SECRET')
+    if relay_password:
+        c.append('unset CROC_PASS')
     c.append('cd /')
     c.append('rm -rf "$__DL_DIR"')
     c.extend(cleanup_commands)
@@ -780,6 +1053,9 @@ def generate_croc_send_commands(
     code: str,
     file_infos: list[dict],
     timeout: int = 300,
+    relay: str = "",
+    relay_password: str = "",
+    transfers: Optional[int] = None,
 ) -> str:
     """Generate shell commands to send files from the container/target to local via croc.
 
@@ -796,6 +1072,9 @@ def generate_croc_send_commands(
             The effective timeout scales with the staged payload size so
             multi-GB transfers are not killed mid-flight; croc may also hang
             after 100% through proxy relays, which this bounds.
+        relay: Optional "host:port" of a private relay; must match the receiver's.
+        relay_password: Optional password for that relay.
+        transfers: Optional number of parallel transfer streams.
 
     Returns:
         Shell commands string.
@@ -818,7 +1097,10 @@ def generate_croc_send_commands(
             f" || {{ echo 'WARNING: Failed to stage {escaped_src} for download' >&2; }}"
         )
 
-    commands.extend(_generate_croc_send_core(code, timeout, cleanup_commands=[]))
+    commands.extend(_generate_croc_send_core(
+        code, timeout, cleanup_commands=[],
+        relay=relay, relay_password=relay_password, transfers=transfers,
+    ))
     commands.append("# === End croc file download ===")
     return "\n".join(commands)
 
@@ -831,6 +1113,9 @@ def generate_croc_scp_download_commands(
     ssh_private_key: str = "",
     ssh_password: str = "",
     timeout: int = 300,
+    relay: str = "",
+    relay_password: str = "",
+    transfers: Optional[int] = None,
 ) -> str:
     """Generate shell commands to SCP files from SSH target to container, then croc send to local.
 
@@ -900,7 +1185,10 @@ def generate_croc_scp_download_commands(
 
     # croc send all staged files to local
     cleanup_commands = ['rm -f "$__DL_KEY"'] if ssh_private_key else []
-    commands.extend(_generate_croc_send_core(code, timeout, cleanup_commands=cleanup_commands))
+    commands.extend(_generate_croc_send_core(
+        code, timeout, cleanup_commands=cleanup_commands,
+        relay=relay, relay_password=relay_password, transfers=transfers,
+    ))
     commands.append("# === End SCP download + croc send ===")
     return "\n".join(commands)
 
@@ -911,6 +1199,8 @@ async def start_croc_receive(
     receive_dir: str,
     timeout: int = 1800,
     gated: bool = False,
+    relay: str = "",
+    relay_password: str = "",
 ) -> asyncio.subprocess.Process:
     """Start croc receive as a background process with automatic retry.
 
@@ -945,6 +1235,8 @@ async def start_croc_receive(
         receive_dir: Directory where received files will be saved.
         timeout: Maximum seconds to keep retrying (default 1800 = 30 min).
         gated: If True, wait for CROC_READY_SIGNAL before each croc attempt.
+        relay: Optional "host:port" of a private relay; must match the sender's.
+        relay_password: Optional password for that relay (via CROC_PASS).
 
     Returns:
         The asyncio subprocess Process handle (a Python wrapper process that
@@ -953,9 +1245,15 @@ async def start_croc_receive(
     # Build a small Python script that retries croc until it succeeds.
     # Using sys.executable ensures cross-platform compatibility.
     # repr() handles Windows backslashes in paths safely.
+    # --relay is a croc GLOBAL option: it must precede the (implicit) receive
+    # subcommand, so the argv is assembled here rather than inside the script.
+    croc_argv = [str(croc_path), "--yes", "--overwrite"]
+    if relay:
+        croc_argv[1:1] = ["--relay", _validate_relay(relay)]
+
     retry_script = (
         "import hashlib, json, os, subprocess, sys, time\n"
-        f"croc_path = {str(croc_path)!r}\n"
+        f"croc_argv = {croc_argv!r}\n"
         f"receive_dir = {receive_dir!r}\n"
         f"code = {code!r}\n"
         f"timeout = {timeout}\n"
@@ -967,7 +1265,8 @@ async def start_croc_receive(
         f"log_f = os.path.join(receive_dir, {CROC_RECEIVE_LOG_FILE!r})\n"
         "env = os.environ.copy()\n"
         "env['CROC_SECRET'] = code\n"
-        "def log(msg):\n"
+        + (f"env['CROC_PASS'] = {relay_password!r}\n" if relay_password else "")
+        + "def log(msg):\n"
         "    try:\n"
         "        with open(log_f, 'a') as f:\n"
         "            f.write(time.strftime('[%H:%M:%S] ') + msg + '\\n')\n"
@@ -1038,7 +1337,7 @@ async def start_croc_receive(
         "    try:\n"
         "        with open(log_f, 'a') as lf:\n"
         "            proc = subprocess.Popen(\n"
-        "                [croc_path, '--yes', '--overwrite'],\n"
+        "                croc_argv,\n"
         "                cwd=receive_dir, env=env,\n"
         "                stdin=subprocess.DEVNULL, stdout=lf, stderr=lf,\n"
         "            )\n"
