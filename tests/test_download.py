@@ -44,7 +44,7 @@ class TestGenerateCrocSendCommands:
             }],
         )
         assert 'CROC_SECRET="test-code-123"' in cmds
-        assert "croc send --no-local" in cmds
+        assert f"croc --relay {croc_manager.DEFAULT_CROC_RELAY} send --no-local" in cmds
         assert "_croc_dl_0_app.log" in cmds
         assert "cp -r '/var/log/app.log'" in cmds
         assert "__DL_DIR=$(mktemp -d)" in cmds
@@ -62,7 +62,7 @@ class TestGenerateCrocSendCommands:
         assert "cp -r '/tmp/a.txt'" in cmds
         assert "cp -r '/opt/b.bin'" in cmds
         # croc sends everything that was staged (glob over the staging dir)
-        assert "croc send --no-local" in cmds
+        assert f"croc --relay {croc_manager.DEFAULT_CROC_RELAY} send --no-local" in cmds
 
     def test_directory_staging_uses_cp_r(self):
         cmds = croc_manager.generate_croc_send_commands(
@@ -110,7 +110,7 @@ class TestGenerateCrocSendCommands:
             timeout=120,
         )
         assert '[ "$__DL_TIMEOUT" -lt 120 ] && __DL_TIMEOUT=120' in cmds
-        assert 'timeout -k 5 "$__DL_TIMEOUT" croc send' in cmds
+        assert f'timeout -k 5 "$__DL_TIMEOUT" croc --relay {croc_manager.DEFAULT_CROC_RELAY} send' in cmds
 
     def test_default_timeout_is_floor(self):
         cmds = croc_manager.generate_croc_send_commands(
@@ -168,7 +168,7 @@ class TestGenerateCrocScpDownloadCommands:
         assert "StrictHostKeyChecking=no" in cmds
         assert "__DL_KEY" in cmds
         assert "10.0.0.1" in cmds
-        assert "croc send --no-local" in cmds
+        assert f"croc --relay {croc_manager.DEFAULT_CROC_RELAY} send --no-local" in cmds
 
     def test_password_auth(self):
         cmds = croc_manager.generate_croc_scp_download_commands(
@@ -253,7 +253,7 @@ class TestGenerateCrocScpDownloadCommands:
             timeout=300,
         )
         assert '[ "$__DL_TIMEOUT" -lt 300 ] && __DL_TIMEOUT=300' in cmds
-        assert 'timeout -k 5 "$__DL_TIMEOUT" croc send' in cmds
+        assert f'timeout -k 5 "$__DL_TIMEOUT" croc --relay {croc_manager.DEFAULT_CROC_RELAY} send' in cmds
 
     def test_scp_uses_r_flag(self):
         """scp -r works for both files and directories."""

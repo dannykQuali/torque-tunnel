@@ -196,7 +196,7 @@ class TestCrocReceiveCommands:
             }],
         )
         assert 'CROC_SECRET="test-code-123"' in cmds
-        assert "croc --yes --overwrite" in cmds
+        assert f"croc --relay {croc_manager.DEFAULT_CROC_RELAY} --yes --overwrite" in cmds
         assert "_croc_0_data.bin" in cmds
         assert "/tmp/data.bin" in cmds
 
@@ -514,6 +514,12 @@ class TestCleanup:
 # ============================================================================
 
 class TestStartCrocSend:
+    @pytest.fixture(autouse=True)
+    def _no_real_dns(self):
+        """start_croc_send looks the relay up first; keep these tests offline."""
+        with mock.patch.object(croc_manager, "warm_dns_cache"):
+            yield
+
     @pytest.mark.asyncio
     async def test_uses_croc_secret_env_var(self):
         """Should pass code via CROC_SECRET env var, not --code flag."""

@@ -7,12 +7,20 @@ torque-tunnel uses [croc](https://github.com/schollz/croc) for transferring file
 ## When Croc is Used
 
 ### Uploads
-Files are automatically routed through croc when their **compressed size** exceeds **300KB** (~307,200 bytes). Files below this threshold continue to use the existing inline base64 approach via Torque API payloads.
+Files travel inline (base64 in the Torque API payload) while they fit a **300KB (~307,200 bytes) compressed budget shared by the whole call**; the rest go through croc, together, in one transfer.
 
 This threshold was determined empirically:
 - Torque API returns HTTP 413 at ~600KB payloads
 - Shell grain hangs at ~450KB payloads
 - 300KB provides a safe margin
+
+**The budget is per call, not per file**, because those limits apply to the whole
+payload. Each file is compressed against what is *left* of the budget, so a single
+file gets exactly the full allowance, and later files spill to croc once it is
+used up. Until 2026-09-23 the check was per file: two 290KB files each passed and
+then travelled together as a 774KB payload, which failed (a caller had to split
+tarballs into one 290KB part per call). Inline `content` counts against the budget
+too; content that doesn't fit is staged as a real file and sent over croc.
 
 The decision is made on **compressed** size, so a large but highly compressible
 file still goes inline. Deciding it never loads the file into memory:
@@ -45,6 +53,8 @@ Croc install + receive commands are included in `init_commands`, which run on th
 Local machine --[croc relay]--> Agent container --[SCP]--> SSH target
 ```
 Croc install + receive + SCP commands run on the agent container via the `container_pre_commands` blueprint mechanism, before the SSH connection to the target.
+
+The profile's `init_commands` are sourced first, in a subshell, just as the download section sources them. That's where proxy settings live. Until 2026-09-23 this slot skipped them. A profile pointing at a non-existent proxy then showed the split: downloads failed on the bad proxy, while uploads silently used whatever proxy the agent container happened to carry, and would have had none on an agent without one. The subshell keeps `init_commands` from changing the blueprint's own variables or working directory. `init_commands` are only run on the runner when there are pre-commands (see `tests/test_blueprint_init_scope.py`, which runs the real blueprint script under bash).
 
 ### Upload Flow
 
@@ -265,6 +275,125 @@ registers its room normally. Note the receiving side is the **agent container**,
 not the SSH target — croc is never installed on the target, so `command -v croc`
 there is empty by design.
 
+## Relay address resolution (croc's 500 ms lookup)
+
+croc resolves its **built-in** default relay (`croc.schollz.com`) once, at process
+start, with a **hard 500 ms timeout** (croc v10 `src/models/constants.go`,
+`localLookupIP`). If the resolver is slower, croc sets the default to the empty
+string without saying so, and the send fails with:
+
+```
+could not connect to : could not connect
+```
+
+Note the empty address after `to`. croc never dialled anything. This broke every
+`download_files` call on the `cisco-jarvis-mx` agent on 2026-09-23. That agent's
+resolver took 1.3-2.5 s for uncached lookups, and still 0.1-0.7 s after its
+DNS was reconfigured, so it fails intermittently. The tell-tale: `croc --help` prints
+`--relay value ... [$CROC_RELAY]` with **no `(default: ...)`**, and takes ~500 ms to
+print.
+
+The network was never the problem: every Cisco agent reaches the relay through
+`proxy.esl.cisco.com`, which croc uses by itself (see *What is not a problem*).
+
+### How this is handled
+
+1. **Every croc invocation names the relay explicitly**: the configured
+   `croc_relay`, or `DEFAULT_CROC_RELAY` = `croc.schollz.com:9009`. That applies to
+   the remote sender and receiver, and the local sender and receiver. An explicit
+   `--relay` makes croc ignore its startup lookup. It is a **hostname, not an
+   IP**, on purpose. With an HTTP proxy, croc's dialler sends
+   `CONNECT croc.schollz.com:9009`, so the **proxy** resolves the name and no local
+   DNS is needed at all. Without a proxy, the lookup happens at connect time with
+   croc's normal ~30 s budget instead of 500 ms.
+
+   Verified 2026-09-23 with the agent container's DNS black-holed
+   (`nameserver 192.0.2.1`):
+   - the default relay reproduced the error on demand;
+   - `--relay croc.schollz.com:9009` connected;
+   - the same flag with the proxy unset failed on `lookup ... i/o timeout`, which
+     shows the proxy was doing the resolving;
+   - a 3 MB container→laptop transfer completed with matching sha256.
+2. **The relay host is looked up just before each croc process starts**, so the
+   resolver's cache is warm for any lookup croc still does itself.
+   - Remote side: `generate_dns_warmup()`, which runs `getent ahosts` in the
+     background and polls it for up to `CROC_DNS_WARMUP_SECONDS`.
+   - Local side: `warm_dns_cache()`, which runs `getaddrinfo` in an abandoned-on-
+     timeout daemon thread.
+
+   It is bounded (with DNS black-holed, an unbounded `getent` took 20 s) and never
+   fatal. It is skipped for IP relays. `ahosts` asks for A and AAAA together, as
+   croc's resolver does. The remote warm-up deliberately avoids the `timeout`
+   binary: the send wrapper's `timeout ... croc send` must remain the only
+   `timeout` call, which the send-wrapper tests rely on. croc's Linux build is
+   static pure Go, which matters here: it never goes through glibc/nscd, so the
+   cache that counts is the DNS server in `resolv.conf` (the agent VM's BIND).
+   That is exactly what `getent` warms.
+
+Side effect of an explicit `--relay`: croc no longer also tries its IPv6 relay.
+That's harmless on these IPv4-only networks, and `croc_relay` can override it.
+
+## Error reporting
+
+- **Download sender failures carry croc's own words.** The remote send wrapper
+  keeps croc's last diagnostic line (progress bars and anything with the transfer
+  code are dropped) and appends it to the FAILED sentinel:
+  `__CROC_DL_FAILED__ exit_code=1 reason=could not connect to : could not connect`.
+  The tool renders that as `remote croc send failed: exit code 1: <reason>` and adds
+  a plain-words explanation for known causes (`croc_manager.describe_croc_error`:
+  the empty relay and the rate limit). Before, the result said only
+  `exit_code=1`; the real line was only in Torque's grain log.
+- **Upload receive failures** print `ERROR: croc file receive failed (exit code: N):
+  <reason>` on the agent. The blueprint only reports
+  `Container pre-commands failed`, so the blocking handlers pull those lines from
+  the grain log (`extract_transfer_errors`) and list them as `UPLOAD FAILED:` under
+  **Files Deployed:** (`format_upload_summary`). Previously a failed upload was
+  still listed as deployed.
+
+  The extractor only accepts lines that *start* with `ERROR:`, after an optional
+  log timestamp. That's because the container blueprint echoes its commands into the
+  log, so the receive script's own source line
+  (`echo "ERROR: croc file receive failed (exit code: $__CROC_RC)..."`) is in there
+  too. The first version matched that source and reported it as the error. The
+  extractor also stops at `=== Running download commands ===`; errors past that
+  point are the download's.
+- **croc install failures say why.** The remote install used to pipe `curl -s`
+  into `tar`, so any download failure surfaced as
+  `gzip: stdin: unexpected end of file` + `ERROR: Failed to install croc`.
+  Now it:
+  - downloads into a temp file;
+  - keeps curl's last error line;
+  - names the proxy in use (credentials masked);
+  - gives every curl a connect timeout (`CROC_INSTALL_CONNECT_TIMEOUT_SECONDS`).
+
+  Measured 2026-09-23 on `cisco-jarvis-mx`:
+  - proxy host that doesn't exist:
+    `Failed to install croc: curl: (5) Could not resolve proxy: no-such-proxy.invalid (proxy: http://no-such-proxy.invalid:80)`;
+  - proxy that drops packets:
+    `curl: (28) Connection timeout after 20001 ms (proxy: http://192.0.2.1:80)`,
+    after 56 s in total. Before, curl's default 300 s connect timeout per request
+    meant roughly ten minutes.
+
+  On the download path the install also emits the FAILED sentinel
+  (`exit_code=install`), so the local receiver is aborted at once and the result
+  names the install failure. Before, it reported that the sender "never
+  registered with the relay". A non-numeric `exit_code` names the stage, and is
+  rendered as the reason alone. The chunked install also removes a partially
+  extracted binary when a chunk fails; otherwise a truncated `croc` would pass the
+  executable check and fail later in a confusing way. It now works in a private
+  `mktemp -d` directory instead of a fixed `/tmp/_croc_dl`, which two concurrent
+  installs in one container would have shared.
+- **Transfer time.** The command's `Duration` excludes the transfer, which runs
+  afterwards. A download that spent 46 s failing was once reported next to
+  `Duration: 0.2s`. `DownloadPlan` now starts a clock at the sender's first
+  sentinel and stops it when `complete_download()` finishes. The summary shows
+  `Transfer time: …`, the CLI prints it, and `--json` carries `transfer_seconds`.
+  The start lags by up to one log-poll interval.
+- **One formatter for the download summary** (`format_download_summary`). The
+  hand-built copies had drifted: the async status path labelled failed downloads
+  `WARNING:`, while the blocking handlers and the CLI (which exits non-zero) treat
+  them as failures. They now all say `DOWNLOAD FAILED:`.
+
 ## Performance
 
 ### Remote croc Installation
@@ -297,6 +426,10 @@ there is empty by design.
 | `CROC_SEND_RATE_LIMIT_BACKOFF_SECONDS` | (20, 45, 70) | Waits between rate-limit retries (local send) |
 | `CROC_RECEIVE_RATE_LIMIT_BACKOFF_SECONDS` | (20, 45, 70) | Waits between rate-limit retries (remote receive) |
 | `CROC_OUTPUT_TAIL_BYTES` | 4,096 | How much croc output is quoted back in an error |
+| `DEFAULT_CROC_RELAY` | `croc.schollz.com:9009` | Relay named on every croc call when `croc_relay` is unset (hostname, so a proxy resolves it) |
+| `CROC_DNS_WARMUP_SECONDS` | 3 | Upper bound of the pre-croc lookup of the relay host |
+| `CROC_INSTALL_CONNECT_TIMEOUT_SECONDS` | 20 | curl connect timeout for the remote croc install |
+| `CROC_INSTALL_MAX_SECONDS` | 300 | curl overall time limit for the remote croc download |
 | `MAX_GZIP_RATIO` (mcp_tool) | 1032 | DEFLATE's best possible ratio; bounds the inline check |
 | `CROC_DOWNLOAD_RECEIVE_WAIT_SECONDS` | 120 | Post-command grace for the receiver to flush |
 | `CROC_DOWNLOAD_ABORT_WAIT_SECONDS` | 10 | Post-abort wait for the receiver to exit |

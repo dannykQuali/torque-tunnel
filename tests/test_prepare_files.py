@@ -435,7 +435,9 @@ class TestRelayConfigReachesBothSides:
         try:
             assert plan.croc_relay == ""
             assert plan.croc_transfers is None
-            assert "--relay" not in plan.croc_init_commands
+            # Named explicitly even when unconfigured: croc's built-in default is
+            # resolved in a 500 ms window and silently blanked when that's missed.
+            assert f"--relay {croc_manager.DEFAULT_CROC_RELAY}" in plan.croc_init_commands
             assert "CROC_PASS" not in plan.croc_init_commands
         finally:
             shutil.rmtree(plan.croc_staging_dir, ignore_errors=True)
@@ -654,3 +656,112 @@ class TestGzipRatioShortCircuit:
 
         with mock.patch("builtins.open", refuse):
             assert compress_dir_if_inline(src, cap) is None
+
+
+# ============================================================================
+# The inline budget is per CALL, not per file
+# ============================================================================
+
+def _inline_payload_bytes(inline_commands: str) -> int:
+    """Total decoded size of every base64 payload the inline commands carry."""
+    import re
+    blobs = re.findall(r"echo '([A-Za-z0-9+/=]+)' \| base64 -d", inline_commands)
+    return sum(len(base64.b64decode(b)) for b in blobs)
+
+
+class TestInlineBudgetIsPerCall:
+    """Torque's payload limit (grain hangs ~450 KB, API 413 ~600 KB) applies to the
+    whole call. Two 290 KB files used to pass the per-file check one by one and
+    then travel together as a 774 KB payload."""
+
+    def _cleanup(self, plan):
+        if plan.croc_staging_dir:
+            shutil.rmtree(plan.croc_staging_dir, ignore_errors=True)
+
+    def test_two_files_that_each_fit_do_not_both_go_inline(self, temp_dir):
+        specs = []
+        for i in range(2):
+            p = os.path.join(temp_dir, f"part{i}")
+            create_file_of_size(p, 290 * 1024, compressible=False)
+            specs.append({"local_source_path": p, "remote_destination_path": f"/tmp/part{i}"})
+
+        plan = prepare_files_with_croc(specs)
+        try:
+            assert plan.needs_croc
+            assert len(plan.croc_local_files) == 1
+            assert _inline_payload_bytes(plan.inline_commands) <= croc_manager.CROC_THRESHOLD_BYTES
+        finally:
+            self._cleanup(plan)
+
+    def test_many_small_files_never_exceed_the_budget_and_none_are_lost(self, temp_dir):
+        specs = []
+        for i in range(6):
+            p = os.path.join(temp_dir, f"f{i}.bin")
+            create_file_of_size(p, 80 * 1024, compressible=False)
+            specs.append({"local_source_path": p, "remote_destination_path": f"/tmp/f{i}.bin"})
+
+        plan = prepare_files_with_croc(specs)
+        try:
+            assert _inline_payload_bytes(plan.inline_commands) <= croc_manager.CROC_THRESHOLD_BYTES
+            inline_dests = {f"/tmp/f{i}.bin" for i in range(6)
+                            if f"'/tmp/f{i}.bin'" in plan.inline_commands}
+            croc_dests = {f"/tmp/f{i}.bin" for i in range(6)
+                          if f"'/tmp/f{i}.bin'" in plan.croc_init_commands}
+            assert inline_dests | croc_dests == {f"/tmp/f{i}.bin" for i in range(6)}
+            assert not inline_dests & croc_dests, "a file must travel exactly one way"
+            assert croc_dests, "80 KB x 6 cannot all fit in one 300 KB payload"
+        finally:
+            self._cleanup(plan)
+
+    def test_a_single_file_up_to_the_threshold_still_goes_inline(self, temp_dir):
+        p = os.path.join(temp_dir, "one.bin")
+        create_file_of_size(p, croc_manager.CROC_THRESHOLD_BYTES - 50_000, compressible=False)
+        plan = prepare_files_with_croc([{"local_source_path": p, "remote_destination_path": "/tmp/one"}])
+        try:
+            assert not plan.needs_croc
+        finally:
+            self._cleanup(plan)
+
+    def test_small_content_still_goes_inline(self):
+        plan = prepare_files_with_croc([{"content": "#!/bin/sh\necho hi\n",
+                                         "remote_destination_path": "/tmp/s.sh"}])
+        assert not plan.needs_croc
+        assert "/tmp/s.sh" in plan.inline_commands
+
+    def test_content_counts_against_the_budget(self, temp_dir):
+        import secrets
+        p = os.path.join(temp_dir, "big.bin")
+        create_file_of_size(p, 250 * 1024, compressible=False)
+        content = secrets.token_hex(120 * 1024)  # ~240 KB of hex, gzips to ~130 KB
+
+        plan = prepare_files_with_croc([
+            {"local_source_path": p, "remote_destination_path": "/tmp/big.bin"},
+            {"content": content, "remote_destination_path": "/tmp/generated.txt", "mode": "600"},
+        ])
+        try:
+            assert plan.needs_croc, "250 KB + 130 KB cannot share one 300 KB payload"
+            assert _inline_payload_bytes(plan.inline_commands) <= croc_manager.CROC_THRESHOLD_BYTES
+        finally:
+            self._cleanup(plan)
+
+    def test_spilled_content_arrives_intact_with_its_mode(self, temp_dir):
+        """Content that no longer fits inline has to take the croc path: it is
+        staged as a real file whose bytes are exactly the content."""
+        import secrets
+        p = os.path.join(temp_dir, "big.bin")
+        create_file_of_size(p, 290 * 1024, compressible=False)
+        content = secrets.token_hex(60 * 1024)
+
+        plan = prepare_files_with_croc([
+            {"local_source_path": p, "remote_destination_path": "/tmp/big.bin"},
+            {"content": content, "remote_destination_path": "/tmp/generated.txt", "mode": "600"},
+        ])
+        try:
+            assert "/tmp/generated.txt" in plan.croc_init_commands
+            assert "chmod 600 '/tmp/generated.txt'" in plan.croc_init_commands
+            staged = [f for f in plan.croc_local_files if f.endswith("generated.txt")]
+            assert len(staged) == 1
+            with open(staged[0], "rb") as f:
+                assert f.read() == content.encode("utf-8")
+        finally:
+            self._cleanup(plan)

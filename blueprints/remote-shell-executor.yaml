@@ -199,7 +199,18 @@ grains:
                 echo '{{ .inputs.container_pre_commands_b64 }}' | base64 -d | gzip -d > "$__CONTAINER_PRE" 2>/dev/null || true
                 if [ -s "$__CONTAINER_PRE" ]; then
                   echo "=== Running container pre-commands ==="
-                  bash "$__CONTAINER_PRE"
+                  # Apply the profile's init commands first, exactly as the download
+                  # section does: proxy settings live there, and the croc install and
+                  # receive in these pre-commands need them. Without this, uploads to
+                  # SSH targets silently used whatever proxy the agent container
+                  # happened to carry (or none). In a subshell, so init commands
+                  # cannot change this script's own variables or working directory.
+                  (
+                    if [ -s "$INIT_FILE" ]; then
+                      . "$INIT_FILE"
+                    fi
+                    bash "$__CONTAINER_PRE"
+                  )
                   __PRE_RC=$?
                   rm -f "$__CONTAINER_PRE"
                   if [ $__PRE_RC -ne 0 ]; then

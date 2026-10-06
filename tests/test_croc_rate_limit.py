@@ -77,7 +77,9 @@ async def _send(**overrides):
         files=["file1.txt"],
     )
     kwargs.update(overrides)
-    return await croc_manager.start_croc_send(**kwargs)
+    # Keep these unit tests off the real resolver (covered in test_croc_relay_resolution)
+    with mock.patch.object(croc_manager, "warm_dns_cache"):
+        return await croc_manager.start_croc_send(**kwargs)
 
 
 # ============================================================================
@@ -306,14 +308,14 @@ class TestLocalSendRelayOptions:
         assert mock_exec.call_args[1]["env"]["CROC_PASS"] == "s3kr1t"
 
     @pytest.mark.asyncio
-    async def test_no_relay_flags_by_default(self):
+    async def test_unconfigured_relay_means_the_public_hostname_and_no_password(self):
         with mock.patch("asyncio.create_subprocess_exec",
                         side_effect=_fake_croc(None)) as mock_exec, \
              mock.patch("asyncio.sleep"):
             await _send()
 
         argv = list(mock_exec.call_args[0])
-        assert "--relay" not in argv
+        assert argv[argv.index("--relay") + 1] == croc_manager.DEFAULT_CROC_RELAY
         assert "CROC_PASS" not in mock_exec.call_args[1]["env"]
 
     @pytest.mark.asyncio
@@ -355,12 +357,12 @@ class TestRemoteRelayOptions:
         # Global options must precede the (implicit) receive, i.e. right after `croc`
         assert "croc --relay" in script
 
-    def test_receive_commands_unchanged_without_a_relay(self):
+    def test_receive_commands_use_the_public_relay_without_a_password(self):
         script = croc_manager.generate_croc_receive_commands(
             code="abc",
             file_transfers=[{"croc_filename": "f", "remote_destination_path": "/tmp/f"}],
         )
-        assert "--relay" not in script
+        assert f"--relay {croc_manager.DEFAULT_CROC_RELAY}" in script
         assert "CROC_PASS" not in script
 
     def test_scp_commands_carry_the_relay(self):
@@ -387,14 +389,13 @@ class TestRemoteRelayOptions:
         assert "croc --relay relay.internal:9009 send" in script
         assert "--transfers 2" in script
 
-    def test_remote_send_commands_unchanged_without_a_relay(self):
+    def test_remote_send_commands_use_the_public_relay_and_default_streams(self):
         script = croc_manager.generate_croc_send_commands(
             code="abc",
             file_infos=[{"remote_source_path": "/tmp/f", "croc_filename": "f"}],
         )
-        assert "--relay" not in script
+        assert f"croc --relay {croc_manager.DEFAULT_CROC_RELAY} send --no-local" in script
         assert "--transfers" not in script
-        assert "croc send --no-local" in script
 
     @pytest.mark.asyncio
     async def test_local_receive_uses_the_relay(self):
@@ -436,31 +437,9 @@ class TestRateLimitConstants:
 # The receiving side must survive a rate limit too (shell-level, under bash)
 # ============================================================================
 
-import shutil
 import subprocess
 
-
-def _find_bash():
-    """Locate a bash that accepts Windows paths (Git Bash) - NOT WSL bash."""
-    if sys.platform != "win32":
-        return shutil.which("bash")
-    candidates = []
-    git = shutil.which("git")
-    if git:
-        git_root = Path(git).parent.parent
-        candidates += [git_root / "bin" / "bash.exe", git_root / "usr" / "bin" / "bash.exe"]
-    candidates += [
-        Path(r"C:\Program Files\Git\bin\bash.exe"),
-        Path(r"C:\Program Files\Git\usr\bin\bash.exe"),
-    ]
-    for c in candidates:
-        if c.exists():
-            return str(c)
-    return None
-
-
-BASH = _find_bash()
-needs_bash = pytest.mark.skipif(BASH is None, reason="Git Bash not available")
+from _bash_harness import BASH, needs_bash
 
 # `timeout` is a coreutils binary the container has and Git Bash does not. A PATH
 # shim is not enough (the generated script calls it in a pipeline), so it is a

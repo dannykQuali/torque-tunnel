@@ -24,6 +24,7 @@ import platform
 import re
 import secrets
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -43,8 +44,32 @@ CROC_THRESHOLD_BYTES = 300 * 1024  # 300KB compressed
 # Benchmarked 1-40 chunks; 7 chunks is the sweet spot at ~2.1s average.
 REMOTE_INSTALL_CHUNKS = 7
 
+# Remote croc install (generate_remote_croc_install_script). Without a connect
+# timeout, curl through a proxy that drops packets waits minutes per request.
+CROC_INSTALL_CONNECT_TIMEOUT_SECONDS = 20
+CROC_INSTALL_MAX_SECONDS = 300
+
 # How long to wait for croc to register with the relay before launching the remote receive
 CROC_SEND_STARTUP_SECONDS = 3
+
+# The relay every croc invocation names explicitly unless the profile configures
+# its own (croc_relay). croc resolves its BUILT-IN default relay once at process
+# start with a hard 500 ms timeout (croc v10 src/models/constants.go) and, if the
+# resolver is slower, silently blanks it — the send then fails with
+# "could not connect to : could not connect" (empty address). That broke every
+# download on the cisco-jarvis-mx agent on 2026-09-23 (resolver uncached lookups
+# 1.3-2.5 s, still 0.1-0.7 s after a DNS fix). Naming the relay makes croc ignore
+# that startup lookup. It is a HOSTNAME, not an IP, on purpose: with an HTTP
+# proxy croc sends `CONNECT croc.schollz.com:9009` and the proxy resolves it, so
+# no local DNS is needed at all (verified with the container's DNS black-holed:
+# 3 MB transferred intact). Without a proxy the lookup happens at connect time
+# with croc's normal ~30 s budget instead of 500 ms.
+DEFAULT_CROC_RELAY = "croc.schollz.com:9009"
+
+# Upper bound for the pre-croc lookup of the relay host (generate_dns_warmup /
+# warm_dns_cache). The lookup only warms the resolver's cache for whatever
+# lookup croc still does itself, so it must never cost more than this.
+CROC_DNS_WARMUP_SECONDS = 3
 
 # The public relay answers with this literal when its admission limiter rejects a
 # join (croc master, src/tcp/tcp.go: sendAdmission("rate limited")); croc then
@@ -320,12 +345,29 @@ def generate_croc_code() -> str:
     return secrets.token_urlsafe(256)
 
 
-def generate_remote_croc_install_script(version: str = CROC_VERSION) -> str:
+def generate_remote_croc_install_script(
+    version: str = CROC_VERSION,
+    failure_sentinel: Optional[str] = None,
+) -> str:
     """Generate shell commands to install croc on a remote Linux container.
 
     Uses 7 parallel curl chunk downloads for speed (~2.1 seconds on tested network).
     Falls back to single-stream download if parallel approach fails.
     Skips installation if croc is already available.
+
+    A failed install says WHY: curl's own last error line and the proxy in use
+    (credentials masked), e.g. ``ERROR: Failed to install croc: curl: (5) Could
+    not resolve proxy: no-such-proxy.invalid (proxy: http://no-such-proxy.invalid:80)``.
+    It used to pipe ``curl -s`` into ``tar``, which reduced every download
+    failure to "gzip: stdin: unexpected end of file". Every curl has a connect
+    timeout, so a proxy that drops packets fails in seconds, not minutes.
+
+    Args:
+        version: croc release to install.
+        failure_sentinel: When set (the download path), also emit
+            ``<sentinel> exit_code=install reason=<message>`` on failure. The
+            local receiver waits on the sender's sentinels, and without one it
+            could only report that the sender "never registered".
 
     Returns:
         Multi-line shell script string.
@@ -334,32 +376,50 @@ def generate_remote_croc_install_script(version: str = CROC_VERSION) -> str:
         f"https://github.com/schollz/croc/releases/download/{version}"
         f"/croc_{version}_Linux-64bit.tar.gz"
     )
+    ct = CROC_INSTALL_CONNECT_TIMEOUT_SECONDS
+    sentinel_line = (
+        f'    echo "{failure_sentinel} exit_code=install reason=$__CROC_INSTALL_MSG"\n'
+        if failure_sentinel else ""
+    )
     return f"""# === Fast parallel croc install (~2s with {REMOTE_INSTALL_CHUNKS} chunks) ===
 if ! command -v croc &>/dev/null; then
   __CROC_URL="{url}"
-  __CROC_FSIZE=$(curl -sI -L "$__CROC_URL" 2>/dev/null | grep -i content-length | tail -1 | tr -dc '0-9')
+  __CROC_CURL="curl -fsSL --connect-timeout {ct} --max-time {CROC_INSTALL_MAX_SECONDS}"
+  __CROC_TMP=$(mktemp -d)
+  __CROC_FSIZE=$(curl -fsSIL --connect-timeout {ct} --max-time 60 "$__CROC_URL" 2>"$__CROC_TMP/head.err" | grep -i content-length | tail -1 | tr -dc '0-9')
   if [ -n "$__CROC_FSIZE" ] && [ "$__CROC_FSIZE" -gt 0 ] 2>/dev/null; then
     __CROC_NCHUNKS={REMOTE_INSTALL_CHUNKS}
     __CROC_CHUNK=$(( (__CROC_FSIZE + __CROC_NCHUNKS - 1) / __CROC_NCHUNKS ))
-    mkdir -p /tmp/_croc_dl
     for __i in $(seq 0 $((__CROC_NCHUNKS - 1))); do
       __S=$((__i * __CROC_CHUNK))
       __E=$(((__i + 1) * __CROC_CHUNK - 1))
       [ $__E -ge $__CROC_FSIZE ] && __E=$((__CROC_FSIZE - 1))
-      curl -sL -r "$__S-$__E" -o "/tmp/_croc_dl/$(printf %04d $__i)" "$__CROC_URL" &
+      $__CROC_CURL -r "$__S-$__E" -o "$__CROC_TMP/part$(printf %04d $__i)" "$__CROC_URL" 2>>"$__CROC_TMP/chunks.err" &
     done
     wait
-    cat /tmp/_croc_dl/* | tar xz -C /usr/local/bin croc 2>/dev/null
-    rm -rf /tmp/_croc_dl
-  else
-    # Fallback: single-stream download if size detection fails
-    curl -sL "$__CROC_URL" | tar xz -C /usr/local/bin croc
+    # A failed chunk can leave a TRUNCATED croc behind that would pass the
+    # executable check below; remove it so the fallback runs instead.
+    cat "$__CROC_TMP"/part* 2>/dev/null | tar xz -C /usr/local/bin croc 2>/dev/null || rm -f /usr/local/bin/croc
+  fi
+  if [ ! -x /usr/local/bin/croc ]; then
+    # Fallback: single-stream download (size detection or a chunk failed).
+    # Into a file, not a pipe, so curl's error is kept and tar never sees junk.
+    if $__CROC_CURL -o "$__CROC_TMP/croc.tgz" "$__CROC_URL" 2>"$__CROC_TMP/curl.err"; then
+      tar xzf "$__CROC_TMP/croc.tgz" -C /usr/local/bin croc 2>"$__CROC_TMP/tar.err" || rm -f /usr/local/bin/croc
+    fi
   fi
   export PATH="/usr/local/bin:$PATH"
   if ! command -v croc &>/dev/null; then
-    echo "ERROR: Failed to install croc" >&2
+    __CROC_INSTALL_MSG=$(tail -n 1 "$__CROC_TMP/curl.err" 2>/dev/null)
+    [ -z "$__CROC_INSTALL_MSG" ] && __CROC_INSTALL_MSG=$(tail -n 1 "$__CROC_TMP/tar.err" 2>/dev/null)
+    [ -z "$__CROC_INSTALL_MSG" ] && __CROC_INSTALL_MSG="the download produced no croc binary"
+    __CROC_PROXY=$(printf '%s' "${{HTTPS_PROXY:-${{https_proxy:-}}}}" | sed -E 's#//[^/@]*@#//***@#')
+    __CROC_INSTALL_MSG="Failed to install croc: $__CROC_INSTALL_MSG (proxy: ${{__CROC_PROXY:-none}})"
+    echo "ERROR: $__CROC_INSTALL_MSG" >&2
+{sentinel_line}    rm -rf "$__CROC_TMP"
     exit 1
   fi
+  rm -rf "$__CROC_TMP"
 fi
 # === End croc install ==="""
 
@@ -398,15 +458,101 @@ def _relay_env_export(relay_password: str) -> list[str]:
     return [f"export CROC_PASS='{_shell_escape_single(relay_password)}'"]
 
 
+def effective_relay(relay: str = "") -> str:
+    """The relay every croc invocation names explicitly: the configured one, or
+    croc's public relay by HOSTNAME (see DEFAULT_CROC_RELAY for why)."""
+    return _validate_relay(relay) if relay else DEFAULT_CROC_RELAY
+
+
+def _relay_host(relay: str) -> str:
+    """Host part of a relay address ("host:port", "[v6]:port" or a bare host)."""
+    host = relay.rsplit(":", 1)[0] if relay.count(":") == 1 or relay.startswith("[") else relay
+    return host.strip("[]")
+
+
+def _needs_lookup(host: str) -> bool:
+    """False for an IP literal: there is nothing to resolve, or to warm."""
+    import ipaddress
+    try:
+        ipaddress.ip_address(host)
+        return False
+    except ValueError:
+        return bool(host)
+
+
 def _croc_global_flags(relay: str) -> str:
-    """croc's GLOBAL options for a relay override — these must precede any subcommand."""
-    return f"--relay {_validate_relay(relay)} " if relay else ""
+    """croc's GLOBAL options naming the relay — these must precede any subcommand."""
+    return f"--relay {effective_relay(relay)} "
+
+
+def generate_dns_warmup(relay: str = "") -> list[str]:
+    """Shell lines that look up the relay host, so croc's own lookup hits a warm cache.
+
+    Bounded and non-fatal: returns as soon as the lookup does (milliseconds on a
+    warm resolver) and gives up after CROC_DNS_WARMUP_SECONDS. With DNS
+    black-holed, an unbounded `getent` took 20 s in testing.
+
+    Deliberately avoids the `timeout` binary: the send wrapper's own
+    `timeout ... croc send` must stay the only `timeout` call, and a foreground
+    `timeout` would also break under test shims that `exec` it. `getent ahosts`
+    asks for A and AAAA together, as croc's resolver does. Nothing is emitted
+    for an IP relay.
+    """
+    host = _relay_host(effective_relay(relay))
+    if not _needs_lookup(host):
+        return []
+    ticks = max(1, int(CROC_DNS_WARMUP_SECONDS * 10))
+    return [
+        f"getent ahosts '{_shell_escape_single(host)}' >/dev/null 2>&1 &",
+        '__TT_DNS_PID=$!',
+        '__TT_DNS_TICK=0',
+        f'while kill -0 "$__TT_DNS_PID" 2>/dev/null && [ "$__TT_DNS_TICK" -lt {ticks} ]; do',
+        '  sleep 0.1; __TT_DNS_TICK=$((__TT_DNS_TICK + 1))',
+        'done',
+        'kill "$__TT_DNS_PID" 2>/dev/null; wait "$__TT_DNS_PID" 2>/dev/null',
+    ]
+
+
+def warm_dns_cache(relay: str = "", timeout: Optional[float] = None) -> None:
+    """Look up the relay host locally, so croc's own lookup is served from cache.
+
+    Bounded by CROC_DNS_WARMUP_SECONDS (or ``timeout``) and never raises: the
+    lookup runs in a daemon thread that is simply abandoned if the resolver
+    doesn't answer in time.
+    """
+    import threading
+    try:
+        host = _relay_host(effective_relay(relay))
+    except ValueError:
+        return
+    if not _needs_lookup(host):
+        return
+    limit = CROC_DNS_WARMUP_SECONDS if timeout is None else timeout
+
+    def lookup():
+        try:
+            socket.getaddrinfo(host, None)
+        except Exception:
+            pass
+
+    worker = threading.Thread(target=lookup, name="croc-dns-warmup", daemon=True)
+    worker.start()
+    worker.join(limit)
 
 
 # Scratch files the receive retry loop uses inside the croc receive directory.
 # Dot-prefixed so they can never collide with a received file.
 _RECEIVE_RC_FILE = ".croc_recv.rc"
 _RECEIVE_LOG_FILE = ".croc_recv.log"
+
+# Shell expression: the last line of a croc output capture worth quoting in an
+# error. Progress redraws (with a percentage) and anything carrying the transfer
+# code are dropped. `$1` is the capture file.
+_LAST_CROC_ERROR_SH = (
+    "tr '\\r' '\\n' < \"$1\" 2>/dev/null | grep -v -e '%' -e 'CROC_SECRET' "
+    "-e 'Code is:' -e 'On the other computer' -e '(For ' -e '^[[:space:]]*croc ' "
+    "-e '^[[:space:]]*$' | tail -n 1"
+)
 
 
 def generate_croc_receive_attempt(code: str, timeout: int, relay: str = "") -> list[str]:
@@ -417,13 +563,20 @@ def generate_croc_receive_attempt(code: str, timeout: int, relay: str = "") -> l
     log; the copy on disk is only there so the loop can tell a rate-limit
     rejection apart from a real failure.
 
+    Also sets ``__CROC_ERR`` to croc's last diagnostic line, for the caller's
+    ERROR message.
+
     Must run with the croc receive directory as the working directory.
     """
     waits = list(CROC_RECEIVE_RATE_LIMIT_BACKOFF_SECONDS) + ["final"]
     return [
         '__CROC_RC=1',
+        '__CROC_ERR=""',
+        f'__tt_last_croc_error() {{ {_LAST_CROC_ERROR_SH}; }}',
         f'for __CROC_WAIT in {" ".join(str(w) for w in waits)}; do',
         f'  rm -f {_RECEIVE_RC_FILE} {_RECEIVE_LOG_FILE}',
+        # Every attempt is a fresh croc process with its own 500 ms startup lookup
+        *(f'  {line}' for line in generate_dns_warmup(relay)),
         # The exit code goes through a file because the pipe into tee would
         # otherwise hide it, and PIPESTATUS is not portable to a plain sh grain.
         f'  {{ timeout {timeout} bash -c \'CROC_SECRET="{code}" '
@@ -431,6 +584,7 @@ def generate_croc_receive_attempt(code: str, timeout: int, relay: str = "") -> l
         f'echo $? > {_RECEIVE_RC_FILE}; }} 2>&1 | tee {_RECEIVE_LOG_FILE}',
         f'  __CROC_RC=$(cat {_RECEIVE_RC_FILE} 2>/dev/null || echo 1)',
         '  [ "$__CROC_RC" = "0" ] && break',
+        f'  __CROC_ERR=$(__tt_last_croc_error {_RECEIVE_LOG_FILE})',
         f'  grep -q "{CROC_RATE_LIMIT_MARKER}" {_RECEIVE_LOG_FILE} 2>/dev/null || break',
         '  [ "$__CROC_WAIT" = "final" ] && break',
         '  echo "[croc receive] relay rate-limited this host; retrying in ${__CROC_WAIT}s"',
@@ -503,6 +657,24 @@ def read_croc_output_tail(
     return " | ".join(_scrub_croc_output(text)[-max_lines:])
 
 
+def describe_croc_error(text: str) -> str:
+    """Plain-words explanation for croc errors whose cause is known, else "".
+
+    Only causes that were actually diagnosed are listed; guessing would send the
+    reader in the wrong direction.
+    """
+    if not text:
+        return ""
+    if "could not connect to : " in text:
+        # Empty relay address: croc's startup lookup blanked its default relay.
+        return ("croc had no relay address: its startup DNS lookup of the relay "
+                "did not finish within croc's 500 ms limit")
+    if CROC_RATE_LIMIT_MARKER in text:
+        return ("the relay rejected the connection: its per-IP admission limit "
+                "(~30 joins/minute) was reached")
+    return ""
+
+
 def _remove_quietly(path: str) -> None:
     """Delete a file, ignoring the case where it is already gone or still locked."""
     try:
@@ -548,7 +720,7 @@ def generate_croc_receive_commands(
     # Use CROC_SECRET env var (not command-line arg) to avoid leaking code in process list
     commands.extend(generate_croc_receive_attempt(code, timeout, relay))
     commands.append('if [ $__CROC_RC -ne 0 ]; then')
-    commands.append('  echo "ERROR: croc file receive failed (exit code: $__CROC_RC)" >&2')
+    commands.append('  echo "ERROR: croc file receive failed (exit code: $__CROC_RC)${__CROC_ERR:+: $__CROC_ERR}" >&2')
     commands.append('  rm -rf "$__CROC_DIR"')
     commands.append('  exit 1')
     commands.append('fi')
@@ -654,7 +826,7 @@ def generate_croc_scp_commands(
     commands.extend(_relay_env_export(relay_password))
     commands.extend(generate_croc_receive_attempt(code, timeout, relay))
     commands.append('if [ $__CROC_RC -ne 0 ]; then')
-    commands.append('  echo "ERROR: croc file receive failed (exit code: $__CROC_RC)" >&2')
+    commands.append('  echo "ERROR: croc file receive failed (exit code: $__CROC_RC)${__CROC_ERR:+: $__CROC_ERR}" >&2')
     if ssh_private_key:
         commands.append('  rm -f "$__SCP_KEY"')
     commands.append('  rm -rf "$__CROC_DIR"')
@@ -762,8 +934,9 @@ async def start_croc_send(
         str(croc_path),
         "--yes",       # No interactive prompts (global option, must precede subcommand)
     ]
-    if relay:
-        cmd += ["--relay", _validate_relay(relay)]  # global option: must precede `send`
+    # Always named, never croc's built-in default (see DEFAULT_CROC_RELAY).
+    # A global option: it must precede `send`.
+    cmd += ["--relay", effective_relay(relay)]
     cmd += [
         "send",
         "--no-local",  # Skip local network discovery (we always use the relay)
@@ -785,6 +958,9 @@ async def start_croc_send(
     attempt = 0
     while True:
         attempt += 1
+        # Warm the resolver for croc's own startup lookup. In a worker thread:
+        # it can take up to CROC_DNS_WARMUP_SECONDS and must not stall the loop.
+        await asyncio.to_thread(warm_dns_cache, relay)
         # The handle is closed as soon as croc has inherited it; croc keeps
         # writing through its own copy.
         with open(log_path, "wb") as log:
@@ -908,7 +1084,7 @@ def _generate_croc_send_core(
     c.append('set -- *')
     c.append('if [ ! -e "$1" ]; then')
     c.append('  echo "ERROR: no files were staged for download" >&2')
-    c.append(f'  echo "{CROC_SENTINEL_FAILED} exit_code=stage"')
+    c.append(f'  echo "{CROC_SENTINEL_FAILED} exit_code=stage reason=no files were staged for download"')
     c.append('  cd /')
     c.append('  rm -rf "$__DL_DIR"')
     c.extend(f'  {line}' for line in cleanup_commands)
@@ -946,6 +1122,8 @@ def _generate_croc_send_core(
              " -e 'On the other computer' -e '(For ' -e '^[[:space:]]*croc '; }")
     # -k 5: SIGKILL 5s after SIGTERM if croc ignores it. Croc sometimes hangs
     # after 100% when going through a proxy relay.
+    # Each attempt is a fresh croc process doing its own 500 ms startup lookup
+    c.extend(f'  {line}' for line in generate_dns_warmup(relay))
     c.append(f'  timeout -k 5 "$__DL_TIMEOUT" {croc_send} "$@" > .croc_send.log 2>&1 &')
     c.append('  __CROC_PID=$!')
     c.append('  __CROC_READY=0')
@@ -1024,7 +1202,13 @@ def _generate_croc_send_core(
     c.append(f'    echo "{CROC_SENTINEL_READY}"')
     c.append('  fi')
     c.append('  __croc_tail | tail -n 3')
+    # croc's last diagnostic line, kept for the FAILED sentinel: the send log is
+    # deleted before that sentinel is emitted, and without it the caller only
+    # ever saw "exit_code=1" (the real "could not connect to : could not connect"
+    # was only in Torque's grain log). __croc_tail has already dropped the code.
+    c.append("  __CROC_ERR=$(__croc_tail | grep -v '%' | tail -n 1)")
     c.append('}')
+    c.append('__CROC_ERR=""')
     c.append('__croc_send_once')
     # Exit codes 124 (timeout SIGTERM), 137 (SIGKILL) and 143 (stall-detection
     # TERM) can mean croc hung after a complete transfer; the local side
@@ -1041,8 +1225,8 @@ def _generate_croc_send_core(
     c.append('rm -rf "$__DL_DIR"')
     c.extend(cleanup_commands)
     c.append('if [ $__DL_RC -ne 0 ] && [ $__DL_RC -ne 124 ] && [ $__DL_RC -ne 137 ] && [ $__DL_RC -ne 143 ]; then')
-    c.append('  echo "ERROR: croc file download failed (exit code: $__DL_RC)" >&2')
-    c.append(f'  echo "{CROC_SENTINEL_FAILED} exit_code=$__DL_RC"')
+    c.append('  echo "ERROR: croc file download failed (exit code: $__DL_RC)${__CROC_ERR:+: $__CROC_ERR}" >&2')
+    c.append(f'  echo "{CROC_SENTINEL_FAILED} exit_code=$__DL_RC${{__CROC_ERR:+ reason=$__CROC_ERR}}"')
     c.append('  exit 1')
     c.append('fi')
     c.append(f'echo "{CROC_SENTINEL_DONE} exit_code=$__DL_RC"')
@@ -1247,13 +1431,18 @@ async def start_croc_receive(
     # repr() handles Windows backslashes in paths safely.
     # --relay is a croc GLOBAL option: it must precede the (implicit) receive
     # subcommand, so the argv is assembled here rather than inside the script.
-    croc_argv = [str(croc_path), "--yes", "--overwrite"]
-    if relay:
-        croc_argv[1:1] = ["--relay", _validate_relay(relay)]
+    # The relay is always named, never croc's built-in default (DEFAULT_CROC_RELAY).
+    relay_address = effective_relay(relay)
+    croc_argv = [str(croc_path), "--relay", relay_address, "--yes", "--overwrite"]
+    warm_host = _relay_host(relay_address)
+    if not _needs_lookup(warm_host):
+        warm_host = ""
 
     retry_script = (
-        "import hashlib, json, os, subprocess, sys, time\n"
+        "import hashlib, json, os, socket, subprocess, sys, threading, time\n"
         f"croc_argv = {croc_argv!r}\n"
+        f"warm_host = {warm_host!r}\n"
+        f"warm_limit = {CROC_DNS_WARMUP_SECONDS!r}\n"
         f"receive_dir = {receive_dir!r}\n"
         f"code = {code!r}\n"
         f"timeout = {timeout}\n"
@@ -1272,6 +1461,19 @@ async def start_croc_receive(
         "            f.write(time.strftime('[%H:%M:%S] ') + msg + '\\n')\n"
         "    except OSError:\n"
         "        pass\n"
+        "def warm_dns():\n"
+        "    # Look the relay host up so croc's own 500 ms startup lookup is served\n"
+        "    # from cache. Bounded, never fatal: a hung resolver is abandoned.\n"
+        "    if not warm_host:\n"
+        "        return\n"
+        "    def lookup():\n"
+        "        try:\n"
+        "            socket.getaddrinfo(warm_host, None)\n"
+        "        except Exception:\n"
+        "            pass\n"
+        "    t = threading.Thread(target=lookup, daemon=True)\n"
+        "    t.start()\n"
+        "    t.join(warm_limit)\n"
         "def received_files():\n"
         "    return [f for f in os.listdir(receive_dir) if not f.startswith('.')]\n"
         "def kill_proc(p):\n"
@@ -1333,6 +1535,7 @@ async def start_croc_receive(
         "        continue\n"
         "    attempt += 1\n"
         "    log('croc attempt %d starting' % attempt)\n"
+        "    warm_dns()\n"
         "    rc = None\n"
         "    try:\n"
         "        with open(log_f, 'a') as lf:\n"

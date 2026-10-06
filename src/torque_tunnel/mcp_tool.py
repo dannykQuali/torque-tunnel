@@ -607,7 +607,12 @@ def prepare_files_with_croc(
     
     inline_files = []  # Files that fit inline
     croc_files = []    # Files that need croc
-    
+    # Torque's payload limit applies to the whole CALL (grain hangs ~450 KB, API
+    # 413 ~600 KB), so the inline budget is shared by every file in it: two 290 KB
+    # files used to pass a per-file check one by one and then travel together as
+    # a 774 KB payload. A single file gets exactly the old per-file allowance.
+    inline_budget = croc_manager.CROC_THRESHOLD_BYTES
+
     for i, file_spec in enumerate(files):
         remote_path = file_spec.get("remote_destination_path")
         local_path = file_spec.get("local_source_path")
@@ -630,9 +635,18 @@ def prepare_files_with_croc(
             f"{local_path or '<content>'} -> {remote_path}"
         )
         
-        # Content-based files always go inline (they're typically small)
+        # Content goes inline while it fits the call's remaining budget, and
+        # takes the croc path (staged as a real file) when it doesn't.
         if content:
-            inline_files.append(file_spec)
+            content_bytes = content if isinstance(content, bytes) else content.encode("utf-8")
+            content_gz = gzip.compress(content_bytes)
+            if len(content_gz) <= inline_budget:
+                file_spec["_content_gz_b64"] = base64.b64encode(content_gz).decode("ascii")
+                inline_budget -= len(content_gz)
+                inline_files.append(file_spec)
+            else:
+                file_spec["_content_bytes"] = content_bytes
+                croc_files.append(file_spec)
             continue
         
         # Check local file/directory size
@@ -641,37 +655,41 @@ def prepare_files_with_croc(
             plan.errors.append(f"File {i+1}: local path not found: {local_path}")
             continue
         
-        # The inline-vs-croc decision is made on COMPRESSED size, and the
-        # compression stops the moment it passes the threshold — a multi-GB
-        # upload must never be read into memory just to be told it needs croc.
+        # The inline-vs-croc decision is made on COMPRESSED size, against what is
+        # LEFT of this call's budget, and the compression stops the moment it
+        # passes that — a multi-GB upload must never be read into memory just to
+        # be told it needs croc.
         if os.path.isdir(expanded):
             try:
-                tar_gz = compress_dir_if_inline(expanded, croc_manager.CROC_THRESHOLD_BYTES)
+                tar_gz = compress_dir_if_inline(expanded, inline_budget)
                 if tar_gz is None:
                     croc_files.append(file_spec)
                 else:
                     # Store pre-computed tar for inline use
                     file_spec["_tar_b64"] = base64.b64encode(tar_gz).decode("ascii")
+                    inline_budget -= len(tar_gz)
                     inline_files.append(file_spec)
             except Exception as e:
                 plan.errors.append(f"File {i+1}: error reading directory: {e}")
                 continue
         else:
             try:
-                compressed = compress_file_if_inline(expanded, croc_manager.CROC_THRESHOLD_BYTES)
+                compressed = compress_file_if_inline(expanded, inline_budget)
                 if compressed is None:
                     croc_files.append(file_spec)
                 else:
                     # Store pre-computed compressed data for inline use
                     file_spec["_compressed_b64"] = base64.b64encode(compressed).decode("ascii")
+                    inline_budget -= len(compressed)
                     inline_files.append(file_spec)
             except Exception as e:
                 plan.errors.append(f"File {i+1}: error reading file: {e}")
                 continue
     
     if plan.errors:
+        _drop_cached_payloads(files)
         return plan
-    
+
     # --- Generate inline commands for small files ---
     if inline_files:
         commands = ["# === File Deployment (inline) ==="]
@@ -711,12 +729,11 @@ def prepare_files_with_croc(
                     if mode:
                         commands.append(f"chmod {mode} '{escaped_remote}'")
             else:
-                # Direct content
-                if isinstance(content, bytes):
-                    content_bytes = content
-                else:
-                    content_bytes = content.encode('utf-8')
-                content_b64 = base64.b64encode(gzip.compress(content_bytes)).decode("ascii")
+                # Direct content (already compressed when its budget was checked)
+                content_b64 = file_spec.get("_content_gz_b64")
+                if not content_b64:
+                    content_bytes = content if isinstance(content, bytes) else content.encode('utf-8')
+                    content_b64 = base64.b64encode(gzip.compress(content_bytes)).decode("ascii")
                 if escaped_dir:
                     commands.append(f"mkdir -p '{escaped_dir}'")
                 commands.append(f"echo '{content_b64}' | base64 -d | gzip -d > '{escaped_remote}'")
@@ -744,13 +761,29 @@ def prepare_files_with_croc(
         
         croc_transfer_info = []
         for i, file_spec in enumerate(croc_files):
-            local_path = file_spec["local_source_path"]
-            expanded = os.path.expanduser(local_path)
             remote_path = file_spec["remote_destination_path"]
             mode = file_spec.get("mode")
-            
+
+            if "_content_bytes" in file_spec:
+                # Content that did not fit the inline budget: stage it as a file
+                unique_name = f"_croc_{i}_{os.path.basename(remote_path) or 'content'}"
+                staged_path = os.path.join(staging_dir, unique_name)
+                with open(staged_path, "wb") as f:
+                    f.write(file_spec["_content_bytes"])
+                plan.croc_local_files.append(staged_path)
+                croc_transfer_info.append({
+                    "croc_filename": unique_name,
+                    "remote_destination_path": remote_path,
+                    "mode": mode,
+                    "is_dir_tar": False,
+                })
+                continue
+
+            local_path = file_spec["local_source_path"]
+            expanded = os.path.expanduser(local_path)
+
             basename = os.path.basename(expanded)
-            
+
             if os.path.isdir(expanded):
                 # Tar directory for consistent extraction semantics (matches inline behavior)
                 unique_name = f"_croc_{i}_{basename}.tar.gz"
@@ -810,12 +843,19 @@ def prepare_files_with_croc(
             )
             plan.croc_init_commands = croc_install + "\n" + croc_recv
     
-    # Clean up cached data from file_specs
-    for file_spec in inline_files:
-        file_spec.pop("_tar_b64", None)
-        file_spec.pop("_compressed_b64", None)
-    
+    _drop_cached_payloads(files)
     return plan
+
+
+def _drop_cached_payloads(files: list[dict]) -> None:
+    """Remove the payloads prepare_files_with_croc cached on the caller's specs.
+
+    The specs are the caller's own dicts (the tool's arguments), so nothing
+    computed here - least of all whole file contents - may stay attached to them.
+    """
+    for file_spec in files:
+        for key in ("_tar_b64", "_compressed_b64", "_content_gz_b64", "_content_bytes"):
+            file_spec.pop(key, None)
 
 
 async def execute_with_croc(plan: FileDeploymentPlan) -> asyncio.subprocess.Process:
@@ -859,6 +899,18 @@ async def cleanup_croc_resources(
 
 # --- Download (remote→local) support ---
 
+# Every sentinel the remote croc-send wrapper can emit. The first one observed
+# marks the start of the transfer (DownloadPlan.transfer_started_at); ordinary
+# command output streams through the same observer and must not.
+_DOWNLOAD_SENTINELS = (
+    croc_manager.CROC_SENTINEL_SIZE,
+    croc_manager.CROC_SENTINEL_MD5,
+    croc_manager.CROC_SENTINEL_READY,
+    croc_manager.CROC_SENTINEL_RETRY,
+    croc_manager.CROC_SENTINEL_FAILED,
+    croc_manager.CROC_SENTINEL_DONE,
+)
+
 
 @dataclass
 class DownloadPlan:
@@ -900,6 +952,12 @@ class DownloadPlan:
     send_done_seen: bool = False
     remote_failed: bool = False
     remote_failure: str = ""
+    # Transfer timing (time.monotonic). The clock starts at the sender's FIRST
+    # sentinel and stops when complete_download() is done, because the command's
+    # own Duration excludes the transfer entirely: a download that spent 46 s
+    # failing was once reported next to "Duration: 0.2s".
+    transfer_started_at: Optional[float] = None
+    transfer_seconds: Optional[float] = None
     # Partial-line carry-over for observe_output chunk handling
     _watch_tail: str = field(default="", repr=False)
 
@@ -918,6 +976,9 @@ class DownloadPlan:
         self._watch_tail = lines.pop()[-1024:]
         for raw in lines:
             line = raw.strip()
+            if self.transfer_started_at is None and any(
+                    s in line for s in _DOWNLOAD_SENTINELS):
+                self.transfer_started_at = time.monotonic()
             if croc_manager.CROC_SENTINEL_SIZE in line:
                 payload = line.split(croc_manager.CROC_SENTINEL_SIZE, 1)[1].strip()
                 size_str, _, name = payload.partition(" ")
@@ -1077,8 +1138,11 @@ def prepare_download_with_croc(
         })
         plan.files_info.append(f"  {remote_path} → {local_path}")
     
-    # Generate croc install + send commands for the remote side
-    croc_install = croc_manager.generate_remote_croc_install_script()
+    # Generate croc install + send commands for the remote side. The install
+    # reports its own failure through the FAILED sentinel: the local receiver
+    # only learns about the sender from sentinels.
+    croc_install = croc_manager.generate_remote_croc_install_script(
+        failure_sentinel=croc_manager.CROC_SENTINEL_FAILED)
     
     if transfer_mode == "ssh":
         # For SSH: SCP files from target to container, then croc send
@@ -1269,7 +1333,7 @@ async def complete_download(
     if dl_plan.remote_failed:
         dl_plan.signal_abort()
         context_errors.append(
-            f"remote croc send failed: {dl_plan.remote_failure or 'unknown error'}"
+            f"remote croc send failed: {describe_remote_failure(dl_plan.remote_failure)}"
         )
     elif not dl_plan.send_ready_seen and not dl_plan.send_done_seen:
         # The sender never registered with the relay — nothing will ever arrive
@@ -1297,7 +1361,131 @@ async def complete_download(
         log_tail = _read_receive_log_tail(dl_plan)
         if log_tail:
             errors.append(f"receiver log (tail): {log_tail}")
+    if dl_plan.transfer_started_at is not None:
+        dl_plan.transfer_seconds = time.monotonic() - dl_plan.transfer_started_at
     return successes, errors
+
+
+def describe_remote_failure(failure: str) -> str:
+    """Render a FAILED sentinel for humans, e.g.
+
+    ``__CROC_DL_FAILED__ exit_code=1 reason=could not connect to : could not connect``
+    becomes ``exit code 1: could not connect to : could not connect (croc had no
+    relay address: ...)``.
+    """
+    if not failure:
+        return "unknown error"
+    match = re.search(r"exit_code=(\S+)(?:\s+reason=(.*))?", failure)
+    if not match:
+        return failure
+    code, reason = match.group(1), (match.group(2) or "").strip()
+    # A non-numeric "code" names the stage that failed (install, stage); the
+    # reason already says what happened there.
+    if code.lstrip("-").isdigit():
+        text = f"exit code {code}" + (f": {reason}" if reason else "")
+    else:
+        text = reason or f"failed during {code}"
+    hint = croc_manager.describe_croc_error(reason)
+    if hint:
+        text += f" ({hint})"
+    return text
+
+
+def _format_seconds(seconds: float) -> str:
+    return f"{int(seconds // 60)}m {seconds % 60:.1f}s" if seconds >= 60 else f"{seconds:.1f}s"
+
+
+def format_download_summary(
+    successes: list[str],
+    errors: list[str],
+    transfer_seconds: Optional[float] = None,
+) -> str:
+    """The **Files Downloaded:** block every handler shows (empty when there is nothing).
+
+    One formatter for all handlers: hand-built copies had drifted, and the async
+    status path labelled failed downloads "WARNING:" while the blocking handlers
+    and the CLI treat them as failures.
+    """
+    lines = [f"- {s}" for s in successes]
+    lines += [f"- DOWNLOAD FAILED: {e}" for e in errors]
+    if not lines:
+        return ""
+    if transfer_seconds is not None:
+        lines.append(f"- Transfer time: {_format_seconds(transfer_seconds)}")
+    return "\n**Files Downloaded:**\n" + "\n".join(lines) + "\n"
+
+
+def format_upload_summary(files_info: list[str], grain_log: Optional[str] = None) -> str:
+    """The **Files Deployed:** block, plus any upload that actually failed.
+
+    Without this, a failed croc upload was still listed as deployed, and the only
+    hint was "Container pre-commands failed with exit code 1" in the output.
+    """
+    if not files_info:
+        return ""
+    lines = [f"- {f}" for f in files_info]
+    lines += [f"- UPLOAD FAILED: {describe_upload_error(e)}" for e in extract_transfer_errors(grain_log)]
+    return "\n**Files Deployed:**\n" + "\n".join(lines) + "\n"
+
+
+def describe_upload_error(error: str) -> str:
+    """An extracted upload error, plus a plain-words explanation when the cause is known."""
+    hint = croc_manager.describe_croc_error(error)
+    return error + (f" ({hint})" if hint else "")
+
+
+async def _cli_upload_errors(plan: Optional["FileDeploymentPlan"], result) -> list[str]:
+    """The CLI's equivalent of the UPLOAD FAILED lines in format_upload_summary.
+
+    The CLI streams only the output after the execution marker, and upload
+    pre-commands run before it, so a failed croc upload showed nothing but
+    "Container pre-commands failed with exit code 1". Fetches the grain log only
+    when a croc upload was involved AND the run did not succeed.
+    """
+    if plan is None or not plan.needs_croc or result is None:
+        return []
+    if result.status == "completed" and result.exit_code == 0:
+        return []
+    try:
+        async with get_torque_client() as client:
+            grain_log = await client.get_grain_log(result.environment_id)
+    except Exception:
+        return []
+    return [describe_upload_error(e) for e in extract_transfer_errors(grain_log)]
+
+
+# A runtime error line: optional "[hh:mm:ss.mmm]" log timestamp, then the ERROR
+# itself at the start. Anchored because the container blueprint echoes its
+# commands into the log, so the receive script's SOURCE line
+# (`echo "ERROR: croc file receive failed (exit code: $__CROC_RC)..."`) is in
+# there too and must not be mistaken for a failure.
+_UPLOAD_ERROR_RE = re.compile(
+    r"^\s*(?:\[[^\]]*\]\s*)?ERROR: ((?:croc file receive failed|Failed to install croc).*)$")
+
+# Where a grain log's download section begins; errors after it are the
+# download's, and reach the caller through the FAILED sentinel instead.
+_DOWNLOAD_SECTION_MARKER = "=== Running download commands ==="
+
+
+def extract_transfer_errors(grain_log: Optional[str]) -> list[str]:
+    """Failed upload transfers a grain printed, with the reason.
+
+    The blueprint reports a failed upload only as "Container pre-commands failed
+    with exit code 1" (or a failed command); the line saying why is in the grain
+    log. Covers the croc receive and the croc install before it.
+    """
+    if not grain_log:
+        return []
+    found = []
+    for line in grain_log.splitlines():
+        if _DOWNLOAD_SECTION_MARKER in line and "echo" not in line:
+            break
+        match = _UPLOAD_ERROR_RE.match(line)
+        if match:
+            message = match.group(1).strip()
+            if message not in found:
+                found.append(message)
+    return found
 
 
 def _read_receive_log_tail(plan: DownloadPlan, max_chars: int = 1500) -> str:
@@ -1516,7 +1704,7 @@ _default_persistent_container_id: Optional[str] = None
 _background_streamers: dict[str, asyncio.Task] = {}  # env_id -> background streaming task
 _streamer_cache: dict[str, dict] = {}  # env_id -> {'env_data': ..., 'status': ..., 'raw_status': ...}
 _croc_async_state: dict[str, dict] = {}  # env_id -> {"process": Process, "staging_dir": str, "dl_process": Process, "dl_plan": DownloadPlan}
-_download_results: dict[str, tuple] = {}  # env_id -> (successes, errors) from finalize_download
+_download_results: dict[str, tuple] = {}  # env_id -> (successes, errors, transfer_seconds)
 
 # How long to wait for croc receive to finish AFTER the Torque environment completes.
 # The croc transfer through relay proxy can take a while to complete even after
@@ -3075,13 +3263,8 @@ async def handle_run_on_tunneled_ssh(arguments: dict, config: dict = None):
         dl_summary = ""
         if dl_plan is not None and dl_plan.needs_download:
             dl_successes, dl_errors = await complete_download(dl_plan, dl_process)
-            parts = []
-            if dl_successes:
-                parts.append("\n".join(f"- {s}" for s in dl_successes))
-            if dl_errors:
-                parts.append("\n".join(f"- DOWNLOAD FAILED: {e}" for e in dl_errors))
-            if parts:
-                dl_summary = "\n**Files Downloaded:**\n" + "\n".join(parts) + "\n"
+            dl_summary = format_download_summary(
+                dl_successes, dl_errors, dl_plan.transfer_seconds)
         
         # Format execution duration
         if result.execution_duration is not None:
@@ -3096,7 +3279,7 @@ async def handle_run_on_tunneled_ssh(arguments: dict, config: dict = None):
         # Build files summary if any were uploaded
         files_summary = ""
         if files_info:
-            files_summary = "\n**Files Deployed:**\n" + "\n".join(f"- {f}" for f in files_info) + "\n"
+            files_summary = format_upload_summary(files_info, grain_log)
         
         if result.status == "completed":
             output_block = format_code_block(result.command_output)
@@ -3432,13 +3615,8 @@ async def handle_run_on_tunneled_persistent_container(arguments: dict, config: d
         dl_summary = ""
         if dl_plan is not None and dl_plan.needs_download:
             dl_successes, dl_errors = await complete_download(dl_plan, dl_process)
-            parts = []
-            if dl_successes:
-                parts.append("\n".join(f"- {s}" for s in dl_successes))
-            if dl_errors:
-                parts.append("\n".join(f"- DOWNLOAD FAILED: {e}" for e in dl_errors))
-            if parts:
-                dl_summary = "\n**Files Downloaded:**\n" + "\n".join(parts) + "\n"
+            dl_summary = format_download_summary(
+                dl_successes, dl_errors, dl_plan.transfer_seconds)
         
         if result.execution_duration is not None:
             duration = result.execution_duration
@@ -3451,7 +3629,7 @@ async def handle_run_on_tunneled_persistent_container(arguments: dict, config: d
         
         files_summary = ""
         if files_info:
-            files_summary = "\n**Files Deployed:**\n" + "\n".join(f"- {f}" for f in files_info) + "\n"
+            files_summary = format_upload_summary(files_info, grain_log)
         
         if result.status == "completed":
             output_block = format_code_block(result.command_output)
@@ -3618,13 +3796,8 @@ async def handle_run_on_tunneled_disposable_container(arguments: dict, config: d
         dl_summary = ""
         if dl_plan is not None and dl_plan.needs_download:
             dl_successes, dl_errors = await complete_download(dl_plan, dl_process)
-            parts = []
-            if dl_successes:
-                parts.append("\n".join(f"- {s}" for s in dl_successes))
-            if dl_errors:
-                parts.append("\n".join(f"- DOWNLOAD FAILED: {e}" for e in dl_errors))
-            if parts:
-                dl_summary = "\n**Files Downloaded:**\n" + "\n".join(parts) + "\n"
+            dl_summary = format_download_summary(
+                dl_successes, dl_errors, dl_plan.transfer_seconds)
         
         # Format execution duration
         if result.execution_duration is not None:
@@ -3640,7 +3813,7 @@ async def handle_run_on_tunneled_disposable_container(arguments: dict, config: d
         # Build files summary if any were uploaded
         files_summary = ""
         if files_info:
-            files_summary = "\n**Files Deployed:**\n" + "\n".join(f"- {f}" for f in files_info) + "\n"
+            files_summary = format_upload_summary(files_info, grain_log)
         
         if result.status == "completed":
             output_block = format_code_block(result.command_output)
@@ -4215,7 +4388,8 @@ async def handle_get_execution_status(arguments: dict):
                         pass
                     dl_successes, dl_errors = await complete_download(dl_plan, dl_process)
                     # Store results for output formatting
-                    _download_results[environment_id] = (dl_successes, dl_errors)
+                    _download_results[environment_id] = (
+                        dl_successes, dl_errors, dl_plan.transfer_seconds)
                     await cleanup_download_resources(dl_process, dl_plan.croc_receive_dir)
         
         # We need a client for extracting outputs, cleanup, and grain log fetching
@@ -4251,14 +4425,7 @@ async def handle_get_execution_status(arguments: dict):
                 dl_summary = ""
                 dl_result = _download_results.pop(environment_id, None)
                 if dl_result:
-                    dl_successes, dl_errors = dl_result
-                    parts = []
-                    if dl_successes:
-                        parts.append("\n".join(f"- {s}" for s in dl_successes))
-                    if dl_errors:
-                        parts.append("\n".join(f"- WARNING: {e}" for e in dl_errors))
-                    if parts:
-                        dl_summary = "\n**Files Downloaded:**\n" + "\n".join(parts) + "\n"
+                    dl_summary = format_download_summary(*dl_result)
                 
                 output_text = f"""{status_msg}
 
@@ -4826,6 +4993,7 @@ async def cli_dispatch(args):
                 finally:
                     await cleanup_download_resources(dl_process, dl_plan.croc_receive_dir)
 
+            upload_errors = await _cli_upload_errors(plan, result)
             if output_json:
                 result_dict = {
                     "status": result.status,
@@ -4835,20 +5003,26 @@ async def cli_dispatch(args):
                     "environment_id": result.environment_id,
                 }
                 if dl_successes or dl_errors:
-                    result_dict["downloads"] = {"successes": dl_successes, "errors": dl_errors}
+                    result_dict["downloads"] = {"successes": dl_successes, "errors": dl_errors, "transfer_seconds": dl_plan.transfer_seconds if dl_plan else None}
+                if upload_errors:
+                    result_dict["upload_errors"] = upload_errors
                 print(json_module.dumps(result_dict))
-                if dl_errors:
+                if dl_errors or upload_errors:
                     sys.exit(1)
             else:
+                for e in upload_errors:
+                    print(f"UPLOAD FAILED: {e}", file=sys.stderr)
                 if result.status == "completed":
                     print(result.command_output or "", end='')
                     for s in dl_successes:
-                        print(f"Downloaded: {s}", file=sys.stderr)
+                        print(s, file=sys.stderr)  # already reads "Downloaded: <path>"
                     for e in dl_errors:
                         print(f"DOWNLOAD FAILED: {e}", file=sys.stderr)
+                    if dl_plan is not None and dl_plan.transfer_seconds is not None:
+                        print(f"Transfer time: {_format_seconds(dl_plan.transfer_seconds)}", file=sys.stderr)
                     # A requested download that did not complete is a failure,
                     # even when the remote command itself exited 0
-                    sys.exit(1 if dl_errors else (result.exit_code or 0))
+                    sys.exit(1 if (dl_errors or upload_errors) else (result.exit_code or 0))
                 else:
                     print(f"Error: {result.error}", file=sys.stderr)
                     sys.exit(1)
@@ -5109,6 +5283,7 @@ async def cli_dispatch(args):
                     finally:
                         await cleanup_download_resources(dl_process, dl_plan.croc_receive_dir)
 
+                upload_errors = await _cli_upload_errors(plan, result)
                 if output_json:
                     result_dict = {
                         "status": result.status,
@@ -5119,20 +5294,26 @@ async def cli_dispatch(args):
                         "persistent_container_id": used_env_id,
                     }
                     if dl_successes or dl_errors:
-                        result_dict["downloads"] = {"successes": dl_successes, "errors": dl_errors}
+                        result_dict["downloads"] = {"successes": dl_successes, "errors": dl_errors, "transfer_seconds": dl_plan.transfer_seconds if dl_plan else None}
+                    if upload_errors:
+                        result_dict["upload_errors"] = upload_errors
                     print(json_module.dumps(result_dict))
-                    if dl_errors:
+                    if dl_errors or upload_errors:
                         sys.exit(1)
                 else:
+                    for e in upload_errors:
+                        print(f"UPLOAD FAILED: {e}", file=sys.stderr)
                     if result.status == "completed":
                         print(result.command_output or "", end='')
                         for s in dl_successes:
-                            print(f"Downloaded: {s}", file=sys.stderr)
+                            print(s, file=sys.stderr)  # already reads "Downloaded: <path>"
                         for e in dl_errors:
                             print(f"DOWNLOAD FAILED: {e}", file=sys.stderr)
+                        if dl_plan is not None and dl_plan.transfer_seconds is not None:
+                            print(f"Transfer time: {_format_seconds(dl_plan.transfer_seconds)}", file=sys.stderr)
                         # A requested download that did not complete is a failure,
                         # even when the remote command itself exited 0
-                        sys.exit(1 if dl_errors else (result.exit_code or 0))
+                        sys.exit(1 if (dl_errors or upload_errors) else (result.exit_code or 0))
                     else:
                         print(f"Error: {result.error}", file=sys.stderr)
                         sys.exit(1)
@@ -5233,6 +5414,7 @@ async def cli_dispatch(args):
                 finally:
                     await cleanup_download_resources(dl_process, dl_plan.croc_receive_dir)
 
+            upload_errors = await _cli_upload_errors(plan, result)
             if output_json:
                 result_dict = {
                     "status": result.status,
@@ -5242,20 +5424,26 @@ async def cli_dispatch(args):
                     "environment_id": result.environment_id,
                 }
                 if dl_successes or dl_errors:
-                    result_dict["downloads"] = {"successes": dl_successes, "errors": dl_errors}
+                    result_dict["downloads"] = {"successes": dl_successes, "errors": dl_errors, "transfer_seconds": dl_plan.transfer_seconds if dl_plan else None}
+                if upload_errors:
+                    result_dict["upload_errors"] = upload_errors
                 print(json_module.dumps(result_dict))
-                if dl_errors:
+                if dl_errors or upload_errors:
                     sys.exit(1)
             else:
+                for e in upload_errors:
+                    print(f"UPLOAD FAILED: {e}", file=sys.stderr)
                 if result.status == "completed":
                     print(result.command_output or "", end='')
                     for s in dl_successes:
-                        print(f"Downloaded: {s}", file=sys.stderr)
+                        print(s, file=sys.stderr)  # already reads "Downloaded: <path>"
                     for e in dl_errors:
                         print(f"DOWNLOAD FAILED: {e}", file=sys.stderr)
+                    if dl_plan is not None and dl_plan.transfer_seconds is not None:
+                        print(f"Transfer time: {_format_seconds(dl_plan.transfer_seconds)}", file=sys.stderr)
                     # A requested download that did not complete is a failure,
                     # even when the remote command itself exited 0
-                    sys.exit(1 if dl_errors else (result.exit_code or 0))
+                    sys.exit(1 if (dl_errors or upload_errors) else (result.exit_code or 0))
                 else:
                     print(f"Error: {result.error}", file=sys.stderr)
                     sys.exit(1)
