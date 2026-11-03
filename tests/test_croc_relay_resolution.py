@@ -236,12 +236,8 @@ class TestRemoteDnsWarmupAndErrors:
                 (control / f).write_text("1")
             script = tmp_path / "under_test.sh"
             bh.write_text(script, FAKE_TIMEOUT_FUNC + "\n".join(lines) + '\necho "RC=$__CROC_RC"\n')
-            env = os.environ.copy()
-            env["FAKE_DIR"] = str(control)
-            env["PATH"] = str(fake_bin) + os.pathsep + env["PATH"]
-            import subprocess
-            return subprocess.run([bh.BASH, str(script)], cwd=str(work),
-                                  capture_output=True, text=True, timeout=120, env=env)
+            return bh.run_script(script, env={"FAKE_DIR": control},
+                                 prepend_path=[fake_bin], cwd=work)
 
         def calls():
             f = control / "calls"
@@ -364,7 +360,6 @@ exit 1
 """
 
     def test_failed_sentinel_carries_the_reason_but_never_the_code(self, tmp_path, monkeypatch):
-        import subprocess
         monkeypatch.setattr(croc_manager, "CROC_SEND_RETRY_DELAY_SECONDS", 0)
         monkeypatch.setattr(croc_manager, "CROC_DNS_WARMUP_SECONDS", 1)
         fake_bin = tmp_path / "bin"
@@ -379,15 +374,11 @@ exit 1
         secret = "SENTINEL-TEST-SECRET-do-not-leak-0123456789"
         cmds = croc_manager.generate_croc_send_commands(
             code=secret,
-            file_infos=[{"remote_source_path": str(src).replace("\\", "/"),
+            file_infos=[{"remote_source_path": bh.shell_path(src),
                          "croc_filename": "_croc_dl_0_data.bin"}])
         script = tmp_path / "send.sh"
         bh.write_text(script, self.TIMEOUT_FUNC + cmds + "\n")
-        env = os.environ.copy()
-        env["FAKE_DIR"] = str(control)
-        env["PATH"] = str(fake_bin) + os.pathsep + env["PATH"]
-        proc = subprocess.run([bh.BASH, str(script)], capture_output=True, text=True,
-                              timeout=120, env=env)
+        proc = bh.run_script(script, env={"FAKE_DIR": control}, prepend_path=[fake_bin])
 
         failed = [l for l in proc.stdout.splitlines() if croc_manager.CROC_SENTINEL_FAILED in l]
         assert failed, proc.stdout + proc.stderr

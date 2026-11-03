@@ -41,32 +41,8 @@ from torque_tunnel.mcp_tool import (
     cleanup_download_resources,
 )
 
-def _find_bash():
-    """Locate a bash that accepts Windows paths (Git Bash) — NOT WSL bash.
-
-    On Windows, shutil.which("bash") often returns C:\\Windows\\system32\\bash.EXE
-    (WSL), which mangles Windows-style script paths. Prefer Git Bash.
-    """
-    if sys.platform != "win32":
-        return shutil.which("bash")
-    candidates = []
-    git = shutil.which("git")
-    if git:
-        git_root = Path(git).parent.parent
-        candidates += [git_root / "bin" / "bash.exe", git_root / "usr" / "bin" / "bash.exe"]
-    candidates += [
-        Path(r"C:\Program Files\Git\bin\bash.exe"),
-        Path(r"C:\Program Files\Git\usr\bin\bash.exe"),
-    ]
-    for c in candidates:
-        if c.exists():
-            return str(c)
-    return None
-
-
-BASH = _find_bash()
-
-needs_bash = pytest.mark.skipif(BASH is None, reason="Git Bash not available")
+# The generated shell runs under WSL on Windows (see _bash_harness).
+from _bash_harness import needs_bash, run_script, shell_path
 
 
 def _write_text(path, content):
@@ -110,7 +86,7 @@ case "$scenario" in
     echo "    croc $CROC_SECRET"
     echo "(For Linux/macOS)"
     echo "    CROC_SECRET=\"$CROC_SECRET\" croc"
-    sleep 1
+    sleep 0.3
     exit 0
     ;;
   fail_no_channel)
@@ -128,20 +104,20 @@ case "$scenario" in
     echo "Sending 'x' (5 B)"
     echo "Code is: $CROC_SECRET"
     echo "_croc_dl_x 100% (5/5 B, 1 MB/s)"
-    sleep 120
-    exit 0
+    exec sleep 120
     ;;
   stall_mid)
     echo "Sending 'x' (5 B)"
     echo "Code is: $CROC_SECRET"
     echo "_croc_dl_x  87% (2.1/2.4 GB, 680 kB/s)"
-    sleep 300
-    exit 0
+    exec sleep 300
     ;;
   wait_then_ok)
+    # Waits (no percentage line) for well over the harness's mid-stall window:
+    # CROC_SEND_MIDSTALL_CHECKS=2 checks x 10 ticks of FAST_TICK = ~1s.
     echo "Sending 'x' (5 B)"
     echo "Code is: $CROC_SECRET"
-    sleep 22
+    sleep 3
     echo "_croc_dl_x 100% (5/5 B, 1 MB/s)"
     exit 0
     ;;
@@ -149,10 +125,13 @@ esac
 exit 3
 """
 
+# The send monitor's tick in these tests (production: 0.5s).
+FAST_TICK = 0.05
+
 # Records the requested timeout duration, then runs the command WITHOUT enforcing
-# it. Defined as a shell FUNCTION prepended to the script under test because Git
-# Bash prepends /usr/bin to PATH, so a fake-bin `timeout` would lose to the real
-# one — functions outrank PATH lookup. Invoked as: timeout -k 5 <seconds> cmd...
+# it. A shell FUNCTION prepended to the script under test (functions outrank PATH
+# lookup, so the real coreutils `timeout` never runs). Invoked as:
+# timeout -k 5 <seconds> cmd...
 FAKE_TIMEOUT_FUNC = r"""timeout() {
   echo "$3" >> "$FAKE_CROC_DIR/timeouts.txt"
   shift 3
@@ -178,19 +157,15 @@ class TestSendCommandsBehavior:
 
         # No delay between send attempts in tests
         monkeypatch.setattr(croc_manager, "CROC_SEND_RETRY_DELAY_SECONDS", 0)
+        # Progress checks every 0.5s instead of 5s; the CHECKS limits count checks,
+        # so every stall/hang rule keeps its meaning, only sooner.
+        monkeypatch.setattr(croc_manager, "CROC_SEND_MONITOR_TICK_SECONDS", FAST_TICK)
 
         def run(commands, scenarios):
             _write_text(control / "scenario.txt", "\n".join(scenarios) + "\n")
             script = tmp_path / "under_test.sh"
             _write_text(script, FAKE_TIMEOUT_FUNC + commands + "\n")
-            env = os.environ.copy()
-            env["FAKE_CROC_DIR"] = str(control)
-            env["PATH"] = str(fake_bin) + os.pathsep + env["PATH"]
-            proc = subprocess.run(
-                [BASH, str(script)],
-                capture_output=True, text=True, timeout=120, env=env,
-            )
-            return proc
+            return run_script(script, env={"FAKE_CROC_DIR": control}, prepend_path=[fake_bin])
 
         def attempts():
             count_file = control / "count"
@@ -199,8 +174,8 @@ class TestSendCommandsBehavior:
         return {"run": run, "control": control, "src": src, "attempts": attempts}
 
     def _commands(self, src, timeout=300):
-        # POSIX-style path for use inside bash
-        posix_src = str(src).replace("\\", "/")
+        # The path as the script sees it
+        posix_src = shell_path(src)
         return croc_manager.generate_croc_send_commands(
             code="test-code",
             file_infos=[{
@@ -276,7 +251,7 @@ class TestSendCommandsBehavior:
         with open(big, "wb") as f:
             f.seek(5_000_000 - 1)
             f.write(b"\0")
-        posix_big = str(big).replace("\\", "/")
+        posix_big = shell_path(big)
         commands = croc_manager.generate_croc_send_commands(
             code="c",
             file_infos=[{"remote_source_path": posix_big, "croc_filename": "_croc_dl_0_big.bin"}],
@@ -345,7 +320,7 @@ class TestSendCommandsBehavior:
         commands = croc_manager.generate_croc_send_commands(
             code="c",
             file_infos=[{
-                "remote_source_path": str(tmp_path / "missing-file").replace("\\", "/"),
+                "remote_source_path": shell_path(tmp_path / "missing-file"),
                 "croc_filename": "_croc_dl_0_missing",
             }],
         )
@@ -780,6 +755,9 @@ class TestCompleteDownload:
     async def test_remote_failure_returns_quickly(self, receive_dir, monkeypatch):
         """Remote sender failed → no 30-minute wait; error mentions the remote failure."""
         monkeypatch.setattr(mcp_tool, "CROC_DOWNLOAD_ABORT_WAIT_SECONDS", 0.3)
+        # The stand-in receiver never reacts to the abort signal, so cleanup ends
+        # up terminating it either way; don't make it wait 5s first.
+        monkeypatch.setattr(mcp_tool, "CROC_DOWNLOAD_CLEANUP_WAIT_SECONDS", 0.3)
         plan = DownloadPlan(
             needs_download=True,
             croc_receive_dir=str(receive_dir),
@@ -807,6 +785,9 @@ class TestCompleteDownload:
     @pytest.mark.asyncio
     async def test_sender_never_registered_aborts(self, receive_dir, monkeypatch):
         monkeypatch.setattr(mcp_tool, "CROC_DOWNLOAD_ABORT_WAIT_SECONDS", 0.3)
+        # The stand-in receiver never reacts to the abort signal, so cleanup ends
+        # up terminating it either way; don't make it wait 5s first.
+        monkeypatch.setattr(mcp_tool, "CROC_DOWNLOAD_CLEANUP_WAIT_SECONDS", 0.3)
         plan = DownloadPlan(
             needs_download=True,
             croc_receive_dir=str(receive_dir),

@@ -7,6 +7,8 @@
 pytest>=8.2
 pytest-asyncio>=0.23
 hypothesis>=6.100
+# Parallel runs: python -m pytest tests -n 16 --dist worksteal  (~50s instead of ~3min).
+pytest-xdist>=3.6
 
 # Static-analysis gate (tests/test_static_analysis.py). Scope-aware, so it catches an
 # undefined name in one function even when another function defines that name - the

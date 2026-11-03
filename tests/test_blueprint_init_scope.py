@@ -50,7 +50,7 @@ cat > /dev/null
 exit 0
 """
 
-# `timeout` is coreutils; Git Bash can't shim it via PATH, so a shell function.
+# `timeout` is a shell function, like the other harnesses' coreutils fakes.
 FAKE_TIMEOUT_FUNC = r"""timeout() {
   shift 1
   "$@"
@@ -68,11 +68,8 @@ class TestPreCommandsSeeTheProfileInit:
         control.mkdir()
         bh.make_executable(fake_bin / "ssh", FAKE_SSH)
         template = _run_ssh_command()
-        # Git Bash's wrapper puts /usr/bin (with a real ssh) ahead of the inherited
-        # PATH, so the fake has to be put first from inside the script.
-        fake_bin_posix = subprocess.run(
-            [bh.BASH, "-c", f"cygpath -u '{fake_bin}'"], capture_output=True, text=True
-        ).stdout.strip() or str(fake_bin).replace("\\", "/")
+        # Put first from inside the script, after the launcher's own PATH setup.
+        fake_bin_posix = bh.shell_path(fake_bin)
 
         def run(init="", pre="", command="true"):
             inputs = {
@@ -91,13 +88,12 @@ class TestPreCommandsSeeTheProfileInit:
             rendered = re.sub(r"\{\{ \.inputs\.(\w+) \}\}",
                               lambda m: inputs.get(m.group(1), ""), template)
             script = tmp_path / "run_ssh.sh"
+            # The proxy variables are cleared: the tests assert which proxy the
+            # profile's init_commands set, and an inherited one would mask that.
             bh.write_text(script, f'export PATH="{fake_bin_posix}:$PATH"\n'
+                                  "unset http_proxy https_proxy no_proxy HTTP_PROXY HTTPS_PROXY NO_PROXY\n"
                                   + FAKE_TIMEOUT_FUNC + rendered + "\n")
-            env = {k: v for k, v in os.environ.items()
-                   if k.lower() not in ("http_proxy", "https_proxy", "no_proxy")}
-            env["FAKE_DIR"] = str(control)
-            proc = subprocess.run([bh.BASH, str(script)], capture_output=True, text=True,
-                                  timeout=120, env=env)
+            proc = bh.run_script(script, env={"FAKE_DIR": control})
             calls = control / "ssh_calls"
             return proc, calls.exists()
 

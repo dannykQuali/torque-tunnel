@@ -152,6 +152,10 @@ CROC_SEND_STALL_CHECKS = 9
 # sentinel delivery) can legitimately last minutes and must not trip this.
 CROC_SEND_MIDSTALL_CHECKS = 24
 
+# The send monitor polls every tick and checks progress every 10 ticks (5s). The
+# CHECKS limits above count those checks, so they stay meaningful at any tick.
+CROC_SEND_MONITOR_TICK_SECONDS = 0.5
+
 
 def _get_cache_dir() -> Path:
     """Get platform-appropriate cache directory for the croc binary."""
@@ -1126,6 +1130,7 @@ def _generate_croc_send_core(
     c.extend(f'  {line}' for line in generate_dns_warmup(relay))
     c.append(f'  timeout -k 5 "$__DL_TIMEOUT" {croc_send} "$@" > .croc_send.log 2>&1 &')
     c.append('  __CROC_PID=$!')
+    c.append('  __CROC_T0=$SECONDS')
     c.append('  __CROC_READY=0')
     c.append('  __CROC_TICK=0')
     c.append('  __CROC_PREV=""')
@@ -1170,7 +1175,7 @@ def _generate_croc_send_core(
     c.append('          __CROC_STALL_KILL=1')
     c.append('          kill "$__CROC_PID" 2>/dev/null')
     c.append('        elif [ "$__CROC_QUIET" -ge 6 ]; then')
-    c.append('          echo "[croc send] still running ($((__CROC_TICK / 2))s): $__CROC_LAST"')
+    c.append('          echo "[croc send] still running ($((SECONDS - __CROC_T0))s): $__CROC_LAST"')
     c.append('          __CROC_QUIET=0')
     c.append('        fi')
     # Heartbeat every ~30s while output is otherwise unchanged: liveness signal
@@ -1180,13 +1185,13 @@ def _generate_croc_send_core(
     c.append('      else')
     c.append('        __CROC_QUIET=$((__CROC_QUIET + 1))')
     c.append('        if [ "$__CROC_QUIET" -ge 6 ]; then')
-    c.append('          echo "[croc send] still running ($((__CROC_TICK / 2))s): $__CROC_LAST"')
+    c.append('          echo "[croc send] still running ($((SECONDS - __CROC_T0))s): $__CROC_LAST"')
     c.append('          __CROC_QUIET=0')
     c.append('        fi')
     c.append('      fi')
     c.append('    fi')
     c.append('    __CROC_TICK=$((__CROC_TICK + 1))')
-    c.append('    sleep 0.5')
+    c.append(f'    sleep {CROC_SEND_MONITOR_TICK_SECONDS}')
     c.append('  done')
     c.append('  wait "$__CROC_PID"')
     c.append('  __DL_RC=$?')
@@ -1375,6 +1380,448 @@ def generate_croc_scp_download_commands(
     ))
     commands.append("# === End SCP download + croc send ===")
     return "\n".join(commands)
+
+
+# --- Remote-to-remote transfer support ---
+# A file goes from a SOURCE machine to a DESTINATION machine that cannot reach each
+# other, through two Torque environments: the sender's (stage from the source + the
+# monitored croc send above, in its download slot) and the receiver's (monitored croc
+# receive + verify + place on the destination, in its container pre-commands). The
+# caller only orchestrates. See docs/design-remote-to-remote-transfer.md.
+
+# "<sentinel> <croc_filename>": the staged file is a tar.gz of a source DIRECTORY, so the
+# receiver extracts it instead of placing it. Directories are tarred on the sender so
+# every croc payload is a regular file covered by the size/MD5 sentinels (a directory
+# sent as-is would have neither).
+CROC_SENTINEL_DIR = "__CROC_DL_DIR__"
+
+# Receiver sentinels, read from the receiver environment's grain log.
+CROC_RX_SENTINEL_PLACED = "__CROC_RX_PLACED__"  # "<sentinel> <destination path>"
+CROC_RX_SENTINEL_DONE = "__CROC_RX_DONE__"      # every file verified and placed
+CROC_RX_SENTINEL_FAILED = "__CROC_RX_FAILED__"  # "<sentinel> exit_code=<n|stage> reason=<text>"
+
+# The sender's croc-send clock starts before the receiver environment exists: the
+# receiver is only launched once the sender reports READY. Its timeout floor therefore
+# includes the time to create and start that environment.
+RELAY_RECEIVER_LAUNCH_BUDGET_SECONDS = 600
+
+# Receiver stall handling. Both legs of a remote-to-remote transfer go through the
+# lab proxy, where a transfer was seen frozen mid-flight for 25 minutes. The receiver
+# must NOT move before the sender does: the sender kills a frozen transfer after
+# ~CROC_SEND_MIDSTALL_CHECKS (~120s), waits CROC_SEND_RETRY_DELAY_SECONDS and registers
+# a fresh room. So the receiver's own stall limit is longer (36 x 5s = ~180s), and its
+# retry waits longer than the sender's delay, so it joins the NEW room, after the sender
+# has registered it - sender-first without a back-channel into the receiver.
+CROC_RECEIVE_MIDSTALL_CHECKS = 36
+CROC_RECEIVE_RETRY_DELAY_SECONDS = CROC_SEND_RETRY_DELAY_SECONDS + 12
+# Progress unchanged at 100% for this many 5s checks: verify the files, and if they are
+# all complete, stop croc instead of waiting out its timeout (the sender's known
+# hang-after-transfer, seen from the other side).
+CROC_RECEIVE_STALL_CHECKS = 9
+# The receive monitor polls every tick and checks progress every 10 ticks (5s).
+RELAY_MONITOR_TICK_SECONDS = 0.5
+
+_SSH_OPTS = "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
+
+
+def _ssh_function(name: str, key_var: str, target_ip: str, ssh_user: str,
+                  ssh_private_key: str = "", ssh_password: str = "") -> tuple[list[str], list[str]]:
+    """Shell lines defining ``name`` as "ssh to the target", and the lines that clean up.
+
+    ``name <remote command>`` runs one remote command, which must already be quoted
+    as ONE shell word (see ``_q``). Its stdin is the function's stdin, so callers pass
+    ``</dev/null`` when not streaming data in. Files are copied by piping through ssh
+    (``cat >``) rather than scp, whose remote-path quoting differs between the legacy
+    and the SFTP protocol.
+    """
+    target = _q(f"{ssh_user}@{target_ip}")
+    if ssh_private_key:
+        lines = [
+            f'{key_var}=$(mktemp)',
+            f"cat << '{key_var}_EOF' > \"${key_var}\"",
+            ssh_private_key,
+            f"{key_var}_EOF",
+            f'chmod 600 "${key_var}"',
+            f'{name}() {{ ssh {_SSH_OPTS} -i "${key_var}" {target} "$@"; }}',
+        ]
+        return lines, [f'rm -f "${key_var}"']
+    if ssh_password:
+        lines = [
+            "if ! command -v sshpass &>/dev/null; then",
+            "  apt-get install -y -qq sshpass >/dev/null 2>&1 \\",
+            "    || { apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq sshpass >/dev/null 2>&1; }",
+            "fi",
+            # Through the environment (sshpass -e), so it is not in the process list.
+            f"{name}() {{ SSHPASS={_q(ssh_password)} sshpass -e ssh {_SSH_OPTS} "
+            f"-o PubkeyAuthentication=no {target} \"$@\"; }}",
+        ]
+        return lines, []
+    raise ValueError("Either ssh_private_key or ssh_password is required")
+
+
+def _q(s: str) -> str:
+    """Quote a string as one POSIX shell word."""
+    import shlex
+    return shlex.quote(s)
+
+
+def _move_into_place(partial: str, dest: str) -> str:
+    """Remote command: move a verified copy to its destination path.
+
+    Refuses an existing DIRECTORY there: ``mv`` would put the copy inside it, under its
+    temporary name. destination_path names the file itself.
+    """
+    return (f"if [ -d {_q(dest)} ]; then rm -f {_q(partial)}; "
+            f"echo {_q(dest + ' is an existing directory; destination_path must name the file itself')} >&2; "
+            f"exit 1; fi; mv -f {_q(partial)} {_q(dest)}")
+
+
+def generate_croc_relay_send_commands(
+    code: str,
+    file_infos: list[dict],
+    target_ip: str,
+    ssh_user: str,
+    ssh_private_key: str = "",
+    ssh_password: str = "",
+    relay: str = "",
+    relay_password: str = "",
+    transfers: Optional[int] = None,
+) -> str:
+    """Shell commands for the SENDER side of a remote-to-remote transfer.
+
+    Runs on the source agent's container (the download slot of an SSH environment that
+    targets the source machine):
+    1. Copies each source path from the target into $__DL_DIR. A directory is streamed
+       as ``tar czf -`` and announced with CROC_SENTINEL_DIR.
+    2. Runs the same monitored croc send as downloads (_generate_croc_send_core): SIZE
+       and MD5 sentinels, READY once the relay room exists, stall handling, one retry,
+       DONE/FAILED.
+
+    A source path that cannot be read fails the whole transfer at once, with a FAILED
+    sentinel (``exit_code=stage``) naming it: unlike a download, there is no local side
+    that could report the missing file later.
+
+    Args:
+        code: The croc secret code.
+        file_infos: List of dicts with source_path and croc_filename.
+        target_ip, ssh_user, ssh_private_key, ssh_password: The source machine.
+        relay, relay_password, transfers: As for downloads; the receiver must use the
+            same relay.
+    """
+    ssh_lines, cleanup = _ssh_function(
+        "__rl_src", "__RL_KEY", target_ip, ssh_user, ssh_private_key, ssh_password)
+    c = ["# === Remote transfer: stage from the source + croc send ==="]
+    c.extend(ssh_lines)
+    c.append('__DL_DIR=$(mktemp -d)')
+    c.append('__rl_stage_fail() {')
+    c.append('  echo "ERROR: $1" >&2')
+    c.append(f'  echo "{CROC_SENTINEL_FAILED} exit_code=stage reason=$1"')
+    c.append('  cd /')
+    c.append('  rm -rf "$__DL_DIR"')
+    c.extend(f'  {line}' for line in cleanup)
+    c.append('  exit 1')
+    c.append('}')
+    for fi in file_infos:
+        src = fi["source_path"]
+        name = fi["croc_filename"]
+        staged = f'"$__DL_DIR/"{_q(name)}'
+        # The reason text goes inside double quotes: keep it free of anything the
+        # shell would expand there.
+        shown = re.sub(r'["$`\\]', "?", src)
+        c.append(f'if __rl_src {_q("test -d " + _q(src))} </dev/null; then')
+        c.append(f'  echo "{CROC_SENTINEL_DIR} {name}"')
+        c.append(f'  __rl_src {_q("tar czf - -C " + _q(src) + " .")} </dev/null > {staged}'
+                 f' || __rl_stage_fail "could not archive directory {shown} on the source"')
+        c.append('else')
+        c.append(f'  __rl_src {_q("cat " + _q(src))} </dev/null > {staged}'
+                 f' || __rl_stage_fail "could not read {shown} on the source"')
+        c.append('fi')
+    c.extend(_generate_croc_send_core(
+        code, 300 + RELAY_RECEIVER_LAUNCH_BUDGET_SECONDS, cleanup_commands=cleanup,
+        relay=relay, relay_password=relay_password, transfers=transfers,
+    ))
+    c.append("# === End remote transfer send ===")
+    return "\n".join(c)
+
+
+def relay_receive_timeout(total_bytes: int) -> int:
+    """croc receive timeout for a payload: the sender's rate assumption plus margin."""
+    return max(900, total_bytes // CROC_SEND_MIN_RATE_BYTES_PER_SEC + 600)
+
+
+def generate_croc_relay_receive_commands(
+    code: str,
+    manifest: list[dict],
+    target_ip: str,
+    ssh_user: str,
+    ssh_private_key: str = "",
+    ssh_password: str = "",
+    relay: str = "",
+    relay_password: str = "",
+) -> str:
+    """Shell commands for the RECEIVER side of a remote-to-remote transfer.
+
+    Runs on the destination agent's container (container pre-commands of an SSH
+    environment that targets the destination machine). Launched only after the sender
+    reported READY, so the first croc attempt joins an existing room.
+
+    1. Receives with croc in the background under a monitor that reports progress,
+       kills a transfer frozen below 100% (longer limit than the sender's, see
+       CROC_RECEIVE_MIDSTALL_CHECKS) and stops croc once every file is verified.
+    2. Verifies every file's size AND MD5 against the sender's manifest - a dead
+       transfer can leave a size-correct file full of holes.
+    3. Retries once on failure (after the sender's own retry has registered its new
+       room), plus the rate-limit backoff loop.
+    4. Places each file on the destination: piped through ssh into a temporary name,
+       MD5-checked there, then moved into place, so a broken copy never reaches the
+       destination path. Directories (tar.gz) are extracted.
+    5. Emits CROC_RX_SENTINEL_PLACED per file and DONE, or FAILED with the reason.
+
+    Args:
+        code: The croc secret code.
+        manifest: One dict per file: croc_filename, size (int), md5 (hex or None),
+            is_dir (bool), destination_path, mode (optional).
+        target_ip, ssh_user, ssh_private_key, ssh_password: The destination machine.
+        relay, relay_password: Must match the sender's.
+    """
+    ssh_lines, cleanup = _ssh_function(
+        "__rx_dst", "__RX_KEY", target_ip, ssh_user, ssh_private_key, ssh_password)
+    total = sum(int(m.get("size") or 0) for m in manifest)
+    c = ["# === Remote transfer: croc receive + place on the destination ==="]
+    c.extend(ssh_lines)
+    c.append('__CROC_DIR=$(mktemp -d)')
+    c.append('cd "$__CROC_DIR"')
+    c.append('__rx_fail() {')
+    c.append('  echo "ERROR: $1" >&2')
+    c.append(f'  echo "{CROC_RX_SENTINEL_FAILED} exit_code=${{2:-1}} reason=$1"')
+    c.append('  cd /')
+    c.append('  rm -rf "$__CROC_DIR"')
+    c.extend(f'  {line}' for line in cleanup)
+    c.append('  exit 1')
+    c.append('}')
+    # __rx_check <name> <size> <md5>: the received file is complete and intact. Sets
+    # __RX_BAD to why not. The hash is only computed once the size matches.
+    c.append('__rx_check() {')
+    c.append('  if [ ! -f "$1" ]; then __RX_BAD="$1 was not received"; return 1; fi')
+    c.append('  __RX_SIZE=$(stat -c %s "$1" 2>/dev/null)')
+    c.append('  if [ "$__RX_SIZE" != "$2" ]; then __RX_BAD="$1 is incomplete ($__RX_SIZE of $2 bytes)"; return 1; fi')
+    c.append('  if [ -n "$3" ]; then')
+    c.append("    __RX_MD5=$(md5sum \"$1\" 2>/dev/null | cut -d' ' -f1)")
+    c.append('    if [ "$__RX_MD5" != "$3" ]; then __RX_BAD="$1 is corrupt (md5 $__RX_MD5, expected $3)"; return 1; fi')
+    c.append('  fi')
+    c.append('  return 0')
+    c.append('}')
+    c.append('__rx_verify() {')
+    for m in manifest:
+        c.append(f'  __rx_check {_q(m["croc_filename"])} {int(m["size"])} {_q(m.get("md5") or "")} || return 1')
+    c.append('  return 0')
+    c.append('}')
+    c.append(f'__tt_last_croc_error() {{ {_LAST_CROC_ERROR_SH}; }}')
+    c.append(f'export CROC_SECRET={_q(code)}')
+    c.extend(_relay_env_export(relay_password))
+    c.append(f'__RX_TIMEOUT={relay_receive_timeout(total)}')
+    c.append('__rx_attempt() {')
+    c.append('  : > .croc_recv.log')
+    c.extend(f'  {line}' for line in generate_dns_warmup(relay))
+    c.append(f'  timeout -k 5 "$__RX_TIMEOUT" croc {_croc_global_flags(relay)}--yes --overwrite'
+             ' > .croc_recv.log 2>&1 &')
+    c.append('  __RX_PID=$!')
+    c.append('  __RX_T0=$SECONDS')
+    c.append('  __RX_TICK=0; __RX_PREV=""; __RX_STALL=0; __RX_MIDSTALL=0; __RX_QUIET=0')
+    c.append('  while kill -0 "$__RX_PID" 2>/dev/null; do')
+    c.append('    if [ "$__RX_TICK" -gt 0 ] && [ $((__RX_TICK % 10)) -eq 0 ]; then')
+    c.append("      __RX_LAST=$(tr '\\r' '\\n' < .croc_recv.log 2>/dev/null | grep '%' | tail -n 1)")
+    c.append('      if [ -n "$__RX_LAST" ] && [ "$__RX_LAST" != "$__RX_PREV" ]; then')
+    c.append('        echo "[croc receive] $__RX_LAST"')
+    c.append('        __RX_PREV=$__RX_LAST; __RX_STALL=0; __RX_MIDSTALL=0; __RX_QUIET=0')
+    c.append('      elif case "$__RX_LAST" in *100%*) true;; *) false;; esac; then')
+    # At 100%: once it has sat there a while, check the files - once, since hashing a
+    # multi-GB file takes a minute. All complete -> croc's job is done whatever it is
+    # waiting for. Not complete (another file still to come, or holes) -> keep
+    # counting toward the stall limit.
+    c.append('        __RX_STALL=$((__RX_STALL + 1)); __RX_MIDSTALL=$((__RX_MIDSTALL + 1))')
+    c.append(f'        if [ "$__RX_STALL" -eq {CROC_RECEIVE_STALL_CHECKS} ] && __rx_verify; then')
+    c.append('          echo "[croc receive] all files received and verified; croc did not exit - terminating it"')
+    c.append('          kill "$__RX_PID" 2>/dev/null')
+    c.append(f'        elif [ "$__RX_MIDSTALL" -ge {CROC_RECEIVE_MIDSTALL_CHECKS} ]; then')
+    c.append('          echo "[croc receive] transfer stalled with no progress - terminating for retry"')
+    c.append('          kill "$__RX_PID" 2>/dev/null')
+    c.append('        fi')
+    c.append('      elif [ -n "$__RX_LAST" ]; then')
+    c.append('        __RX_MIDSTALL=$((__RX_MIDSTALL + 1)); __RX_QUIET=$((__RX_QUIET + 1))')
+    c.append(f'        if [ "$__RX_MIDSTALL" -ge {CROC_RECEIVE_MIDSTALL_CHECKS} ]; then')
+    c.append('          echo "[croc receive] transfer stalled with no progress - terminating for retry"')
+    c.append('          kill "$__RX_PID" 2>/dev/null')
+    c.append('        elif [ "$__RX_QUIET" -ge 6 ]; then')
+    c.append('          echo "[croc receive] still running ($((SECONDS - __RX_T0))s): $__RX_LAST"; __RX_QUIET=0')
+    c.append('        fi')
+    # No progress line yet: connecting, or the sender is still hashing. A heartbeat
+    # keeps this environment's log moving for the status calls.
+    c.append('      else')
+    c.append('        __RX_QUIET=$((__RX_QUIET + 1))')
+    c.append('        if [ "$__RX_QUIET" -ge 6 ]; then')
+    c.append('          echo "[croc receive] waiting for data ($((SECONDS - __RX_T0))s)"; __RX_QUIET=0')
+    c.append('        fi')
+    c.append('      fi')
+    c.append('    fi')
+    c.append('    __RX_TICK=$((__RX_TICK + 1))')
+    c.append(f'    sleep {RELAY_MONITOR_TICK_SECONDS}')
+    c.append('  done')
+    c.append('  wait "$__RX_PID"')
+    c.append('  __RX_RC=$?')
+    c.append('  __RX_ERR=$(__tt_last_croc_error .croc_recv.log)')
+    c.append('}')
+    # Attempts: one general retry (aligned after the sender's), plus the rate-limit
+    # backoff waits. Success is decided by the files, not by croc's exit code.
+    waits = " ".join(str(w) for w in CROC_RECEIVE_RATE_LIMIT_BACKOFF_SECONDS)
+    c.append('__RX_OK=0; __RX_RETRY=1; __RX_RC=1; __RX_ERR=""')
+    c.append(f'__RX_RL_LEFT="{waits}"')
+    c.append(f'for __RX_N in $(seq 1 {len(CROC_RECEIVE_RATE_LIMIT_BACKOFF_SECONDS) + 2}); do')
+    c.append('  __rx_attempt')
+    c.append('  if __rx_verify; then __RX_OK=1; break; fi')
+    c.append(f'  if grep -q "{CROC_RATE_LIMIT_MARKER}" .croc_recv.log 2>/dev/null && [ -n "$__RX_RL_LEFT" ]; then')
+    c.append('    __RX_W=${__RX_RL_LEFT%% *}')
+    c.append('    if [ "$__RX_W" = "$__RX_RL_LEFT" ]; then __RX_RL_LEFT=""; else __RX_RL_LEFT=${__RX_RL_LEFT#* }; fi')
+    c.append('    echo "[croc receive] relay rate-limited this host; retrying in ${__RX_W}s"')
+    c.append('    sleep "$__RX_W"')
+    c.append('    continue')
+    c.append('  fi')
+    c.append('  if [ "$__RX_RETRY" -eq 1 ]; then')
+    c.append('    __RX_RETRY=0')
+    c.append(f'    echo "[croc receive] attempt failed (exit code $__RX_RC${{__RX_ERR:+: $__RX_ERR}}; $__RX_BAD); retrying once in {CROC_RECEIVE_RETRY_DELAY_SECONDS}s"')
+    c.append(f'    sleep {CROC_RECEIVE_RETRY_DELAY_SECONDS}')
+    c.append('    continue')
+    c.append('  fi')
+    c.append('  break')
+    c.append('done')
+    c.append('unset CROC_SECRET')
+    if relay_password:
+        c.append('unset CROC_PASS')
+    c.append('if [ "$__RX_OK" -ne 1 ]; then')
+    # Same wording as the upload receive's error, so extract_transfer_errors finds it.
+    c.append('  __rx_fail "croc file receive failed (exit code: $__RX_RC)${__RX_ERR:+: $__RX_ERR}; $__RX_BAD" "$__RX_RC"')
+    c.append('fi')
+    for m in manifest:
+        name = m["croc_filename"]
+        dest = m["destination_path"]
+        mode = m.get("mode")
+        received = f'"$__CROC_DIR/"{_q(name)}'
+        shown = re.sub(r'["$`\\]', "?", dest)
+        if m.get("is_dir"):
+            remote = f"mkdir -p {_q(dest)} && tar xzf - -C {_q(dest)}"
+            c.append(f'__rx_dst {_q(remote)} < {received}'
+                     f' || __rx_fail "could not extract into {shown} on the destination"')
+        else:
+            partial = dest + ".tt-partial"
+            parent = os.path.dirname(dest)
+            if parent:
+                c.append(f'__rx_dst {_q("mkdir -p " + _q(parent))} </dev/null'
+                         f' || __rx_fail "could not create the directory of {shown} on the destination"')
+            c.append(f'__rx_dst {_q("cat > " + _q(partial))} < {received}'
+                     f' || {{ __rx_dst {_q("rm -f " + _q(partial))} </dev/null;'
+                     f' __rx_fail "could not copy to {shown} on the destination"; }}')
+            if m.get("md5"):
+                # Verified again where it landed: the hop from this container to the
+                # destination is a second transfer.
+                c.append(f"__RX_GOT=$(__rx_dst {_q('md5sum ' + _q(partial))} </dev/null 2>/dev/null | cut -d' ' -f1)")
+                c.append('if [ -z "$__RX_GOT" ]; then')
+                c.append(f'  echo "WARNING: md5sum is not available on the destination; {shown} was not re-verified there"')
+                c.append(f'elif [ "$__RX_GOT" != {_q(m["md5"])} ]; then')
+                c.append(f'  __rx_dst {_q("rm -f " + _q(partial))} </dev/null')
+                c.append(f'  __rx_fail "content corruption copying to {shown} on the destination (md5 $__RX_GOT, expected {m["md5"]})"')
+                c.append('fi')
+            c.append(f'__rx_dst {_q(_move_into_place(partial, dest))} </dev/null'
+                     f' || __rx_fail "could not move the copy into place at {shown} on the destination'
+                     f' (is it an existing directory?)"')
+        if mode and _validate_mode(mode):
+            c.append(f'__rx_dst {_q("chmod " + mode + " " + _q(dest))} </dev/null'
+                     f' || __rx_fail "could not chmod {shown} on the destination"')
+        c.append(f'echo "{CROC_RX_SENTINEL_PLACED} {shown}"')
+    c.append('cd /')
+    c.append('rm -rf "$__CROC_DIR"')
+    c.extend(cleanup)
+    c.append(f'echo "{CROC_RX_SENTINEL_DONE}"')
+    c.append("# === End remote transfer receive ===")
+    return "\n".join(c)
+
+
+def generate_direct_copy_commands(files: list[dict], source: dict, destination: dict) -> str:
+    """Shell commands for a transfer whose endpoints sit behind the SAME agent.
+
+    That agent's container reaches both machines, so no croc and no relay are needed:
+    each file is streamed ``ssh source cat | ssh destination 'cat > partial'``, hashed
+    on both ends, then moved into place (directories: ``tar c | tar x``, which gzip's
+    CRC protects). Nothing is staged on the container's disk. Reports with the
+    receiver's sentinels (CROC_RX_SENTINEL_*), so the status tool reads it the same way.
+
+    Args:
+        files: One dict per file: source_path, destination_path, mode (optional).
+        source, destination: Dicts with target_ip, ssh_user, ssh_private_key,
+            ssh_password.
+    """
+    src_lines, src_cleanup = _ssh_function(
+        "__dc_src", "__DC_SKEY", source["target_ip"], source["ssh_user"],
+        source.get("ssh_private_key", ""), source.get("ssh_password", ""))
+    dst_lines, dst_cleanup = _ssh_function(
+        "__dc_dst", "__DC_DKEY", destination["target_ip"], destination["ssh_user"],
+        destination.get("ssh_private_key", ""), destination.get("ssh_password", ""))
+    cleanup = src_cleanup + dst_cleanup + ['kill "$__DC_HB" 2>/dev/null']
+    c = ["# === Remote transfer: direct copy (both endpoints behind one agent) ==="]
+    # A failure on the SOURCE end of a pipe must fail the copy.
+    c.append("set -o pipefail")
+    c.extend(src_lines)
+    c.extend(dst_lines)
+    # A long copy prints nothing; a heartbeat keeps the log (and the status calls) alive.
+    # sleep itself must not hold the log's stdout: killing the loop then releases it
+    # at once instead of after up to 30s.
+    c.append('( while sleep 30 </dev/null >/dev/null 2>&1; do echo "[direct copy] still copying (${SECONDS}s)"; done ) &')
+    c.append('__DC_HB=$!')
+    c.append('__dc_fail() {')
+    c.append('  echo "ERROR: $1" >&2')
+    c.append(f'  echo "{CROC_RX_SENTINEL_FAILED} exit_code=1 reason=$1"')
+    c.extend(f'  {line}' for line in cleanup)
+    c.append('  exit 1')
+    c.append('}')
+    for f in files:
+        src, dest, mode = f["source_path"], f["destination_path"], f.get("mode")
+        shown_src = re.sub(r'["$`\\]', "?", src)
+        shown = re.sub(r'["$`\\]', "?", dest)
+        c.append(f'echo "[direct copy] {shown_src} -> {shown}"')
+        c.append(f'if __dc_src {_q("test -d " + _q(src))} </dev/null; then')
+        c.append(f'  __dc_dst {_q("mkdir -p " + _q(dest))} </dev/null'
+                 f' || __dc_fail "could not create {shown} on the destination"')
+        c.append(f'  __dc_src {_q("tar czf - -C " + _q(src) + " .")} </dev/null'
+                 f' | __dc_dst {_q("tar xzf - -C " + _q(dest))}'
+                 f' || __dc_fail "could not copy directory {shown_src} to {shown}"')
+        c.append('else')
+        partial = dest + ".tt-partial"
+        parent = os.path.dirname(dest)
+        if parent:
+            c.append(f'  __dc_dst {_q("mkdir -p " + _q(parent))} </dev/null'
+                     f' || __dc_fail "could not create the directory of {shown} on the destination"')
+        c.append(f'  __dc_src {_q("cat " + _q(src))} </dev/null'
+                 f' | __dc_dst {_q("cat > " + _q(partial))}'
+                 f' || {{ __dc_dst {_q("rm -f " + _q(partial))} </dev/null;'
+                 f' __dc_fail "could not copy {shown_src} to {shown}"; }}')
+        c.append(f"  __DC_A=$(__dc_src {_q('md5sum ' + _q(src))} </dev/null 2>/dev/null | cut -d' ' -f1)")
+        c.append(f"  __DC_B=$(__dc_dst {_q('md5sum ' + _q(partial))} </dev/null 2>/dev/null | cut -d' ' -f1)")
+        c.append('  if [ -z "$__DC_A" ] || [ -z "$__DC_B" ]; then')
+        c.append(f'    echo "WARNING: md5sum is not available on both machines; {shown} was not verified"')
+        c.append('  elif [ "$__DC_A" != "$__DC_B" ]; then')
+        c.append(f'    __dc_dst {_q("rm -f " + _q(partial))} </dev/null')
+        c.append(f'    __dc_fail "content corruption copying to {shown} (md5 $__DC_B, expected $__DC_A)"')
+        c.append('  fi')
+        c.append(f'  __dc_dst {_q(_move_into_place(partial, dest))} </dev/null'
+                 f' || __dc_fail "could not move the copy into place at {shown} (is it an existing directory?)"')
+        c.append('fi')
+        if mode and _validate_mode(mode):
+            c.append(f'__dc_dst {_q("chmod " + mode + " " + _q(dest))} </dev/null'
+                     f' || __dc_fail "could not chmod {shown} on the destination"')
+        c.append(f'echo "{CROC_RX_SENTINEL_PLACED} {shown}"')
+    c.extend(cleanup)
+    c.append(f'echo "{CROC_RX_SENTINEL_DONE}"')
+    c.append("# === End direct copy ===")
+    return "\n".join(c)
 
 
 async def start_croc_receive(

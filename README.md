@@ -95,8 +95,19 @@ Full reference: [docs/configuration.md](docs/configuration.md).
 | `run_on_tunneled_ssh_async` | Start an SSH command asynchronously; returns an execution ID |
 | `run_on_tunneled_persistent_container_async` | Start a persistent-container command asynchronously |
 | `run_on_tunneled_disposable_container_async` | Start a disposable-container command asynchronously |
-| `get_execution_status` | Check the status/output of an async execution by ID |
-| `cancel_execution` | Cancel a running async execution |
+| `get_execution_status` | Check the status/output of an async execution by ID (pass the same `profile` if the command used one) |
+| `cancel_execution` | Cancel a running async execution (same `profile` rule) |
+
+### File transfer between two remote machines
+
+| Tool | Description |
+|------|-------------|
+| `transfer_files_between_tunneled_hosts_async` | Copy files/directories from one machine to another when both are reachable through torque-tunnel but not from each other; each side may use its own profile. The data does not pass through this machine. |
+| `get_transfer_status` | Status of such a transfer, from its sender and receiver environment ids |
+| `cancel_transfer` | Abort such a transfer (ends both environments) |
+
+CLI: `torque-tunnel transfer --from-host ... --to-host ... --file SRC:DST[:MODE]`. See
+[docs/design-remote-to-remote-transfer.md](docs/design-remote-to-remote-transfer.md).
 
 ### Configuration
 

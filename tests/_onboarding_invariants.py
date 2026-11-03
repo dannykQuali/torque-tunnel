@@ -10,6 +10,7 @@ text with exactly ONE contiguous block inserted — i.e. nothing the user had wa
 removed, reordered, or rewritten.
 """
 
+import itertools
 import json
 import math
 import os
@@ -23,6 +24,25 @@ from torque_tunnel import onboarding
 # --------------------------------------------------------------------------
 # Driving merge_entry on raw text (bytes preserved exactly — no newline xlat)
 # --------------------------------------------------------------------------
+
+_example_dirs: dict = {}
+_example_numbers = itertools.count()
+
+
+def fresh_path(tmp_path_factory, prefix, filename):
+    """A path named `filename` in a new, empty directory - one per Hypothesis example.
+
+    `tmp_path_factory.mktemp()` per example was the bulk of these suites' runtime:
+    to number a directory it scans every directory already under the shared base
+    temp dir, which made thousands of examples quadratic. Here each test prefix gets
+    ONE mktemp'd parent, and each example a plain mkdir inside it.
+    """
+    parent = _example_dirs.get(prefix)
+    if parent is None:
+        parent = _example_dirs[prefix] = tmp_path_factory.mktemp(prefix)
+    directory = parent / str(next(_example_numbers))
+    directory.mkdir()
+    return directory / filename
 
 def run_merge(path, before_text, *, family, entry, server_name="torque-tunnel", make_backup=False):
     """Write `before_text` (or leave absent if None) to `path`, run merge_entry,

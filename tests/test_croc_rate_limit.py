@@ -437,13 +437,11 @@ class TestRateLimitConstants:
 # The receiving side must survive a rate limit too (shell-level, under bash)
 # ============================================================================
 
-import subprocess
+from _bash_harness import needs_bash, run_script
 
-from _bash_harness import BASH, needs_bash
-
-# `timeout` is a coreutils binary the container has and Git Bash does not. A PATH
-# shim is not enough (the generated script calls it in a pipeline), so it is a
-# shell function. No `exec`: the caller is a { ...; } group that must keep going.
+# `timeout` is a shell function, so the test does not depend on the real one (the
+# generated script calls it in a pipeline). No `exec`: the caller is a { ...; } group
+# that must keep going.
 FAKE_TIMEOUT_FUNC = r"""timeout() {
   shift 1
   "$@"
@@ -506,13 +504,8 @@ class TestReceiveRetryBehaviour:
             script = tmp_path / "under_test.sh"
             body = FAKE_TIMEOUT_FUNC + "\n".join(lines) + '\necho "RC=$__CROC_RC"\n'
             script.write_text(body, encoding="utf-8", newline="\n")
-            env = os.environ.copy()
-            env["FAKE_CROC_DIR"] = str(control)
-            env["PATH"] = str(fake_bin) + os.pathsep + env["PATH"]
-            return subprocess.run(
-                [BASH, str(script)], cwd=str(workdir),
-                capture_output=True, text=True, timeout=120, env=env,
-            )
+            return run_script(script, env={"FAKE_CROC_DIR": control},
+                              prepend_path=[fake_bin], cwd=workdir)
 
         def attempts():
             f = control / "count"

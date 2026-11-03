@@ -171,7 +171,7 @@ def test_property_wrapped_and_numbers_safe(tmp_path_factory, base, lead, trail, 
     if numsib and doc.startswith("{") and doc != "{}":
         doc = "{" + numsib + doc[1:]            # inject a number/escape sibling after the root brace
     text = ("\ufeff" if bom else "") + lead + doc + trail
-    path = tmp_path_factory.mktemp("e") / "c.json"
+    path = inv.fresh_path(tmp_path_factory, "e", "c.json")
     res, after = inv.run_merge(path, text, family=family, entry=_entry(family))
     _assert_safe(text, after, res, family=family, entry=_entry(family))
 
@@ -189,6 +189,6 @@ def test_property_json5_noise_safe(tmp_path_factory, base, inserts, family):
     for pos, tok in inserts:
         s.insert(pos % (len(s) + 1), tok)
     text = "".join(s)
-    path = tmp_path_factory.mktemp("e") / "c.json"
+    path = inv.fresh_path(tmp_path_factory, "e", "c.json")
     res, after = inv.run_merge(path, text, family=family, entry=_entry(family))
     _assert_safe(text, after, res, family=family, entry=_entry(family))

@@ -50,9 +50,7 @@ class TestInstallFailureNamesTheCause:
         control = tmp_path / "control"
         control.mkdir()
         bh.make_executable(fake_bin / "curl", FAKE_CURL_BAD_PROXY)
-        fake_bin_posix = subprocess.run(
-            [bh.BASH, "-c", f"cygpath -u '{fake_bin}'"], capture_output=True, text=True
-        ).stdout.strip() or str(fake_bin).replace("\\", "/")
+        fake_bin_posix = bh.shell_path(fake_bin)
 
         def run(proxy="http://no-such-proxy.invalid:80", failure_sentinel=None):
             script = croc_manager.generate_remote_croc_install_script(
@@ -62,10 +60,7 @@ class TestInstallFailureNamesTheCause:
             bh.write_text(path, f'export PATH="{fake_bin_posix}:/usr/bin:/bin"\n'
                                 f"export https_proxy='{proxy}' HTTPS_PROXY='{proxy}'\n"
                                 + script + '\necho "INSTALL-OK"\n')
-            env = os.environ.copy()
-            env["FAKE_DIR"] = str(control)
-            proc = subprocess.run([bh.BASH, str(path)], capture_output=True, text=True,
-                                  timeout=120, env=env)
+            proc = bh.run_script(path, env={"FAKE_DIR": control})
             calls_file = control / "curl_calls"
             calls = calls_file.read_text().splitlines() if calls_file.exists() else []
             return proc, calls

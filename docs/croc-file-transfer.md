@@ -187,6 +187,28 @@ For async tools (`run_on_tunneled_ssh_async`, etc.), the croc send process (uplo
 
 Download results for async executions are stored in `_download_results[environment_id]` and included in the `get_execution_status` response.
 
+**The Torque each async environment lives on is remembered** (`_async_env_connections`,
+2026-11-03). The background streamer, `get_execution_status` and `cancel_execution` use
+it, or the `profile` argument both tools now take. Until then all three used the
+default profile's connection, so an async call whose profile pointed at another Torque
+instance or space was polled on the wrong one. For a download, that also meant the
+gated local receiver never saw READY. The `_async` tools' results name the `profile`
+in the follow-up calls they suggest.
+
+## Relay per call
+
+The relay comes from the **call's** effective config, i.e. its `profile`
+(`_croc_relay_settings(cfg)`). Until 2026-11-03 it was read from the global config, the
+default profile, so a profile's own `croc_relay` was ignored by uploads and downloads,
+while its `init_commands` were applied.
+
+## Remote-to-remote transfers
+
+`transfer_files_between_tunneled_hosts_async` reuses this machinery between two remote
+machines: the download's monitored send on the source side, and a monitored receive
+on the destination side. See
+[design-remote-to-remote-transfer.md](design-remote-to-remote-transfer.md).
+
 ## Security
 
 ### Transfer Code
@@ -447,7 +469,7 @@ That's harmless on these IPv4-only networks, and `croc_relay` can override it.
 ## Testing
 
 ```bash
-python -m pytest tests/ -v
+python -m pytest tests -n 16 --dist worksteal
 ```
 
 Tests cover:
@@ -467,7 +489,7 @@ Tests cover:
 - Download: `parse_downloads()` (CLI arg parsing, Windows drive letters)
 - Edge cases (empty files, missing paths, duplicate basenames, special characters)
 - Race fix (`tests/test_download_race_fix.py`): the generated send commands are
-  executed under bash (Git Bash on Windows) with a fake croc, verifying the
+  executed under bash (WSL on Windows, see [testing.md](testing.md)) with a fake croc, verifying the
   READY/SIZE/RETRY/DONE/FAILED sentinel behavior, size-scaled timeouts, one-shot
   retry, and non-zero exit on failure; the receive wrapper is exercised with a
   fake croc binary verifying gating, abort, size-verified completion (partial

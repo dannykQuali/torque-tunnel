@@ -104,7 +104,7 @@ def test_merge_invariants(tmp_path_factory, other, family, servers, indent, eol,
     fam_present = isinstance(bdata.get(family), dict)
     tt_present = fam_present and "torque-tunnel" in bdata[family]
 
-    path = tmp_path_factory.mktemp("p") / "cfg.json"
+    path = inv.fresh_path(tmp_path_factory, "p", "cfg.json")
     res, after = inv.run_merge(path, text, family=family, entry=entry)
 
     # An abort is always acceptable IF the file is left untouched.
@@ -129,7 +129,7 @@ def test_idempotent(tmp_path_factory, other, family, servers, indent, eol, add_c
     assume(ok and isinstance(bdata, dict))
     assume(not (isinstance(bdata.get(family), dict) and "torque-tunnel" in bdata[family]))
 
-    path = tmp_path_factory.mktemp("p") / "cfg.json"
+    path = inv.fresh_path(tmp_path_factory, "p", "cfg.json")
     res1, after1 = inv.run_merge(path, text, family=family, entry=entry)
     assume(res1.status == "added")              # only continue from a successful add
     res2, after2 = inv.run_merge(path, None, family=family, entry=entry)  # re-run on the now-existing file

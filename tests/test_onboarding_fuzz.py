@@ -47,7 +47,7 @@ def _assert_safe_outcome(before, after, res, *, family, entry):
        family=st.sampled_from(["mcpServers", "servers"]))
 def test_fuzz_structural_noise_never_corrupts(tmp_path_factory, text, family):
     entry = onboarding.server_entry(family, python="/x/py")
-    path = tmp_path_factory.mktemp("f") / "c.json"
+    path = inv.fresh_path(tmp_path_factory, "f", "c.json")
     res, after = inv.run_merge(path, text, family=family, entry=entry)
     _assert_safe_outcome(text, after, res, family=family, entry=entry)
 
@@ -82,7 +82,7 @@ def test_fuzz_mutated_valid_never_corrupts(tmp_path_factory, base, ops, family):
             s.insert(i, s[i])
     text = "".join(s)
     entry = onboarding.server_entry(family, python="/x/py")
-    path = tmp_path_factory.mktemp("f") / "c.json"
+    path = inv.fresh_path(tmp_path_factory, "f", "c.json")
     res, after = inv.run_merge(path, text, family=family, entry=entry)
     _assert_safe_outcome(text, after, res, family=family, entry=entry)
 
@@ -120,7 +120,7 @@ def test_fuzz_unicode_and_unterminated_never_corrupts(tmp_path_factory, base, in
         s.insert(pos % (len(s) + 1), ch)
     text = "".join(s)
     entry = onboarding.server_entry(family, python="/x/py")
-    path = tmp_path_factory.mktemp("f") / "c.json"
+    path = inv.fresh_path(tmp_path_factory, "f", "c.json")
     res, after = inv.run_merge(path, text, family=family, entry=entry)
     _assert_safe_outcome(text, after, res, family=family, entry=entry)
 

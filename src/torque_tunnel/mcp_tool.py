@@ -38,6 +38,7 @@ from . import config as config_module
 from . import auth as auth_module
 from . import onboarding as onboarding_module
 from . import credentials as credentials_module
+from . import remote_transfer
 
 
 # Shared compiled patterns for filtering grain/execution logs.
@@ -555,20 +556,24 @@ class FileDeploymentPlan:
     files_info: list[str] = field(default_factory=list)
 
 
-def _croc_relay_settings() -> dict:
-    """Relay options for every croc invocation, resolved from the active profile.
+def _croc_relay_settings(config: Optional[dict] = None) -> dict:
+    """Relay options for every croc invocation, resolved from the call's config.
 
-    Empty values mean croc's public relay, whose admission limiter is keyed on
-    this machine's public IP and shared with every other session behind it.
+    That is the call's effective config (its `profile`), not the global one: reading
+    the global config made a per-call profile's croc_relay be silently ignored while
+    its init_commands were applied. Empty values mean croc's public relay, whose
+    admission limiter is keyed on this machine's public IP and shared with every other
+    session behind it.
     """
-    transfers = _config.get("croc_transfers")
+    cfg = config or _config
+    transfers = cfg.get("croc_transfers")
     try:
         transfers = int(transfers) if transfers else None
     except (TypeError, ValueError):
         transfers = None
     return {
-        "relay": str(_config.get("croc_relay") or ""),
-        "relay_password": str(_config.get("croc_relay_password") or ""),
+        "relay": str(cfg.get("croc_relay") or ""),
+        "relay_password": str(cfg.get("croc_relay_password") or ""),
         "transfers": transfers,
     }
 
@@ -580,6 +585,7 @@ def prepare_files_with_croc(
     ssh_user: str = "",
     ssh_private_key: str = "",
     ssh_password: str = "",
+    config: Optional[dict] = None,
 ) -> FileDeploymentPlan:
     """Prepare file deployment, using croc for files exceeding the inline threshold.
     
@@ -595,7 +601,8 @@ def prepare_files_with_croc(
         ssh_user: SSH user (only for transfer_mode="ssh").
         ssh_private_key: SSH private key (only for transfer_mode="ssh").
         ssh_password: SSH password (only for transfer_mode="ssh").
-    
+        config: The call's effective config, for the croc relay (default: global).
+
     Returns:
         FileDeploymentPlan with deployment commands and croc transfer info.
     """
@@ -749,7 +756,7 @@ def prepare_files_with_croc(
         plan.croc_code = croc_manager.generate_croc_code()
         # Pin the relay for this transfer; execute_with_croc reads it back so the
         # two sides cannot end up on different relays.
-        relay_settings = _croc_relay_settings()
+        relay_settings = _croc_relay_settings(config)
         plan.croc_relay = relay_settings["relay"]
         plan.croc_relay_password = relay_settings["relay_password"]
         plan.croc_transfers = relay_settings["transfers"]
@@ -1086,6 +1093,7 @@ def prepare_download_with_croc(
     ssh_user: str = "",
     ssh_private_key: str = "",
     ssh_password: str = "",
+    config: Optional[dict] = None,
 ) -> DownloadPlan:
     """Prepare download plan for remote→local file transfer via croc.
     
@@ -1100,7 +1108,8 @@ def prepare_download_with_croc(
         ssh_user: SSH user (only for transfer_mode="ssh").
         ssh_private_key: SSH private key (only for transfer_mode="ssh").
         ssh_password: SSH password (only for transfer_mode="ssh").
-    
+        config: The call's effective config, for the croc relay (default: global).
+
     Returns:
         DownloadPlan with download commands and croc receive info.
     """
@@ -1111,7 +1120,7 @@ def prepare_download_with_croc(
     
     plan.needs_download = True
     plan.croc_code = croc_manager.generate_croc_code()
-    _dl_relay = _croc_relay_settings()
+    _dl_relay = _croc_relay_settings(config)
     plan.croc_relay = _dl_relay["relay"]
     plan.croc_relay_password = _dl_relay["relay_password"]
     plan.croc_transfers = _dl_relay["transfers"]
@@ -1523,7 +1532,7 @@ async def cleanup_download_resources(
         except OSError:
             pass
         try:
-            await asyncio.wait_for(dl_process.wait(), timeout=5)
+            await asyncio.wait_for(dl_process.wait(), timeout=CROC_DOWNLOAD_CLEANUP_WAIT_SECONDS)
         except asyncio.TimeoutError:
             pass  # fall through to terminate
     if dl_process is not None:
@@ -1705,6 +1714,11 @@ _background_streamers: dict[str, asyncio.Task] = {}  # env_id -> background stre
 _streamer_cache: dict[str, dict] = {}  # env_id -> {'env_data': ..., 'status': ..., 'raw_status': ...}
 _croc_async_state: dict[str, dict] = {}  # env_id -> {"process": Process, "staging_dir": str, "dl_process": Process, "dl_plan": DownloadPlan}
 _download_results: dict[str, tuple] = {}  # env_id -> (successes, errors, transfer_seconds)
+# env_id -> the Torque connection an async command was started with. Polling, streaming
+# and cancelling must use it: the call's profile can point at another Torque instance or
+# space than the default profile, and the default profile can change (hot reload) while
+# the command runs.
+_async_env_connections: dict[str, dict] = {}
 
 # How long to wait for croc receive to finish AFTER the Torque environment completes.
 # The croc transfer through relay proxy can take a while to complete even after
@@ -1715,6 +1729,10 @@ CROC_DOWNLOAD_RECEIVE_WAIT_SECONDS = 120
 # failed / never registered) — just enough for the wrapper to notice the
 # abort signal and exit; cleanup terminates it afterwards regardless.
 CROC_DOWNLOAD_ABORT_WAIT_SECONDS = 10
+
+# How long cleanup_download_resources waits for the receive wrapper to exit by itself
+# after the abort signal, before terminating it.
+CROC_DOWNLOAD_CLEANUP_WAIT_SECONDS = 5
 
 # Slack added on top of a command's timeout when arming the persistent
 # container's end time at command start, so the container cannot die under a
@@ -1769,7 +1787,7 @@ async def _background_stream_grain_log(environment_id: str) -> None:
             await asyncio.sleep(2)
             
             try:
-                async with get_torque_client() as client:
+                async with _connection_client(_async_connection(environment_id)) as client:
                     # Check status and cache it
                     env_data = await client.get_environment_status(environment_id)
                     details = env_data.get("details", {})
@@ -1918,6 +1936,98 @@ def get_torque_client(torque_url=None, torque_token=None, torque_space=None, con
         create_retry_budget_seconds=cfg.get("create_retry_budget_seconds", 600),
         retry_max_backoff_seconds=cfg.get("retry_max_backoff_seconds", 15),
     )
+
+
+def _config_for_profile(profile_name: str) -> dict:
+    """The effective config of a named profile. Raises ValueError for an unknown one."""
+    profile_values = config_module.resolve_profile(_loaded_config, profile_name)
+    return config_module.apply_profile_to_config(_config, profile_values)
+
+
+def _connection(cfg: dict, profile_name: Optional[str] = None,
+                torque_url=None, torque_token=None, torque_space=None) -> dict:
+    """A Torque connection: where an environment lives, and the config to reach it with."""
+    return {
+        "torque_url": torque_url or cfg["torque_url"],
+        "torque_token": torque_token or cfg["torque_token"],
+        "torque_space": torque_space or cfg["torque_space"],
+        "config": dict(cfg),
+        "profile": profile_name,
+    }
+
+
+def _remember_async_connection(environment_id: str, connection: dict) -> None:
+    _async_env_connections[environment_id] = connection
+
+
+def _async_connection(environment_id: str, cfg: Optional[dict] = None,
+                      profile_name: Optional[str] = None) -> dict:
+    """The connection to poll or cancel an async environment with.
+
+    An explicit profile wins; then the connection the command was started with; then
+    the default profile (an environment this server did not start, or one started
+    before a restart).
+    """
+    if profile_name:
+        return _connection(cfg or _config, profile_name)
+    known = _async_env_connections.get(environment_id)
+    if known:
+        return _with_current_token(known)
+    return _connection(_config)
+
+
+def _with_current_token(connection: dict) -> dict:
+    """Prefer the profile's current token for the same Torque URL and space: a re-login
+    since the command started may have replaced the one it was started with."""
+    try:
+        cfg = _config_for_profile(connection["profile"]) if connection["profile"] else _config
+    except ValueError:
+        return connection
+    if (cfg.get("torque_token") and cfg.get("torque_url") == connection["torque_url"]
+            and cfg.get("torque_space") == connection["torque_space"]):
+        return dict(connection, torque_token=cfg["torque_token"])
+    return connection
+
+
+def _connection_client(connection: dict) -> TorqueClient:
+    return get_torque_client(
+        connection["torque_url"], connection["torque_token"], connection["torque_space"],
+        config=connection["config"],
+    )
+
+
+def _environment_url(connection: dict, environment_id: str) -> str:
+    return f"{connection['torque_url']}/{connection['torque_space']}/environments/{environment_id}"
+
+
+def _follow_up_args(environment_id: str, profile_name: Optional[str]) -> str:
+    """The arguments a follow-up status/cancel call needs, as the caller should pass them."""
+    text = f'environment_id="{environment_id}"'
+    if profile_name:
+        text += f', profile="{profile_name}"'
+    return text
+
+
+_FOLLOW_UP_PROFILE_SCHEMA = {
+    "type": "string",
+    "description": "The profile the async command was started with. Pass it exactly when the _async tool's result names one; omit it otherwise. Do NOT pass 'default'.",
+}
+
+
+_TRANSFER_ENDPOINT_SCHEMA = {
+    "type": "object",
+    "description": "One side of the transfer.",
+    "properties": {
+        "type": {"type": "string", "enum": ["ssh", "persistent_container"], "description": "Default: ssh."},
+        "host": {"type": "string", "description": "ssh: IP or hostname of the machine."},
+        "user": {"type": "string", "description": "ssh: user name."},
+        "private_key": {"type": "string", "description": "ssh: a LOCAL key file path, the key content, or a base64-encoded key. Use this OR password."},
+        "password": {"type": "string", "description": "ssh: password (requires sshpass on the agent). Use this OR private_key."},
+        "environment_id": {"type": "string", "description": "persistent_container: the container's environment id."},
+        "profile": {"type": "string", "description": "Configuration profile for this side. Omit to use the default profile. Do NOT pass 'default'."},
+        "torque_agent": {"type": "string", "description": "DO NOT set unless the user explicitly provides this value. Overrides the profile's agent for this side."},
+    },
+}
 
 
 # Create MCP server
@@ -2290,7 +2400,7 @@ Without the ID, a new container is created.
         Tool(
             name="run_on_tunneled_ssh_async",
             description="""Like run_on_tunneled_ssh but returns IMMEDIATELY with an environment ID.
-Use get_execution_status to poll output/progress. Use cancel_execution to abort.
+Use get_execution_status to poll output/progress. Use cancel_execution to abort. Pass them the same `profile` if this call used one.
 If you don't need intermediate output or cancel early, use run_on_tunneled_ssh instead (simpler, one call).
 
 Same network rules: only for unreachable internal network targets.
@@ -2418,7 +2528,7 @@ systemctl restart docker, reboot, shutdown, init 0/6""",
         Tool(
             name="run_on_tunneled_persistent_container_async",
             description="""Like run_on_tunneled_persistent_container but returns IMMEDIATELY with an environment ID.
-Use get_execution_status to poll output/progress. Use cancel_execution to abort.
+Use get_execution_status to poll output/progress. Use cancel_execution to abort. Pass them the same `profile` if this call used one.
 If you don't need intermediate output or cancel early, use run_on_tunneled_persistent_container instead (simpler).
 
 Only for unreachable internal network targets. For local network/VMs, use terminal commands.
@@ -2535,7 +2645,7 @@ After restart: pass previous `environment_id` to reconnect.""",
         Tool(
             name="run_on_tunneled_disposable_container_async",
             description="""Like run_on_tunneled_disposable_container but returns IMMEDIATELY with an environment ID.
-Use get_execution_status to poll output/progress. Use cancel_execution to abort.
+Use get_execution_status to poll output/progress. Use cancel_execution to abort. Pass them the same `profile` if this call used one.
 If you don't need intermediate output or cancel early, use run_on_tunneled_disposable_container instead (simpler).
 
 Only for unreachable internal network targets. For local network/VMs, use terminal commands.
@@ -2638,8 +2748,9 @@ Use `wait` to avoid tight polling. Typical: wait=10, repeat until completed.""",
                 "properties": {
                     "environment_id": {
                         "type": "string",
-                        "description": "The environment ID returned by run_on_tunneled_ssh_async or run_on_tunneled_persistent_container_async.",
+                        "description": "The environment ID returned by an _async tool (run_on_tunneled_ssh_async, run_on_tunneled_persistent_container_async or run_on_tunneled_disposable_container_async).",
                     },
+                    "profile": _FOLLOW_UP_PROFILE_SCHEMA,
                     "wait": {
                         "type": "integer",
                         "description": "Seconds to wait before checking status. Use this to avoid tight polling loops. Suggested: 5-10 for short commands, 15-30 for installs/builds. Default: 5.",
@@ -2656,10 +2767,81 @@ Use `wait` to avoid tight polling. Typical: wait=10, repeat until completed.""",
                 "properties": {
                     "environment_id": {
                         "type": "string",
-                        "description": "The environment ID returned by run_on_tunneled_ssh_async or run_on_tunneled_persistent_container_async.",
+                        "description": "The environment ID returned by an _async tool (run_on_tunneled_ssh_async, run_on_tunneled_persistent_container_async or run_on_tunneled_disposable_container_async).",
                     },
+                    "profile": _FOLLOW_UP_PROFILE_SCHEMA,
                 },
                 "required": ["environment_id"],
+            },
+        ),
+        Tool(
+            name="transfer_files_between_tunneled_hosts_async",
+            description="""Copy files/directories from one machine to another when BOTH are reachable through torque-tunnel but NOT from each other (e.g. two lab networks behind different Torque agents, or even different Torque accounts). The data never passes through your machine.
+
+Returns once the transfer is under way (the source side has been copied and hashed, which can take a few minutes for multi-GB files), with two environment ids. Then poll `get_transfer_status` with the arguments the result gives you, and use `cancel_transfer` to abort. Large files (tens of GB) are fine.
+
+Each endpoint is an SSH machine (`type`: "ssh", with host/user and private_key or password) or a running persistent container (`type`: "persistent_container", with its environment_id). Each endpoint may name its own `profile`; omit it to use the default profile.
+
+How it works: torque-tunnel runs croc on each side's agent container (encrypted, through the croc relay), and verifies every file's size and MD5 before placing it. When both endpoints are behind the same agent, one environment copies directly over SSH instead.
+
+Do NOT use this to move files between your local machine and a remote one - use upload_files / download_files of the run_* tools for that.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "command_description": {
+                        "type": "string",
+                        "description": "REQUIRED. A concise (3-6 word) description of the transfer, embedded in the Torque environment names (e.g. 'copy ova to esxi').",
+                    },
+                    "source": _TRANSFER_ENDPOINT_SCHEMA,
+                    "destination": _TRANSFER_ENDPOINT_SCHEMA,
+                    "files": {
+                        "type": "array",
+                        "description": "What to copy. Each item: one file or directory.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "source_path": {"type": "string", "description": "Path of a file or directory on the source machine."},
+                                "destination_path": {"type": "string", "description": "Full path to create on the destination machine: for a file, the file's own path (an existing file is replaced; an existing DIRECTORY there is an error); for a directory, the directory whose CONTENTS will be the source directory's."},
+                                "mode": {"type": "string", "description": "Optional permissions to set on the destination (e.g. '644')."},
+                            },
+                            "required": ["source_path", "destination_path"],
+                        },
+                    },
+                    "timeout": {
+                        "type": "integer",
+                        "description": f"Optional: overall limit in seconds. Default {TRANSFER_DEFAULT_TIMEOUT_SECONDS}.",
+                    },
+                },
+                "required": ["command_description", "source", "destination", "files"],
+            },
+        ),
+        Tool(
+            name="get_transfer_status",
+            description="""Check a transfer started by transfer_files_between_tunneled_hosts_async: RUNNING (with progress), COMPLETED (every file verified and placed) or FAILED (with the reason). Pass exactly the arguments that tool's result gave you. Use `wait` to avoid tight polling.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "sender_environment_id": {"type": "string", "description": "From the transfer tool's result."},
+                    "receiver_environment_id": {"type": "string", "description": "From the transfer tool's result (the same id as the sender's for a direct copy)."},
+                    "sender_profile": {"type": "string", "description": "Only if the transfer tool's result names one."},
+                    "receiver_profile": {"type": "string", "description": "Only if the transfer tool's result names one."},
+                    "wait": {"type": "integer", "description": "Seconds to wait (returning early when the transfer finishes). Suggested: 30. Default: 5."},
+                },
+                "required": ["sender_environment_id", "receiver_environment_id"],
+            },
+        ),
+        Tool(
+            name="cancel_transfer",
+            description="""Abort a transfer started by transfer_files_between_tunneled_hosts_async: ends both of its environments. Pass the same arguments as get_transfer_status (without wait).""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "sender_environment_id": {"type": "string"},
+                    "receiver_environment_id": {"type": "string"},
+                    "sender_profile": {"type": "string"},
+                    "receiver_profile": {"type": "string"},
+                },
+                "required": ["sender_environment_id", "receiver_environment_id"],
             },
         ),
         Tool(
@@ -2738,7 +2920,16 @@ async def call_tool(name: str, arguments: dict):
     # Block execution tools if config file has errors
     if _config_error:
         return [TextContent(type="text", text=f"Error: Config file is broken — {_config_error}\nFix the config file or run the 'setup' tool to reconfigure.")]
-    
+
+    # The transfer tools name a profile PER ENDPOINT (each side can be another Torque),
+    # so the call-level profile handling below does not apply to them.
+    if name == "transfer_files_between_tunneled_hosts_async":
+        return await handle_transfer_files_between_tunneled_hosts_async(arguments)
+    if name == "get_transfer_status":
+        return await handle_get_transfer_status(arguments)
+    if name == "cancel_transfer":
+        return await handle_cancel_transfer(arguments)
+
     # Resolve profile for execution tools: inject profile values into arguments
     # and create an effective_config overlay for config-only keys
     effective_config = _config
@@ -2789,21 +2980,21 @@ async def call_tool(name: str, arguments: dict):
             return await handle_run_on_tunneled_disposable_container(arguments, effective_config)
 
         elif name == "run_on_tunneled_ssh_async":
-            return await handle_run_on_tunneled_ssh_async(arguments, effective_config)
+            return await handle_run_on_tunneled_ssh_async(arguments, effective_config, profile_name=profile_name)
 
         elif name == "run_on_tunneled_persistent_container_async":
-            return await handle_run_on_tunneled_persistent_container_async(arguments, effective_config)
+            return await handle_run_on_tunneled_persistent_container_async(arguments, effective_config, profile_name=profile_name)
 
         elif name == "run_on_tunneled_disposable_container_async":
-            return await handle_run_on_tunneled_disposable_container_async(arguments, effective_config)
+            return await handle_run_on_tunneled_disposable_container_async(arguments, effective_config, profile_name=profile_name)
     except credentials_module.CredentialError as e:
         return [TextContent(type="text", text=f"Credential error: {e}")]
 
     if name == "get_execution_status":
-        return await handle_get_execution_status(arguments)
-    
+        return await handle_get_execution_status(arguments, effective_config, profile_name=profile_name)
+
     elif name == "cancel_execution":
-        return await handle_cancel_execution(arguments)
+        return await handle_cancel_execution(arguments, effective_config, profile_name=profile_name)
     
     else:
         return [TextContent(type="text", text=f"Unknown tool: {name}")]
@@ -3159,6 +3350,7 @@ async def handle_run_on_tunneled_ssh(arguments: dict, config: dict = None):
             files, transfer_mode="ssh",
             target_ip=target_ip, ssh_user=ssh_user,
             ssh_private_key=ssh_private_key, ssh_password=ssh_password,
+            config=cfg,
         )
         if plan.errors:
             return [TextContent(
@@ -3179,6 +3371,7 @@ async def handle_run_on_tunneled_ssh(arguments: dict, config: dict = None):
             download_files, transfer_mode="ssh",
             target_ip=target_ip, ssh_user=ssh_user,
             ssh_private_key=ssh_private_key, ssh_password=ssh_password,
+            config=cfg,
         )
         if dl_plan.errors:
             return [TextContent(
@@ -3506,6 +3699,7 @@ async def handle_run_on_tunneled_persistent_container(arguments: dict, config: d
             files, transfer_mode="ssh",
             target_ip=container_ip, ssh_user="root",
             ssh_private_key=private_key,
+            config=cfg,
         )
         if plan.errors:
             return [TextContent(
@@ -3526,6 +3720,7 @@ async def handle_run_on_tunneled_persistent_container(arguments: dict, config: d
             download_files, transfer_mode="ssh",
             target_ip=container_ip, ssh_user="root",
             ssh_private_key=private_key,
+            config=cfg,
         )
         if dl_plan.errors:
             return [TextContent(
@@ -3712,7 +3907,7 @@ async def handle_run_on_tunneled_disposable_container(arguments: dict, config: d
     plan = None
     croc_process = None
     if files:
-        plan = prepare_files_with_croc(files, transfer_mode="container")
+        plan = prepare_files_with_croc(files, transfer_mode="container", config=cfg)
         if plan.errors:
             return [TextContent(
                 type="text",
@@ -3732,7 +3927,7 @@ async def handle_run_on_tunneled_disposable_container(arguments: dict, config: d
     dl_plan = None
     dl_process = None
     if download_files:
-        dl_plan = prepare_download_with_croc(download_files, transfer_mode="container")
+        dl_plan = prepare_download_with_croc(download_files, transfer_mode="container", config=cfg)
         if dl_plan.errors:
             return [TextContent(
                 type="text",
@@ -3871,7 +4066,8 @@ async def handle_run_on_tunneled_disposable_container(arguments: dict, config: d
         await cleanup_download_resources(dl_process, dl_plan.croc_receive_dir if dl_plan else "")
 
 
-async def handle_run_on_tunneled_ssh_async(arguments: dict, config: dict = None):
+async def handle_run_on_tunneled_ssh_async(arguments: dict, config: dict = None,
+                                           profile_name: Optional[str] = None):
     """Start a remote SSH command without waiting for completion."""
     cfg = config or _config
     target_ip = arguments.get("host") or cfg["default_target_ip"]
@@ -3928,6 +4124,7 @@ async def handle_run_on_tunneled_ssh_async(arguments: dict, config: dict = None)
             files, transfer_mode="ssh",
             target_ip=target_ip, ssh_user=ssh_user,
             ssh_private_key=ssh_private_key, ssh_password=ssh_password,
+            config=cfg,
         )
         if plan.errors:
             return [TextContent(type="text", text="Error preparing files:\n" + "\n".join(f"- {e}" for e in plan.errors))]
@@ -3945,6 +4142,7 @@ async def handle_run_on_tunneled_ssh_async(arguments: dict, config: dict = None)
             download_files, transfer_mode="ssh",
             target_ip=target_ip, ssh_user=ssh_user,
             ssh_private_key=ssh_private_key, ssh_password=ssh_password,
+            config=cfg,
         )
         if dl_plan.errors:
             return [TextContent(type="text", text="Error preparing downloads:\n" + "\n".join(f"- {e}" for e in dl_plan.errors))]
@@ -3999,6 +4197,8 @@ async def handle_run_on_tunneled_ssh_async(arguments: dict, config: dict = None)
             _croc_async_state[environment_id] = async_state
         
         # Start background streaming of grain log to stderr
+        _remember_async_connection(environment_id, _connection(
+            cfg, profile_name, torque_url, torque_token, torque_space))
         _start_background_streamer(environment_id)
         
         env_url = f"{torque_url or cfg['torque_url']}/{torque_space or cfg['torque_space']}/environments/{environment_id}"
@@ -4019,8 +4219,8 @@ async def handle_run_on_tunneled_ssh_async(arguments: dict, config: dict = None)
 **Environment ID:** {environment_id}
 **Environment:** {env_url}
 
-Use `get_execution_status` with environment_id="{environment_id}" to check progress (suggested initial wait={suggested_wait}, adjust as needed).
-Use `cancel_execution` with the same environment_id to abort if needed."""
+Use `get_execution_status` with {_follow_up_args(environment_id, profile_name)} to check progress (suggested initial wait={suggested_wait}, adjust as needed).
+Use `cancel_execution` with {_follow_up_args(environment_id, profile_name)} to abort if needed."""
         
         return [TextContent(type="text", text=output_text)]
     
@@ -4035,7 +4235,8 @@ Use `cancel_execution` with the same environment_id to abort if needed."""
         return [TextContent(type="text", text=f"Error starting async command: {str(e)}")]
 
 
-async def handle_run_on_tunneled_persistent_container_async(arguments: dict, config: dict = None):
+async def handle_run_on_tunneled_persistent_container_async(arguments: dict, config: dict = None,
+                                                            profile_name: Optional[str] = None):
     """Start a command on the persistent container without waiting for completion.
     
     Blocks until the persistent container is up, then launches the command
@@ -4078,6 +4279,7 @@ async def handle_run_on_tunneled_persistent_container_async(arguments: dict, con
             files, transfer_mode="ssh",
             target_ip=container_ip, ssh_user="root",
             ssh_private_key=private_key,
+            config=cfg,
         )
         if plan.errors:
             return [TextContent(type="text", text="Error preparing files:\n" + "\n".join(f"- {e}" for e in plan.errors))]
@@ -4095,6 +4297,7 @@ async def handle_run_on_tunneled_persistent_container_async(arguments: dict, con
             download_files, transfer_mode="ssh",
             target_ip=container_ip, ssh_user="root",
             ssh_private_key=private_key,
+            config=cfg,
         )
         if dl_plan.errors:
             return [TextContent(type="text", text="Error preparing downloads:\n" + "\n".join(f"- {e}" for e in dl_plan.errors))]
@@ -4162,6 +4365,8 @@ async def handle_run_on_tunneled_persistent_container_async(arguments: dict, con
                 pass
 
         # Start background streaming of grain log to stderr
+        _remember_async_connection(environment_id, _connection(
+            cfg, profile_name, torque_url, torque_token, torque_space))
         _start_background_streamer(environment_id)
         
         env_url = f"{torque_url or cfg['torque_url']}/{torque_space or cfg['torque_space']}/environments/{environment_id}"
@@ -4183,8 +4388,8 @@ async def handle_run_on_tunneled_persistent_container_async(arguments: dict, con
 **Environment ID:** {environment_id}
 **Environment:** {env_url}
 
-Use `get_execution_status` with environment_id="{environment_id}" to check progress (suggested initial wait={suggested_wait}, adjust as needed).
-Use `cancel_execution` with the same environment_id to abort if needed."""
+Use `get_execution_status` with {_follow_up_args(environment_id, profile_name)} to check progress (suggested initial wait={suggested_wait}, adjust as needed).
+Use `cancel_execution` with {_follow_up_args(environment_id, profile_name)} to abort if needed."""
         
         return [TextContent(type="text", text=output_text)]
     
@@ -4199,7 +4404,8 @@ Use `cancel_execution` with the same environment_id to abort if needed."""
         return [TextContent(type="text", text=f"Error starting async command on container: {str(e)}")]
 
 
-async def handle_run_on_tunneled_disposable_container_async(arguments: dict, config: dict = None):
+async def handle_run_on_tunneled_disposable_container_async(arguments: dict, config: dict = None,
+                                                            profile_name: Optional[str] = None):
     """Start a disposable container command without waiting for completion."""
     cfg = config or _config
     command = arguments.get("command")
@@ -4221,7 +4427,7 @@ async def handle_run_on_tunneled_disposable_container_async(arguments: dict, con
     plan = None
     croc_process = None
     if files:
-        plan = prepare_files_with_croc(files, transfer_mode="container")
+        plan = prepare_files_with_croc(files, transfer_mode="container", config=cfg)
         if plan.errors:
             return [TextContent(type="text", text="Error preparing files:\n" + "\n".join(f"- {e}" for e in plan.errors))]
         # Combine croc init + inline commands for container target
@@ -4238,7 +4444,7 @@ async def handle_run_on_tunneled_disposable_container_async(arguments: dict, con
     dl_plan = None
     dl_process = None
     if download_files:
-        dl_plan = prepare_download_with_croc(download_files, transfer_mode="container")
+        dl_plan = prepare_download_with_croc(download_files, transfer_mode="container", config=cfg)
         if dl_plan.errors:
             return [TextContent(type="text", text="Error preparing downloads:\n" + "\n".join(f"- {e}" for e in dl_plan.errors))]
     
@@ -4286,6 +4492,8 @@ async def handle_run_on_tunneled_disposable_container_async(arguments: dict, con
             _croc_async_state[environment_id] = async_state
         
         # Start background streaming of grain log to stderr
+        _remember_async_connection(environment_id, _connection(
+            cfg, profile_name, torque_url, torque_token, torque_space))
         _start_background_streamer(environment_id)
         
         env_url = f"{torque_url or cfg['torque_url']}/{torque_space or cfg['torque_space']}/environments/{environment_id}"
@@ -4306,8 +4514,8 @@ async def handle_run_on_tunneled_disposable_container_async(arguments: dict, con
 **Environment ID:** {environment_id}
 **Environment:** {env_url}
 
-Use `get_execution_status` with environment_id="{environment_id}" to check progress (suggested initial wait={suggested_wait}, adjust as needed).
-Use `cancel_execution` with the same environment_id to abort if needed."""
+Use `get_execution_status` with {_follow_up_args(environment_id, profile_name)} to check progress (suggested initial wait={suggested_wait}, adjust as needed).
+Use `cancel_execution` with {_follow_up_args(environment_id, profile_name)} to abort if needed."""
         
         return [TextContent(type="text", text=output_text)]
     
@@ -4322,14 +4530,23 @@ Use `cancel_execution` with the same environment_id to abort if needed."""
         return [TextContent(type="text", text=f"Error starting async command: {str(e)}")]
 
 
-async def handle_get_execution_status(arguments: dict):
-    """Check status of an async execution."""
+async def handle_get_execution_status(arguments: dict, config: dict = None,
+                                      profile_name: Optional[str] = None):
+    """Check status of an async execution.
+
+    Polls the Torque the environment lives on: the given profile's, else the one the
+    command was started with, else the default profile's.
+    """
     environment_id = arguments.get("environment_id")
     wait_seconds = arguments.get("wait", 5)
-    
+
     if not environment_id:
         return [TextContent(type="text", text="Error: environment_id is required.")]
-    
+
+    connection = _async_connection(environment_id, config, profile_name)
+    cfg = connection["config"]
+    follow_up = _follow_up_args(environment_id, connection["profile"])
+
     # Wait with early exit — check the background streamer's cached status every second.
     # The background streamer (started by the async handler) already polls the API and
     # streams grain log to stderr, so we just piggyback on its cached results.
@@ -4352,19 +4569,20 @@ async def handle_get_execution_status(arguments: dict):
             status = cached['status']
             raw_status = cached['raw_status']
         else:
-            async with get_torque_client() as client:
+            async with _connection_client(connection) as client:
                 env_data = await client.get_environment_status(environment_id)
             details = env_data.get("details", {})
             raw_status = details.get("computed_status") or env_data.get("computed_status") or env_data.get("status", "unknown")
             status = raw_status.lower().replace(" ", "_")
-        
+
         details = env_data.get("details", {})
-        env_url = f"{_config['torque_url']}/{_config['torque_space']}/environments/{environment_id}"
-        
+        env_url = _environment_url(connection, environment_id)
+
         # Stop background streamer if terminal (it may already have stopped itself)
         if status in _TERMINAL_STATUSES:
             _stop_background_streamer(environment_id)
             _streamer_cache.pop(environment_id, None)
+            _async_env_connections.pop(environment_id, None)
             # Clean up any croc send process/staging dir associated with this async execution
             croc_state = _croc_async_state.pop(environment_id, None)
             if croc_state:
@@ -4381,7 +4599,7 @@ async def handle_get_execution_status(arguments: dict):
                     # the watcher sees the final sentinels (idempotent) before
                     # the download's fate is decided.
                     try:
-                        async with get_torque_client() as log_client:
+                        async with _connection_client(connection) as log_client:
                             final_log = await log_client.get_grain_log(environment_id) or ""
                         dl_plan.observe_output("\n" + final_log + "\n")
                     except Exception:
@@ -4393,7 +4611,7 @@ async def handle_get_execution_status(arguments: dict):
                     await cleanup_download_resources(dl_process, dl_plan.croc_receive_dir)
         
         # We need a client for extracting outputs, cleanup, and grain log fetching
-        async with get_torque_client() as client:
+        async with _connection_client(connection) as client:
             # Completed successfully
             if status in ("active", "success"):
                 outputs = client._extract_outputs(env_data)
@@ -4446,7 +4664,7 @@ async def handle_get_execution_status(arguments: dict):
                 # Auto-cleanup
                 try:
                     await client.end_environment(environment_id)
-                    if _config["auto_delete_environments"]:
+                    if cfg["auto_delete_environments"]:
                         await client.delete_environment(environment_id)
                 except Exception:
                     pass
@@ -4492,7 +4710,7 @@ async def handle_get_execution_status(arguments: dict):
 **Environment:** {env_url}"""
                     
                     # Auto-cleanup
-                    if _config["auto_delete_environments"]:
+                    if cfg["auto_delete_environments"]:
                         try:
                             await client.delete_environment(environment_id)
                         except Exception:
@@ -4568,7 +4786,7 @@ This may indicate a deployment failure. Check the environment URL for details.""
 {partial_block}"""
                 
                 # Auto-cleanup
-                if _config["auto_delete_environments"]:
+                if cfg["auto_delete_environments"]:
                     try:
                         await client.delete_environment(environment_id)
                     except Exception:
@@ -4599,7 +4817,7 @@ This may indicate a deployment failure. Check the environment URL for details.""
                 
                 output_text += f"""
 
-Call `get_execution_status` again with environment_id="{environment_id}" and wait=10 to check progress."""
+Call `get_execution_status` again with {follow_up} and wait=10 to check progress."""
                 
                 return [TextContent(type="text", text=output_text)]
     
@@ -4611,17 +4829,23 @@ Call `get_execution_status` again with environment_id="{environment_id}" and wai
         return [TextContent(type="text", text=f"Error checking execution status: {str(e)}")]
 
 
-async def handle_cancel_execution(arguments: dict):
-    """Cancel a running async execution."""
+async def handle_cancel_execution(arguments: dict, config: dict = None,
+                                  profile_name: Optional[str] = None):
+    """Cancel a running async execution, on the Torque it lives on (see
+    handle_get_execution_status)."""
     environment_id = arguments.get("environment_id")
-    
+
     if not environment_id:
         return [TextContent(type="text", text="Error: environment_id is required.")]
-    
+
+    connection = _async_connection(environment_id, config, profile_name)
+    cfg = connection["config"]
+
     # Stop background streamer for this environment
     _stop_background_streamer(environment_id)
     _streamer_cache.pop(environment_id, None)
-    
+    _async_env_connections.pop(environment_id, None)
+
     # Clean up any croc send process/staging dir associated with this execution
     croc_state = _croc_async_state.pop(environment_id, None)
     if croc_state:
@@ -4639,7 +4863,7 @@ async def handle_cancel_execution(arguments: dict):
     _download_results.pop(environment_id, None)
     
     try:
-        async with get_torque_client() as client:
+        async with _connection_client(connection) as client:
             # First check current status
             try:
                 env_data = await client.get_environment_status(environment_id)
@@ -4651,12 +4875,12 @@ async def handle_cancel_execution(arguments: dict):
                     return [TextContent(type="text", text=f"Environment {environment_id} not found. It may have already completed or been deleted.")]
                 raise
             
-            env_url = f"{_config['torque_url']}/{_config['torque_space']}/environments/{environment_id}"
-            
+            env_url = _environment_url(connection, environment_id)
+
             # Already fully terminated - nothing to cancel
             if status in ("ended", "inactive", "terminated", "released", "cancelled"):
                 # Still respect auto-delete
-                if _config["auto_delete_environments"]:
+                if cfg["auto_delete_environments"]:
                     try:
                         await client.delete_environment(environment_id)
                     except Exception:
@@ -4677,7 +4901,7 @@ async def handle_cancel_execution(arguments: dict):
                 action_msg = "Execution cancelled."
             
             # Auto-delete if configured
-            if _config["auto_delete_environments"]:
+            if cfg["auto_delete_environments"]:
                 try:
                     await client.delete_environment(environment_id)
                     action_msg += " Environment deleted."
@@ -4692,6 +4916,655 @@ async def handle_cancel_execution(arguments: dict):
     
     except Exception as e:
         return [TextContent(type="text", text=f"Error cancelling execution: {str(e)}")]
+
+
+# --- Remote-to-remote transfer ----------------------------------------------------------
+# See docs/design-remote-to-remote-transfer.md. The tool call launches the sender, waits
+# for its READY (the receiver may only connect once the sender's relay room exists),
+# launches the receiver with the sender's manifest, and returns both environment ids.
+# From then on get_transfer_status / cancel_transfer work from those ids alone.
+
+TRANSFER_DEFAULT_TIMEOUT_SECONDS = 21600
+# The blocking first phase (install croc, copy from the source, hash) never waits longer
+# than this, whatever the transfer's own timeout.
+TRANSFER_STAGE_TIMEOUT_SECONDS = 3600
+TRANSFER_POLL_SECONDS = 3
+# Consecutive Torque API failures tolerated while waiting for the sender.
+TRANSFER_POLL_ERRORS_TOLERATED = 5
+# Environments are created with an 8h lifetime (TorqueClient.start_environment). A
+# payload whose transfer could take longer extends both, once its size is known.
+TRANSFER_DEFAULT_LIFETIME_SECONDS = 8 * 3600
+
+
+@dataclass
+class _TransferEndpoint:
+    """One side of a transfer, fully resolved: the machine and how to reach it."""
+    role: str                      # "source" | "destination"
+    profile: Optional[str]
+    cfg: dict
+    connection: dict
+    host: str
+    user: str
+    private_key: str
+    password: str
+    agent: str
+    container_env_id: Optional[str] = None   # persistent_container endpoints
+    label: str = ""
+
+    @property
+    def environment_kind(self) -> str:
+        return "persistent-command" if self.container_env_id else "ssh"
+
+    def ssh(self) -> dict:
+        return {"target_ip": self.host, "ssh_user": self.user,
+                "ssh_private_key": self.private_key, "ssh_password": self.password}
+
+
+async def _resolve_transfer_endpoint(spec: dict, role: str) -> _TransferEndpoint:
+    """Resolve an endpoint against ITS OWN profile (each side can be another Torque).
+
+    Raises ValueError with a message for the caller.
+    """
+    if not isinstance(spec, dict):
+        raise ValueError(f"{role} must be an object")
+    profile = spec.get("profile") or None
+    if profile:
+        if not _loaded_config:
+            raise ValueError(f"{role}: profile {profile!r} given, but no config file with profiles is loaded")
+        profile_values = config_module.resolve_profile(_loaded_config, profile)
+        cfg = config_module.apply_profile_to_config(_config, profile_values)
+        args = config_module.inject_profile_into_arguments(spec, profile_values)
+    else:
+        if _default_profile_warning:
+            raise ValueError(f"{role}: {_default_profile_warning} Give the {role} a profile explicitly.")
+        cfg, args = _config, dict(spec)
+
+    kind = args.get("type") or "ssh"
+    agent = args.get("torque_agent") or cfg["default_agent"]
+    connection = _connection(cfg, profile, args.get("torque_url"), args.get("torque_token"),
+                             args.get("torque_space"))
+    for key in ("torque_url", "torque_token", "torque_space"):
+        if not connection[key]:
+            raise ValueError(f"{role}: Torque configuration missing ({key}); give it a profile or run setup")
+
+    if kind == "ssh":
+        host = args.get("host") or cfg["default_target_ip"]
+        user = args.get("user") or cfg["default_ssh_user"]
+        key_value, password = args.get("private_key"), args.get("password")
+        if not key_value and not password:
+            key_value, password = cfg.get("default_ssh_key"), cfg.get("default_ssh_password")
+        if not host or not user:
+            raise ValueError(f"{role}: host and user are required (or configure defaults)")
+        if not key_value and not password:
+            raise ValueError(f"{role}: private_key or password is required (or configure defaults)")
+        private_key = resolve_ssh_private_key(key_value) if key_value else ""
+        return _TransferEndpoint(role, profile, cfg, connection, host, user, private_key,
+                                 password or "", agent, label=f"{user}@{host}")
+
+    if kind == "persistent_container":
+        env_id = args.get("environment_id")
+        if not env_id:
+            raise ValueError(f"{role}: environment_id of the persistent container is required")
+        info = await _attach_persistent_container(env_id, connection)
+        return _TransferEndpoint(role, profile, cfg, connection, info["container_ip"], "root",
+                                 info["private_key"], "", args.get("torque_agent") or info.get("agent") or agent,
+                                 container_env_id=env_id, label=f"persistent container {env_id}")
+
+    raise ValueError(f"{role}: unknown type {kind!r} (expected 'ssh' or 'persistent_container')")
+
+
+async def _attach_persistent_container(environment_id: str, connection: dict) -> dict:
+    """Connection details of an EXISTING, running persistent container.
+
+    Unlike _ensure_persistent_container this never creates one: a transfer endpoint
+    that is gone is an error, not a reason to start an empty container.
+    """
+    async with _connection_client(connection) as client:
+        env_data = await client.get_environment_status(environment_id)
+        state = env_data.get("details", {}).get("state", {}).get("current_state", "")
+        if state not in ("deploying", "launching"):
+            raise ValueError(f"persistent container {environment_id} is not running (state: {state or 'unknown'})")
+        cached = _persistent_containers.get(environment_id)
+        if cached:
+            return dict(cached)
+        info = await client.get_persistent_container_info(environment_id)
+    return {"container_ip": info["container_ip"], "private_key": info["private_key"]}
+
+
+def _same_place(a: _TransferEndpoint, b: _TransferEndpoint) -> bool:
+    """Both endpoints run their environments on the same Torque agent."""
+    return (a.connection["torque_url"].rstrip("/") == b.connection["torque_url"].rstrip("/")
+            and a.connection["torque_space"] == b.connection["torque_space"]
+            and (a.agent or "") == (b.agent or ""))
+
+
+def _environment_status(env_data: dict) -> tuple[str, str]:
+    """(normalized status, raw status) of an environment, as the status tools use them."""
+    details = env_data.get("details", {})
+    raw = details.get("computed_status") or env_data.get("computed_status") or env_data.get("status", "unknown")
+    return raw.lower().replace(" ", "_"), raw
+
+
+def _environment_errors(env_data: dict) -> str:
+    """Torque's own error messages for an environment, joined ("" when none).
+
+    When the grain never starts (e.g. "runner is in error state") the log is empty, and
+    these are the only explanation there is.
+    """
+    errors = env_data.get("details", {}).get("state", {}).get("errors") or []
+    messages = [e.get("message") if isinstance(e, dict) else e for e in errors]
+    return "; ".join(str(m) for m in messages if m)
+
+
+async def _terminate_environment(connection: dict, environment_id: str) -> str:
+    """End an environment in whatever state it is in. Returns what was done, for humans."""
+    async with _connection_client(connection) as client:
+        try:
+            status, raw = _environment_status(await client.get_environment_status(environment_id))
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                return "not found"
+            raise
+        if status in ("ended", "inactive", "terminated", "released", "cancelled"):
+            return f"already ended ({raw})"
+        if status in ("launching", "deploying", "preparing", "provisioning"):
+            # end_environment returns 409 in these states
+            await client.release_environment(environment_id, force=True)
+        else:
+            await client.end_environment(environment_id, force=True)
+        if connection["config"].get("auto_delete_environments"):
+            try:
+                await client.delete_environment(environment_id)
+            except Exception:
+                pass
+        return f"ended (was {raw})"
+
+
+async def _terminate_quietly(connection: dict, environment_id: str) -> None:
+    try:
+        await _terminate_environment(connection, environment_id)
+    except Exception as e:
+        print(f"[torque-tunnel] Could not end environment {environment_id}: {e}", file=sys.stderr, flush=True)
+    _async_env_connections.pop(environment_id, None)
+
+
+def _transfer_follow_up(sender_id: str, receiver_id: str,
+                        sender_profile: Optional[str], receiver_profile: Optional[str]) -> str:
+    text = f'sender_environment_id="{sender_id}", receiver_environment_id="{receiver_id}"'
+    if sender_profile:
+        text += f', sender_profile="{sender_profile}"'
+    if receiver_profile:
+        text += f', receiver_profile="{receiver_profile}"'
+    return text
+
+
+def _validate_transfer_files(files) -> tuple[list[dict], list[str]]:
+    if not isinstance(files, list) or not files:
+        return [], ["'files' must be a non-empty list"]
+    out, errors = [], []
+    for i, f in enumerate(files):
+        if not isinstance(f, dict):
+            errors.append(f"File {i + 1}: must be an object")
+            continue
+        src, dest, mode = f.get("source_path"), f.get("destination_path"), f.get("mode")
+        if not src or not isinstance(src, str):
+            errors.append(f"File {i + 1}: missing 'source_path'")
+        if not dest or not isinstance(dest, str):
+            errors.append(f"File {i + 1}: missing 'destination_path'")
+        if mode and not croc_manager._validate_mode(str(mode)):
+            errors.append(f"File {i + 1}: invalid mode {mode!r} (expected e.g. '644' or '0755')")
+        if src and dest:
+            out.append({"source_path": src, "destination_path": dest,
+                        "mode": str(mode) if mode else None,
+                        "croc_filename": remote_transfer.croc_filename(i, src)})
+    return out, errors
+
+
+async def _wait_for_sender_ready(connection: dict, environment_id: str, deadline: float):
+    """Poll the sender until its relay room exists. Returns (report, problem)."""
+    errors = 0
+    report = remote_transfer.SenderReport()
+    while True:
+        try:
+            async with _connection_client(connection) as client:
+                env_data = await client.get_environment_status(environment_id)
+                status, raw = _environment_status(env_data)
+                log = await client.get_grain_log(environment_id) or ""
+            errors = 0
+        except Exception as e:
+            errors += 1
+            if errors > TRANSFER_POLL_ERRORS_TOLERATED:
+                return report, f"could not read the sending environment's status: {e}"
+            await asyncio.sleep(TRANSFER_POLL_SECONDS)
+            continue
+        report = remote_transfer.parse_sender_log(log)
+        if report.failure:
+            return report, "the sender failed: " + remote_transfer.describe_failure(report.failure)
+        if report.ready:
+            return report, ""
+        if status in _TERMINAL_STATUSES:
+            torque_errors = _environment_errors(env_data)
+            tail = format_code_block(filter_grain_log(log)[-1500:]) if log else ""
+            return report, (f"the sending environment ended ({raw}) before its croc sender was ready"
+                            + (f" - Torque: {torque_errors}" if torque_errors else "")
+                            + (f"\n\n**Sender log (tail):**\n{tail}" if tail else ""))
+        if time.monotonic() > deadline:
+            return report, "timed out waiting for the sender to copy, hash and register its files"
+        await asyncio.sleep(TRANSFER_POLL_SECONDS)
+
+
+async def _extend_for_payload(endpoints: list, total_bytes: int) -> None:
+    """Lengthen the environments' lifetime when the payload could outlast it."""
+    needed = croc_manager.relay_receive_timeout(total_bytes) + 3600
+    if needed <= TRANSFER_DEFAULT_LIFETIME_SECONDS - 3600:
+        return
+    end = datetime.now(timezone.utc) + timedelta(seconds=needed)
+    for connection, environment_id in endpoints:
+        try:
+            async with _connection_client(connection) as client:
+                await client.set_scheduled_end_time(environment_id, end)
+        except Exception as e:
+            print(f"[torque-tunnel] Could not extend environment {environment_id}: {e}",
+                  file=sys.stderr, flush=True)
+
+
+def _transfer_files_summary(files: list[dict], sizes: Optional[dict] = None) -> str:
+    lines = []
+    for f in files:
+        size = (sizes or {}).get(f["croc_filename"])
+        shown = f" ({size:,} bytes)" if isinstance(size, int) else ""
+        lines.append(f"- {f['source_path']} → {f['destination_path']}{shown}")
+    return "\n".join(lines)
+
+
+@dataclass
+class _TransferHandle:
+    """The two environments of a started transfer (one, twice, for a direct copy)."""
+    sender_id: str
+    receiver_id: str
+    sender_connection: dict
+    receiver_connection: dict
+
+
+async def handle_transfer_files_between_tunneled_hosts_async(arguments: dict):
+    """Start a transfer between two machines torque-tunnel reaches but that cannot reach
+    each other. Returns once both environments exist (see the section comment)."""
+    _, text = await _start_transfer(arguments)
+    return [TextContent(type="text", text=text)]
+
+
+async def _start_transfer(arguments: dict) -> tuple[Optional[_TransferHandle], str]:
+    """Returns (handle, text for the caller); the handle is None when nothing is running."""
+    description = arguments.get("command_description")
+    if not description:
+        return None, "Error: command_description is required."
+    files, errors = _validate_transfer_files(arguments.get("files"))
+    if errors:
+        return None, "Error in files:\n" + "\n".join(f"- {e}" for e in errors)
+    try:
+        source = await _resolve_transfer_endpoint(arguments.get("source") or {}, "source")
+        destination = await _resolve_transfer_endpoint(arguments.get("destination") or {}, "destination")
+    except Exception as e:
+        return None, f"Error: {e}"
+    if _same_place(source, destination) and source.host == destination.host:
+        return None, (
+            f"Error: source and destination are the same machine ({source.label} via agent "
+            f"{source.agent}). Use a command (cp/mv) on it instead, or check that both 'host' "
+            f"values were given.")
+
+    timeout = int(arguments.get("timeout") or TRANSFER_DEFAULT_TIMEOUT_SECONDS)
+    if _same_place(source, destination):
+        return await _start_direct_copy(description, files, source, destination, timeout)
+    return await _start_croc_transfer(description, files, source, destination, timeout)
+
+
+async def _start_direct_copy(description, files, source, destination, timeout):
+    """Both endpoints behind one agent: one environment copies ssh to ssh, no croc."""
+    commands = croc_manager.generate_direct_copy_commands(files, source.ssh(), destination.ssh())
+    try:
+        async with _connection_client(destination.connection) as client:
+            environment_id = await client.start_environment(
+                target_ip=destination.host, ssh_user=destination.user,
+                ssh_private_key=destination.private_key, ssh_password=destination.password or None,
+                command="true", agent=destination.agent, timeout=timeout,
+                container_pre_commands=commands,
+                command_description=f"{description} (copy)",
+                environment_kind=destination.environment_kind,
+                parent_env_id=destination.container_env_id,
+            )
+    except Exception as e:
+        return None, f"Error starting the copy: {e}"
+    _remember_async_connection(environment_id, destination.connection)
+    handle = _TransferHandle(environment_id, environment_id, destination.connection, destination.connection)
+    follow_up = _transfer_follow_up(environment_id, environment_id, destination.profile, destination.profile)
+    return handle, f"""Transfer started (async): {source.label} → {destination.label}
+Both machines are behind agent `{destination.agent}`, so one environment copies directly (no croc, no relay).
+
+**Files:**
+{_transfer_files_summary(files)}
+
+**Environment:** {_environment_url(destination.connection, environment_id)}
+
+Use `get_transfer_status` with {follow_up} to check progress (suggested initial wait=30).
+Use `cancel_transfer` with the same arguments to abort."""
+
+
+async def _start_croc_transfer(description, files, source, destination, timeout):
+    relay = remote_transfer.choose_relay(_croc_relay_settings(source.cfg),
+                                         _croc_relay_settings(destination.cfg))
+    code = croc_manager.generate_croc_code()
+    sender_commands = (
+        croc_manager.generate_remote_croc_install_script(failure_sentinel=croc_manager.CROC_SENTINEL_FAILED)
+        + "\n" + croc_manager.generate_croc_relay_send_commands(
+            code, [{"source_path": f["source_path"], "croc_filename": f["croc_filename"]} for f in files],
+            relay=relay["relay"], relay_password=relay["relay_password"],
+            transfers=relay["transfers"], **source.ssh())
+    )
+    try:
+        async with _connection_client(source.connection) as client:
+            sender_id = await client.start_environment(
+                target_ip=source.host, ssh_user=source.user,
+                ssh_private_key=source.private_key, ssh_password=source.password or None,
+                command="true", agent=source.agent, timeout=timeout,
+                download_commands=sender_commands,
+                command_description=f"{description} (send)",
+                environment_kind=source.environment_kind,
+                parent_env_id=source.container_env_id,
+            )
+    except Exception as e:
+        return None, f"Error starting the sending environment: {e}"
+    _remember_async_connection(sender_id, source.connection)
+    sender_url = _environment_url(source.connection, sender_id)
+    print(f"[torque-tunnel] Transfer: sender {sender_id} started; waiting for it to stage and register...",
+          file=sys.stderr, flush=True)
+
+    deadline = time.monotonic() + min(timeout, TRANSFER_STAGE_TIMEOUT_SECONDS)
+    try:
+        report, problem = await _wait_for_sender_ready(source.connection, sender_id, deadline)
+    except asyncio.CancelledError:
+        # The call was abandoned (client gone, Ctrl+C): nobody will ever launch the
+        # receiver, so the sender must not be left waiting out its croc timeout.
+        await asyncio.shield(_terminate_quietly(source.connection, sender_id))
+        raise
+    manifest = []
+    if not problem:
+        manifest, manifest_errors = remote_transfer.build_manifest(files, report)
+        problem = "; ".join(manifest_errors)
+    if problem:
+        await _terminate_quietly(source.connection, sender_id)
+        return None, f"""Transfer failed before any data was sent: {problem}
+
+**Sender environment:** {sender_url}"""
+
+    receiver_commands = (
+        croc_manager.generate_remote_croc_install_script(failure_sentinel=croc_manager.CROC_RX_SENTINEL_FAILED)
+        + "\n" + croc_manager.generate_croc_relay_receive_commands(
+            code, manifest, relay=relay["relay"], relay_password=relay["relay_password"],
+            **destination.ssh())
+    )
+    try:
+        async with _connection_client(destination.connection) as client:
+            receiver_id = await client.start_environment(
+                target_ip=destination.host, ssh_user=destination.user,
+                ssh_private_key=destination.private_key, ssh_password=destination.password or None,
+                command="true", agent=destination.agent, timeout=timeout,
+                container_pre_commands=receiver_commands,
+                command_description=f"{description} (receive)",
+                environment_kind=destination.environment_kind,
+                parent_env_id=destination.container_env_id,
+            )
+    except Exception as e:
+        await _terminate_quietly(source.connection, sender_id)
+        return None, f"Error starting the receiving environment: {e} (the sender was ended)\n\n**Sender environment:** {sender_url}"
+    _remember_async_connection(receiver_id, destination.connection)
+    total = sum(m["size"] for m in manifest)
+    await _extend_for_payload([(source.connection, sender_id), (destination.connection, receiver_id)], total)
+
+    relay_note = ""
+    if relay["relays_differ"]:
+        relay_note = (f"\nNote: the two profiles name different croc relays; both sides use the "
+                      f"source's ({croc_manager.effective_relay(relay['relay'])}).\n")
+    follow_up = _transfer_follow_up(sender_id, receiver_id, source.profile, destination.profile)
+    handle = _TransferHandle(sender_id, receiver_id, source.connection, destination.connection)
+    return handle, f"""Transfer started (async): {source.label} → {destination.label}
+The source side copied and hashed the files and is waiting for the receiver.
+{relay_note}
+**Files:**
+{_transfer_files_summary(files, report.sizes)}
+
+**Sender environment:** {sender_url}
+**Receiver environment:** {_environment_url(destination.connection, receiver_id)}
+
+Use `get_transfer_status` with {follow_up} to check progress (suggested initial wait=30).
+Use `cancel_transfer` with the same arguments to abort."""
+
+
+def _transfer_connections(arguments: dict) -> tuple[dict, dict]:
+    """The sender's and receiver's connections: given profile, else remembered, else default."""
+    out = []
+    for id_key, profile_key in (("sender_environment_id", "sender_profile"),
+                                ("receiver_environment_id", "receiver_profile")):
+        profile = arguments.get(profile_key) or None
+        cfg = _config_for_profile(profile) if profile else None
+        out.append(_async_connection(arguments[id_key], cfg, profile))
+    return out[0], out[1]
+
+
+async def _read_environment(connection: dict, environment_id: str):
+    """(status, raw status, env_data, log) of one environment; log is None if unreadable."""
+    async with _connection_client(connection) as client:
+        env_data = await client.get_environment_status(environment_id)
+        status, raw = _environment_status(env_data)
+        log = await client.get_grain_log(environment_id)
+    return status, raw, env_data, log
+
+
+async def handle_get_transfer_status(arguments: dict):
+    """Status of a transfer, from its two environment ids alone (no state kept here)."""
+    sender_id = arguments.get("sender_environment_id")
+    receiver_id = arguments.get("receiver_environment_id")
+    if not sender_id or not receiver_id:
+        return [TextContent(type="text", text="Error: sender_environment_id and receiver_environment_id are required.")]
+    try:
+        sender_conn, receiver_conn = _transfer_connections(arguments)
+    except ValueError as e:
+        return [TextContent(type="text", text=f"Error: {e}")]
+    wait_seconds = max(0, min(int(arguments.get("wait", 5) or 0), 300))
+    handle = _TransferHandle(sender_id, receiver_id, sender_conn, receiver_conn)
+    _, text, _ = await _check_transfer(handle, wait_seconds)
+    return [TextContent(type="text", text=text)]
+
+
+async def _check_transfer(handle: _TransferHandle, wait_seconds: float):
+    """Poll a transfer for up to ``wait_seconds`` (returning early once it is finished),
+    end its environments if it is, and describe it.
+
+    Returns (PairState, text, ReceiverReport), or (None, error text, None).
+    """
+    sender_id, receiver_id = handle.sender_id, handle.receiver_id
+    sender_conn, receiver_conn = handle.sender_connection, handle.receiver_connection
+    direct = sender_id == receiver_id
+    deadline = time.monotonic() + wait_seconds
+
+    while True:
+        try:
+            r_status, r_raw, r_data, r_log = await _read_environment(receiver_conn, receiver_id)
+            if direct:
+                s_status, s_raw, s_data, s_log = r_status, r_raw, r_data, r_log
+            else:
+                s_status, s_raw, s_data, s_log = await _read_environment(sender_conn, sender_id)
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                return None, "Error: environment not found. Check both ids (and the profiles, if the transfer used any).", None
+            return None, f"Error checking transfer status: {e}", None
+        except Exception as e:
+            return None, f"Error checking transfer status: {e}", None
+
+        receiver = remote_transfer.parse_receiver_log(r_log or "")
+        sender = None if direct else remote_transfer.parse_sender_log(s_log or "")
+        state = remote_transfer.evaluate_pair(
+            receiver, r_raw, r_status in _TERMINAL_STATUSES,
+            sender, s_raw, s_status in _TERMINAL_STATUSES)
+        # A log that could not be read is not evidence the transfer failed.
+        unreadable = r_log is None or (not direct and s_log is None)
+        if state.status == "FAILED" and unreadable and not (receiver.failure or (sender and sender.failure)):
+            state = remote_transfer.PairState("RUNNING", "an environment's log could not be read this time")
+        if state.status != "RUNNING" or time.monotonic() >= deadline:
+            break
+        await asyncio.sleep(min(TRANSFER_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
+
+    if state.status == "FAILED":
+        # An environment that ended without reporting may never have run at all; then
+        # Torque's own errors are the only explanation.
+        extra = [f"{side} environment: {msg}" for side, msg in (
+            ("receiving", _environment_errors(r_data)),
+            ("sending", "" if direct else _environment_errors(s_data))) if msg]
+        if extra:
+            state.reason = "; ".join([state.reason] + extra) if state.reason else "; ".join(extra)
+
+    actions = []
+    if state.end_sender and not direct:
+        actions.append(("sender", sender_conn, sender_id))
+    if state.end_receiver:
+        actions.append(("receiver", receiver_conn, receiver_id))
+    for _, conn, env_id in actions:
+        await _terminate_quietly(conn, env_id)
+
+    lines = [f"**Status:** {state.status}"]
+    if state.reason:
+        lines.append(f"**Reason:** {state.reason}")
+    if receiver.placed:
+        lines.append("\n**Files placed on the destination:**")
+        lines += [f"- {p}" for p in receiver.placed]
+    if state.status == "RUNNING":
+        if sender is not None and not sender.done:
+            lines.append("\n**Sender:** sending" if sender.ready else "\n**Sender:** preparing")
+        elif sender is not None:
+            lines.append("\n**Sender:** finished sending")
+        if receiver.progress:
+            lines.append(f"**Progress:** {receiver.progress}")
+    if state.status == "FAILED":
+        tail_log = s_log if (sender is not None and sender.failure and not receiver.failure) else r_log
+        if tail_log:
+            lines.append("\n**Log (tail):**\n" + format_code_block(filter_grain_log(tail_log)[-1500:]))
+    if direct:
+        lines.append(f"\n**Environment:** {_environment_url(receiver_conn, receiver_id)}")
+    else:
+        lines.append(f"\n**Sender environment:** {_environment_url(sender_conn, sender_id)} ({s_raw})")
+        lines.append(f"**Receiver environment:** {_environment_url(receiver_conn, receiver_id)} ({r_raw})")
+    if state.status == "RUNNING":
+        follow_up = _transfer_follow_up(sender_id, receiver_id, sender_conn["profile"], receiver_conn["profile"])
+        lines.append(f"\nCall `get_transfer_status` again with {follow_up} and wait=30 to check progress.")
+    return state, "\n".join(lines), receiver
+
+
+async def handle_cancel_transfer(arguments: dict):
+    """End both environments of a transfer (one, for a direct copy)."""
+    sender_id = arguments.get("sender_environment_id")
+    receiver_id = arguments.get("receiver_environment_id")
+    if not sender_id or not receiver_id:
+        return [TextContent(type="text", text="Error: sender_environment_id and receiver_environment_id are required.")]
+    try:
+        sender_conn, receiver_conn = _transfer_connections(arguments)
+    except ValueError as e:
+        return [TextContent(type="text", text=f"Error: {e}")]
+    targets = [("Receiver", receiver_conn, receiver_id)]
+    if sender_id != receiver_id:
+        targets.insert(0, ("Sender", sender_conn, sender_id))
+    lines = ["Transfer cancelled."]
+    for label, conn, env_id in targets:
+        try:
+            outcome = await _terminate_environment(conn, env_id)
+        except Exception as e:
+            outcome = f"could not be ended: {e}"
+        _async_env_connections.pop(env_id, None)
+        lines.append(f"**{label}:** {_environment_url(conn, env_id)} - {outcome}")
+    return [TextContent(type="text", text="\n".join(lines))]
+
+
+def _parse_transfer_files(specs) -> list[dict]:
+    """``--file SOURCE:DESTINATION[:MODE]`` (both are remote POSIX paths)."""
+    files = []
+    for spec in specs or []:
+        parts = spec.split(":")
+        mode = None
+        if len(parts) == 3 and croc_manager._validate_mode(parts[2]):
+            mode = parts.pop()
+        if len(parts) != 2 or not parts[0] or not parts[1]:
+            raise ValueError(f"Invalid --file {spec!r}: use SOURCE_PATH:DESTINATION_PATH[:MODE]")
+        entry = {"source_path": parts[0], "destination_path": parts[1]}
+        if mode:
+            entry["mode"] = mode
+        files.append(entry)
+    return files
+
+
+def _cli_transfer_endpoint(args, prefix: str) -> dict:
+    """An endpoint spec from the --from-* / --to-* options."""
+    container = getattr(args, f"{prefix}_persistent_container", None)
+    spec = ({"type": "persistent_container", "environment_id": container} if container
+            else {"type": "ssh"})
+    for option, key in (("host", "host"), ("user", "user"), ("key", "private_key"),
+                        ("password", "password"), ("profile", "profile"), ("agent", "torque_agent")):
+        value = getattr(args, f"{prefix}_{option}", None)
+        if value:
+            spec[key] = value
+    return spec
+
+
+async def _cli_transfer(args) -> None:
+    """``torque-tunnel transfer``: the same transfer as the MCP tool, followed in the
+    foreground until it finishes. Exits non-zero unless every file was placed."""
+    import json as json_module
+    try:
+        files = _parse_transfer_files(getattr(args, "file", None))
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    arguments = {
+        "command_description": getattr(args, "description", None) or "file transfer",
+        "source": _cli_transfer_endpoint(args, "from"),
+        "destination": _cli_transfer_endpoint(args, "to"),
+        "files": files,
+        "timeout": getattr(args, "timeout", None),
+    }
+    started = time.monotonic()
+    handle, text = await _start_transfer(arguments)
+    if handle is None:
+        print(text, file=sys.stderr)
+        sys.exit(1)
+    print(text.split("\n\nUse `get_transfer_status`")[0], file=sys.stderr, flush=True)
+
+    shown = ""
+    while True:
+        state, text, receiver = await _check_transfer(handle, 30)
+        if state is None:
+            print(text, file=sys.stderr)
+            sys.exit(1)
+        if receiver.progress and receiver.progress != shown:
+            print(receiver.progress, file=sys.stderr, flush=True)
+            shown = receiver.progress
+        if state.status != "RUNNING":
+            break
+    elapsed = time.monotonic() - started
+
+    if getattr(args, "json", False):
+        print(json_module.dumps({
+            "status": state.status,
+            "reason": state.reason,
+            "placed": receiver.placed,
+            "path": "direct" if handle.sender_id == handle.receiver_id else "croc",
+            "sender_environment_id": handle.sender_id,
+            "receiver_environment_id": handle.receiver_id,
+            "transfer_seconds": round(elapsed, 1),
+        }))
+    else:
+        for p in receiver.placed:
+            print(f"Placed: {p}", file=sys.stderr)
+        if state.status != "COMPLETED":
+            print(f"TRANSFER FAILED: {state.reason}", file=sys.stderr)
+        print(f"Transfer time: {_format_seconds(elapsed)}", file=sys.stderr)
+    sys.exit(0 if state.status == "COMPLETED" else 1)
 
 
 def _suggest_wait_time(command: str) -> int:
@@ -4858,6 +5731,10 @@ async def cli_dispatch(args):
                     print(json_module.dumps(payload, indent=2))
             else:
                 print(text)
+            return
+
+        if args.command == "transfer":
+            await _cli_transfer(args)
             return
 
         if args.command == "ssh":
@@ -5864,6 +6741,25 @@ PERFORMANCE TIP:
     ssh_parser.add_argument("--description", help="Optional short description embedded in the Torque environment name (for finding it in the UI)")
     ssh_parser.add_argument("--credential", help="Name of a Torque credential to attach; its secrets are injected as environment variables where the command runs (see `torque-tunnel credentials`)")
     ssh_parser.add_argument("--credential-env-forward", action="append", metavar="VAR", help="Extra env var NAME to carry to the remote host (repeatable); only needed for an unmeasured credential type")
+
+    # transfer subcommand (machine to machine, neither reachable from the other)
+    transfer_parser = subparsers.add_parser(
+        "transfer", parents=[common_parser],
+        help="Copy files between two remote machines that cannot reach each other (data does not pass through this machine)")
+    for prefix, role in (("from", "source"), ("to", "destination")):
+        transfer_parser.add_argument(f"--{prefix}-host", help=f"The {role} machine's IP or hostname")
+        transfer_parser.add_argument(f"--{prefix}-user", help=f"SSH user on the {role}")
+        transfer_parser.add_argument(f"--{prefix}-key", help=f"SSH private key for the {role} - file path, key content, or base64")
+        transfer_parser.add_argument(f"--{prefix}-password", help=f"SSH password for the {role}")
+        transfer_parser.add_argument(f"--{prefix}-persistent-container", metavar="ENV_ID",
+                                     help=f"Use a running persistent container as the {role}")
+        transfer_parser.add_argument(f"--{prefix}-profile", help=f"Configuration profile for the {role} (default: --profile / the default profile)")
+        transfer_parser.add_argument(f"--{prefix}-agent", help=f"Torque agent for the {role} (default: its profile's)")
+    transfer_parser.add_argument("--file", action="append", required=True, metavar="SOURCE:DESTINATION[:MODE]",
+                                 help="A file or directory to copy (can be repeated)")
+    transfer_parser.add_argument("--description", help="Optional short description embedded in the Torque environment names")
+    transfer_parser.add_argument("--timeout", type=int, help=f"Overall limit in seconds (default {TRANSFER_DEFAULT_TIMEOUT_SECONDS})")
+    transfer_parser.add_argument("--json", "-j", action="store_true", help="Output the result as JSON")
 
     # persistent-container subcommand (run on persistent Torque agent container)
     pc_parser = subparsers.add_parser("persistent-container", parents=[common_parser],
