@@ -2014,18 +2014,61 @@ _FOLLOW_UP_PROFILE_SCHEMA = {
 }
 
 
+# Arguments that mean the same in every tool that takes them, defined once: the run_*
+# tools and each endpoint of a transfer (which resolve them through the same code, see
+# "Argument resolution, shared by every tool").
+_ARG_SCHEMAS = {
+    "host": {
+        "type": "string",
+        "description": "The IP address or hostname of the remote server to connect to",
+    },
+    "user": {
+        "type": "string",
+        "description": "The username for authentication",
+    },
+    "private_key": {
+        "type": "string",
+        "description": "SSH private key - a LOCAL file path (e.g., C:\\Users\\you\\.ssh\\id_rsa), the key content directly (starting with '-----BEGIN'), or a base64-encoded key. Use this OR password.",
+    },
+    "password": {
+        "type": "string",
+        "description": "SSH password for authentication. Use this OR private_key. Requires sshpass on the Torque agent.",
+    },
+    "torque_agent": {
+        "type": "string",
+        "description": "DO NOT set unless the user explicitly provides this value or asks you to change it. Overrides the pre-configured Torque agent.",
+    },
+    "torque_token": {
+        "type": "string",
+        "description": "DO NOT set unless the user explicitly provides this value or asks you to change it. Overrides the pre-configured Torque API token.",
+    },
+    "torque_url": {
+        "type": "string",
+        "description": "DO NOT set unless the user explicitly provides this value or asks you to change it. Overrides the pre-configured Torque platform URL.",
+    },
+    "torque_space": {
+        "type": "string",
+        "description": "DO NOT set unless the user explicitly provides this value or asks you to change it. Overrides the pre-configured Torque space name.",
+    },
+    "profile": {
+        "type": "string",
+        "description": "Configuration profile name to use. Omit this parameter (or don't pass it) to use the default profile. Do NOT pass 'default' as the value — that would look for a profile literally named 'default'. Use list_profiles to see available profiles and which one is the default.",
+    },
+}
+
+# One side of a transfer: the same arguments as a run_* tool call, plus which kind of
+# machine it is.
 _TRANSFER_ENDPOINT_SCHEMA = {
     "type": "object",
-    "description": "One side of the transfer.",
+    "description": "One side of the transfer. Its fields mean exactly what they mean in run_on_tunneled_ssh (and resolve the same way: argument, else this side's profile, else the default configuration).",
     "properties": {
-        "type": {"type": "string", "enum": ["ssh", "persistent_container"], "description": "Default: ssh."},
-        "host": {"type": "string", "description": "ssh: IP or hostname of the machine."},
-        "user": {"type": "string", "description": "ssh: user name."},
-        "private_key": {"type": "string", "description": "ssh: a LOCAL key file path, the key content, or a base64-encoded key. Use this OR password."},
-        "password": {"type": "string", "description": "ssh: password (requires sshpass on the agent). Use this OR private_key."},
-        "environment_id": {"type": "string", "description": "persistent_container: the container's environment id."},
-        "profile": {"type": "string", "description": "Configuration profile for this side. Omit to use the default profile. Do NOT pass 'default'."},
-        "torque_agent": {"type": "string", "description": "DO NOT set unless the user explicitly provides this value. Overrides the profile's agent for this side."},
+        "type": {"type": "string", "enum": ["ssh", "persistent_container"],
+                 "description": "ssh (default): a machine reached over SSH. persistent_container: a running persistent container, by environment_id."},
+        "environment_id": {"type": "string",
+                           "description": "persistent_container only: the container's environment id. It must exist and be running (a transfer never creates one)."},
+        **{name: _ARG_SCHEMAS[name] for name in (
+            "host", "user", "private_key", "password", "profile",
+            "torque_agent", "torque_url", "torque_token", "torque_space")},
     },
 }
 
@@ -2063,22 +2106,10 @@ docker restart/stop/kill, systemctl restart docker, reboot, shutdown, init 0/6
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "host": {
-                        "type": "string",
-                        "description": "The IP address or hostname of the remote server to connect to",
-                    },
-                    "user": {
-                        "type": "string",
-                        "description": "The username for authentication",
-                    },
-                    "private_key": {
-                        "type": "string",
-                        "description": "SSH private key - a LOCAL file path (e.g., C:\\Users\\you\\.ssh\\id_rsa), the key content directly (starting with '-----BEGIN'), or a base64-encoded key. Use this OR password.",
-                    },
-                    "password": {
-                        "type": "string",
-                        "description": "SSH password for authentication. Use this OR private_key. Requires sshpass on the Torque agent.",
-                    },
+                    "host": _ARG_SCHEMAS["host"],
+                    "user": _ARG_SCHEMAS["user"],
+                    "private_key": _ARG_SCHEMAS["private_key"],
+                    "password": _ARG_SCHEMAS["password"],
                     "command": {
                         "type": "string",
                         "description": "The shell command to execute on the remote server. Optional if only uploading files via upload_files.",
@@ -2140,10 +2171,7 @@ docker restart/stop/kill, systemctl restart docker, reboot, shutdown, init 0/6
                         "items": {"type": "string"},
                         "description": "Optional: extra environment variable NAMES to carry to the remote host, on top of the credential's own. Only needed for a credential type torque-tunnel has not measured yet, or to correct a stale cache entry.",
                     },
-                    "torque_agent": {
-                        "type": "string",
-                        "description": "DO NOT set unless the user explicitly provides this value or asks you to change it. Overrides the pre-configured Torque agent.",
-                    },
+                    "torque_agent": _ARG_SCHEMAS["torque_agent"],
                     "allow_dangerous_commands": {
                         "type": "boolean",
                         "description": "Optional: Set to true to bypass dangerous command warnings. Use with extreme caution.",
@@ -2156,22 +2184,10 @@ docker restart/stop/kill, systemctl restart docker, reboot, shutdown, init 0/6
                         "type": "boolean",
                         "description": "Optional: Whether to automatically delete the Torque environment after completion.",
                     },
-                    "torque_token": {
-                        "type": "string",
-                        "description": "DO NOT set unless the user explicitly provides this value or asks you to change it. Overrides the pre-configured Torque API token.",
-                    },
-                    "torque_url": {
-                        "type": "string",
-                        "description": "DO NOT set unless the user explicitly provides this value or asks you to change it. Overrides the pre-configured Torque platform URL.",
-                    },
-                    "torque_space": {
-                        "type": "string",
-                        "description": "DO NOT set unless the user explicitly provides this value or asks you to change it. Overrides the pre-configured Torque space name.",
-                    },
-                    "profile": {
-                        "type": "string",
-                        "description": "Configuration profile name to use. Omit this parameter (or don't pass it) to use the default profile. Do NOT pass 'default' as the value — that would look for a profile literally named 'default'. Use list_profiles to see available profiles and which one is the default.",
-                    },
+                    "torque_token": _ARG_SCHEMAS["torque_token"],
+                    "torque_url": _ARG_SCHEMAS["torque_url"],
+                    "torque_space": _ARG_SCHEMAS["torque_space"],
+                    "profile": _ARG_SCHEMAS["profile"],
                 },
                 "required": ["command_description"],
             },
@@ -2246,30 +2262,15 @@ for local network/VMs use regular terminal commands):
                         "type": "string",
                         "description": "Optional: name of a credential stored in the connected Torque account. Torque injects its secrets as environment variables where the command runs, so the command can reference them (e.g. \"$VSPHERE_PASSWORD\") without them ever being shown to you or written into the command. Call list_credentials to see the available names and which variables each one provides. One credential per call — for two, make two calls.",
                     },
-                    "torque_agent": {
-                        "type": "string",
-                        "description": "DO NOT set unless the user explicitly provides this value or asks you to change it. Overrides the pre-configured Torque agent.",
-                    },
+                    "torque_agent": _ARG_SCHEMAS["torque_agent"],
                     "timeout": {
                         "type": "integer",
                         "description": "Optional: Maximum time in seconds. Default is 1800 (30 minutes).",
                     },
-                    "torque_token": {
-                        "type": "string",
-                        "description": "DO NOT set unless the user explicitly provides this value or asks you to change it. Overrides the pre-configured Torque API token.",
-                    },
-                    "torque_url": {
-                        "type": "string",
-                        "description": "DO NOT set unless the user explicitly provides this value or asks you to change it. Overrides the pre-configured Torque platform URL.",
-                    },
-                    "torque_space": {
-                        "type": "string",
-                        "description": "DO NOT set unless the user explicitly provides this value or asks you to change it. Overrides the pre-configured Torque space name.",
-                    },
-                    "profile": {
-                        "type": "string",
-                        "description": "Configuration profile name to use. Omit this parameter (or don't pass it) to use the default profile. Do NOT pass 'default' as the value — that would look for a profile literally named 'default'. Use list_profiles to see available profiles and which one is the default.",
-                    },
+                    "torque_token": _ARG_SCHEMAS["torque_token"],
+                    "torque_url": _ARG_SCHEMAS["torque_url"],
+                    "torque_space": _ARG_SCHEMAS["torque_space"],
+                    "profile": _ARG_SCHEMAS["profile"],
                 },
                 "required": ["command_description"],
             },
@@ -2357,10 +2358,7 @@ Without the ID, a new container is created.
                         "items": {"type": "string"},
                         "description": "Optional: extra environment variable NAMES to carry to the remote host, on top of the credential's own. Only needed for a credential type torque-tunnel has not measured yet, or to correct a stale cache entry.",
                     },
-                    "torque_agent": {
-                        "type": "string",
-                        "description": "DO NOT set unless the user explicitly provides this value or asks you to change it. Overrides the pre-configured Torque agent.",
-                    },
+                    "torque_agent": _ARG_SCHEMAS["torque_agent"],
                     "timeout": {
                         "type": "integer",
                         "description": "Optional: Maximum time in seconds. Default is 1800 (30 minutes).",
@@ -2377,22 +2375,10 @@ Without the ID, a new container is created.
                         "type": "string",
                         "description": "Target a specific persistent container by its environment ID. If omitted, uses the most recently used container (or creates one).",
                     },
-                    "torque_token": {
-                        "type": "string",
-                        "description": "DO NOT set unless the user explicitly provides this value or asks you to change it. Overrides the pre-configured Torque API token.",
-                    },
-                    "torque_url": {
-                        "type": "string",
-                        "description": "DO NOT set unless the user explicitly provides this value or asks you to change it. Overrides the pre-configured Torque platform URL.",
-                    },
-                    "torque_space": {
-                        "type": "string",
-                        "description": "DO NOT set unless the user explicitly provides this value or asks you to change it. Overrides the pre-configured Torque space name.",
-                    },
-                    "profile": {
-                        "type": "string",
-                        "description": "Configuration profile name to use. Omit this parameter (or don't pass it) to use the default profile. Do NOT pass 'default' as the value — that would look for a profile literally named 'default'. Use list_profiles to see available profiles and which one is the default.",
-                    },
+                    "torque_token": _ARG_SCHEMAS["torque_token"],
+                    "torque_url": _ARG_SCHEMAS["torque_url"],
+                    "torque_space": _ARG_SCHEMAS["torque_space"],
+                    "profile": _ARG_SCHEMAS["profile"],
                 },
                 "required": ["command_description", "container_description"],
             },
@@ -2416,22 +2402,10 @@ systemctl restart docker, reboot, shutdown, init 0/6""",
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "host": {
-                        "type": "string",
-                        "description": "The IP address or hostname of the remote server to connect to",
-                    },
-                    "user": {
-                        "type": "string",
-                        "description": "The username for authentication",
-                    },
-                    "private_key": {
-                        "type": "string",
-                        "description": "SSH private key - a LOCAL file path, the key content directly (starting with '-----BEGIN'), or a base64-encoded key. Use this OR password.",
-                    },
-                    "password": {
-                        "type": "string",
-                        "description": "SSH password for authentication. Use this OR private_key. Requires sshpass on the Torque agent.",
-                    },
+                    "host": _ARG_SCHEMAS["host"],
+                    "user": _ARG_SCHEMAS["user"],
+                    "private_key": _ARG_SCHEMAS["private_key"],
+                    "password": _ARG_SCHEMAS["password"],
                     "command": {
                         "type": "string",
                         "description": "The shell command to execute on the remote server.",
@@ -2493,10 +2467,7 @@ systemctl restart docker, reboot, shutdown, init 0/6""",
                         "items": {"type": "string"},
                         "description": "Optional: extra environment variable NAMES to carry to the remote host, on top of the credential's own. Only needed for a credential type torque-tunnel has not measured yet, or to correct a stale cache entry.",
                     },
-                    "torque_agent": {
-                        "type": "string",
-                        "description": "DO NOT set unless the user explicitly provides this value or asks you to change it. Overrides the pre-configured Torque agent.",
-                    },
+                    "torque_agent": _ARG_SCHEMAS["torque_agent"],
                     "allow_dangerous_commands": {
                         "type": "boolean",
                         "description": "Optional: Set to true to bypass dangerous command warnings.",
@@ -2505,22 +2476,10 @@ systemctl restart docker, reboot, shutdown, init 0/6""",
                         "type": "integer",
                         "description": "Optional: Maximum time in seconds. Default is 1800 (30 minutes).",
                     },
-                    "torque_token": {
-                        "type": "string",
-                        "description": "DO NOT set unless the user explicitly provides this value or asks you to change it. Overrides the pre-configured Torque API token.",
-                    },
-                    "torque_url": {
-                        "type": "string",
-                        "description": "DO NOT set unless the user explicitly provides this value or asks you to change it. Overrides the pre-configured Torque platform URL.",
-                    },
-                    "torque_space": {
-                        "type": "string",
-                        "description": "DO NOT set unless the user explicitly provides this value or asks you to change it. Overrides the pre-configured Torque space name.",
-                    },
-                    "profile": {
-                        "type": "string",
-                        "description": "Configuration profile name to use. Omit this parameter (or don't pass it) to use the default profile. Do NOT pass 'default' as the value — that would look for a profile literally named 'default'. Use list_profiles to see available profiles and which one is the default.",
-                    },
+                    "torque_token": _ARG_SCHEMAS["torque_token"],
+                    "torque_url": _ARG_SCHEMAS["torque_url"],
+                    "torque_space": _ARG_SCHEMAS["torque_space"],
+                    "profile": _ARG_SCHEMAS["profile"],
                 },
                 "required": ["command", "command_description"],
             },
@@ -2602,10 +2561,7 @@ After restart: pass previous `environment_id` to reconnect.""",
                         "items": {"type": "string"},
                         "description": "Optional: extra environment variable NAMES to carry to the remote host, on top of the credential's own. Only needed for a credential type torque-tunnel has not measured yet, or to correct a stale cache entry.",
                     },
-                    "torque_agent": {
-                        "type": "string",
-                        "description": "DO NOT set unless the user explicitly provides this value or asks you to change it. Overrides the pre-configured Torque agent.",
-                    },
+                    "torque_agent": _ARG_SCHEMAS["torque_agent"],
                     "new_container": {
                         "type": "boolean",
                         "description": "Set to true to create a new persistent container instead of reusing the current one. Old containers remain active.",
@@ -2622,22 +2578,10 @@ After restart: pass previous `environment_id` to reconnect.""",
                         "type": "integer",
                         "description": "Optional: Maximum time in seconds. Default is 1800 (30 minutes).",
                     },
-                    "torque_token": {
-                        "type": "string",
-                        "description": "DO NOT set unless the user explicitly provides this value or asks you to change it. Overrides the pre-configured Torque API token.",
-                    },
-                    "torque_url": {
-                        "type": "string",
-                        "description": "DO NOT set unless the user explicitly provides this value or asks you to change it. Overrides the pre-configured Torque platform URL.",
-                    },
-                    "torque_space": {
-                        "type": "string",
-                        "description": "DO NOT set unless the user explicitly provides this value or asks you to change it. Overrides the pre-configured Torque space name.",
-                    },
-                    "profile": {
-                        "type": "string",
-                        "description": "Configuration profile name to use. Omit this parameter (or don't pass it) to use the default profile. Do NOT pass 'default' as the value — that would look for a profile literally named 'default'. Use list_profiles to see available profiles and which one is the default.",
-                    },
+                    "torque_token": _ARG_SCHEMAS["torque_token"],
+                    "torque_url": _ARG_SCHEMAS["torque_url"],
+                    "torque_space": _ARG_SCHEMAS["torque_space"],
+                    "profile": _ARG_SCHEMAS["profile"],
                 },
                 "required": ["command", "command_description", "container_description"],
             },
@@ -2711,30 +2655,15 @@ Only for unreachable internal network targets. For local network/VMs, use termin
                         "type": "string",
                         "description": "Optional: name of a credential stored in the connected Torque account. Torque injects its secrets as environment variables where the command runs, so the command can reference them (e.g. \"$VSPHERE_PASSWORD\") without them ever being shown to you or written into the command. Call list_credentials to see the available names and which variables each one provides. One credential per call — for two, make two calls.",
                     },
-                    "torque_agent": {
-                        "type": "string",
-                        "description": "DO NOT set unless the user explicitly provides this value or asks you to change it. Overrides the pre-configured Torque agent.",
-                    },
+                    "torque_agent": _ARG_SCHEMAS["torque_agent"],
                     "timeout": {
                         "type": "integer",
                         "description": "Optional: Maximum time in seconds. Default is 1800 (30 minutes).",
                     },
-                    "torque_token": {
-                        "type": "string",
-                        "description": "DO NOT set unless the user explicitly provides this value or asks you to change it. Overrides the pre-configured Torque API token.",
-                    },
-                    "torque_url": {
-                        "type": "string",
-                        "description": "DO NOT set unless the user explicitly provides this value or asks you to change it. Overrides the pre-configured Torque platform URL.",
-                    },
-                    "torque_space": {
-                        "type": "string",
-                        "description": "DO NOT set unless the user explicitly provides this value or asks you to change it. Overrides the pre-configured Torque space name.",
-                    },
-                    "profile": {
-                        "type": "string",
-                        "description": "Configuration profile name to use. Omit this parameter (or don't pass it) to use the default profile. Do NOT pass 'default' as the value — that would look for a profile literally named 'default'. Use list_profiles to see available profiles and which one is the default.",
-                    },
+                    "torque_token": _ARG_SCHEMAS["torque_token"],
+                    "torque_url": _ARG_SCHEMAS["torque_url"],
+                    "torque_space": _ARG_SCHEMAS["torque_space"],
+                    "profile": _ARG_SCHEMAS["profile"],
                 },
                 "required": ["command", "command_description"],
             },
@@ -2780,7 +2709,7 @@ Use `wait` to avoid tight polling. Typical: wait=10, repeat until completed.""",
 
 Returns once the transfer is under way (the source side has been copied and hashed, which can take a few minutes for multi-GB files), with two environment ids. Then poll `get_transfer_status` with the arguments the result gives you, and use `cancel_transfer` to abort. Large files (tens of GB) are fine.
 
-Each endpoint is an SSH machine (`type`: "ssh", with host/user and private_key or password) or a running persistent container (`type`: "persistent_container", with its environment_id). Each endpoint may name its own `profile`; omit it to use the default profile.
+`sender` and `receiver` are each an SSH machine (`type`: "ssh", with host/user and private_key or password) or a running persistent container (`type`: "persistent_container", with its environment_id). Their fields are the same as run_on_tunneled_ssh's and resolve the same way; each side may name its own `profile`.
 
 How it works: torque-tunnel runs croc on each side's agent container (encrypted, through the croc relay), and verifies every file's size and MD5 before placing it. When both endpoints are behind the same agent, one environment copies directly over SSH instead.
 
@@ -2792,8 +2721,8 @@ Do NOT use this to move files between your local machine and a remote one - use 
                         "type": "string",
                         "description": "REQUIRED. A concise (3-6 word) description of the transfer, embedded in the Torque environment names (e.g. 'copy ova to esxi').",
                     },
-                    "source": _TRANSFER_ENDPOINT_SCHEMA,
-                    "destination": _TRANSFER_ENDPOINT_SCHEMA,
+                    "sender": _TRANSFER_ENDPOINT_SCHEMA,
+                    "receiver": _TRANSFER_ENDPOINT_SCHEMA,
                     "files": {
                         "type": "array",
                         "description": "What to copy. Each item: one file or directory.",
@@ -2812,7 +2741,7 @@ Do NOT use this to move files between your local machine and a remote one - use 
                         "description": f"Optional: overall limit in seconds. Default {TRANSFER_DEFAULT_TIMEOUT_SECONDS}.",
                     },
                 },
-                "required": ["command_description", "source", "destination", "files"],
+                "required": ["command_description", "sender", "receiver", "files"],
             },
         ),
         Tool(
@@ -2905,6 +2834,101 @@ DO NOT search for config files or try to edit them manually — this tool handle
     ]
 
 
+# --- Argument resolution, shared by every tool ------------------------------------------
+# Each value comes from the tool argument, else the call's profile, else the base config.
+# The run_* tools and both endpoints of a remote-to-remote transfer resolve through these
+# same functions (tests/test_argument_resolution.py pins the behaviour for all of them).
+
+async def _resolve_call_profile(arguments: dict):
+    """Apply the `profile` named in `arguments`, as every tool call does.
+
+    Returns (arguments, effective_config, profile_name, error). The arguments come back
+    without `profile`, with the profile's tool-mappable values (host, user, private_key,
+    torque_* ...) filled in where the caller gave none; effective_config overlays the
+    profile's other values (init_commands, croc_relay ...) onto the base config.
+    `error` is the text to return instead of running anything. The caller's dict is not
+    modified.
+    """
+    arguments = dict(arguments)
+    effective_config = _config
+    profile_name = arguments.pop("profile", None)
+
+    # Block tools that would use the broken default profile (but allow explicit profile)
+    if not profile_name and _default_profile_warning:
+        return arguments, effective_config, profile_name, (
+            f"Error: {_default_profile_warning}\nSpecify a profile explicitly "
+            f"(e.g. profile='cisco-review1') or fix default_profile in config.yaml.")
+    if profile_name and _loaded_config:
+        try:
+            profile_values = config_module.resolve_profile(_loaded_config, profile_name)
+            # Inject tool-argument-mappable values (host, user, private_key, etc.)
+            arguments = config_module.inject_profile_into_arguments(arguments, profile_values)
+            # Create effective config with config-only values (init_commands, etc.)
+            effective_config = config_module.apply_profile_to_config(_config, profile_values)
+        except ValueError as e:
+            error_parts = [f"Error: {str(e)}"]
+            if profile_name == "default":
+                error_parts.append("**Hint:** To use the default profile, simply omit the 'profile' parameter entirely.")
+            # Append profile listing for context
+            profile_listing = await handle_list_profiles()
+            if profile_listing:
+                error_parts.append("")
+                error_parts.append(profile_listing[0].text)
+            return arguments, effective_config, profile_name, "\n".join(error_parts)
+    return arguments, effective_config, profile_name, None
+
+
+def _resolve_agent(arguments: dict, cfg: dict) -> Optional[str]:
+    """The Torque agent a call runs on: its `torque_agent`, else the config's."""
+    return arguments.get("torque_agent") or cfg["default_agent"]
+
+
+def _resolve_connection(arguments: dict, cfg: dict, profile_name: Optional[str] = None) -> dict:
+    """The Torque a call runs against: its torque_url/token/space, else the config's."""
+    return _connection(cfg, profile_name, arguments.get("torque_url"),
+                       arguments.get("torque_token"), arguments.get("torque_space"))
+
+
+def _missing_torque_config(connection: dict) -> Optional[str]:
+    if not all([connection["torque_url"], connection["torque_token"], connection["torque_space"]]):
+        return ("Error: Torque configuration missing. Need torque_url, torque_token, and torque_space "
+                "(or configure defaults).")
+    return None
+
+
+def _resolve_ssh_target(arguments: dict, cfg: dict):
+    """The SSH target of a call: host, user and exactly one auth pair.
+
+    host/user: the argument, else the config's default. Auth: if the arguments give
+    either private_key or password, only the arguments' pair is used; otherwise the
+    config's pair. The key goes through resolve_ssh_private_key (a path, the key's
+    content, or base64 of it).
+
+    Returns ({"host", "user", "private_key", "password"}, None) or (None, error text).
+    """
+    target_ip = arguments.get("host") or cfg["default_target_ip"]
+    ssh_user = arguments.get("user") or cfg["default_ssh_user"]
+    # SSH auth mutual exclusion: if args specify either auth method, use only args;
+    # only fall back to config defaults when neither is provided in args.
+    private_key_value = arguments.get("private_key")
+    ssh_password = arguments.get("password")
+    if not private_key_value and not ssh_password:
+        private_key_value = cfg.get("default_ssh_key")
+        ssh_password = cfg.get("default_ssh_password")
+    if not all([target_ip, ssh_user]):
+        return None, "Error: Missing required parameters. Need host and user (or configure defaults)."
+    if not private_key_value and not ssh_password:
+        return None, "Error: Missing authentication. Need private_key or password (or configure defaults)."
+    ssh_private_key = ""
+    if private_key_value:
+        try:
+            ssh_private_key = resolve_ssh_private_key(private_key_value)
+        except ValueError as e:
+            return None, f"Error: {str(e)}"
+    return {"host": target_ip, "user": ssh_user, "private_key": ssh_private_key,
+            "password": ssh_password}, None
+
+
 @server.call_tool()
 async def call_tool(name: str, arguments: dict):
     """Handle tool calls."""
@@ -2932,30 +2956,10 @@ async def call_tool(name: str, arguments: dict):
 
     # Resolve profile for execution tools: inject profile values into arguments
     # and create an effective_config overlay for config-only keys
-    effective_config = _config
-    profile_name = arguments.pop("profile", None)
+    arguments, effective_config, profile_name, error = await _resolve_call_profile(arguments)
+    if error:
+        return [TextContent(type="text", text=error)]
 
-    # Block tools that would use the broken default profile (but allow explicit profile)
-    if not profile_name and _default_profile_warning:
-        return [TextContent(type="text", text=f"Error: {_default_profile_warning}\nSpecify a profile explicitly (e.g. profile='cisco-review1') or fix default_profile in config.yaml.")]
-    if profile_name and _loaded_config:
-        try:
-            profile_values = config_module.resolve_profile(_loaded_config, profile_name)
-            # Inject tool-argument-mappable values (host, user, private_key, etc.)
-            arguments = config_module.inject_profile_into_arguments(arguments, profile_values)
-            # Create effective config with config-only values (init_commands, etc.)
-            effective_config = config_module.apply_profile_to_config(_config, profile_values)
-        except ValueError as e:
-            error_parts = [f"Error: {str(e)}"]
-            if profile_name == "default":
-                error_parts.append("**Hint:** To use the default profile, simply omit the 'profile' parameter entirely.")
-            # Append profile listing for context
-            profile_listing = await handle_list_profiles()
-            if profile_listing:
-                error_parts.append("")
-                error_parts.append(profile_listing[0].text)
-            return [TextContent(type="text", text="\n".join(error_parts))]
-    
     if name == "list_credentials":
         return await handle_list_credentials(arguments, effective_config)
 
@@ -3274,32 +3278,22 @@ async def handle_setup(arguments: dict):
 async def handle_run_on_tunneled_ssh(arguments: dict, config: dict = None):
     """Execute a remote command via SSH, optionally uploading files first."""
     cfg = config or _config
-    target_ip = arguments.get("host") or cfg["default_target_ip"]
-    ssh_user = arguments.get("user") or cfg["default_ssh_user"]
-    # SSH auth mutual exclusion: if args specify either auth method, use only args;
-    # only fall back to config defaults when neither is provided in args.
-    private_key_value = arguments.get("private_key")
-    ssh_password = arguments.get("password")
-    if not private_key_value and not ssh_password:
-        private_key_value = cfg.get("default_ssh_key")
-        ssh_password = cfg.get("default_ssh_password")
     command = arguments.get("command")
     command_description = arguments.get("command_description")
     files = arguments.get("upload_files", [])
     download_files = arguments.get("download_files", [])
-    agent = arguments.get("torque_agent")
+    agent = _resolve_agent(arguments, cfg)
     allow_dangerous_commands = arguments.get("allow_dangerous_commands", False)
     timeout = arguments.get("timeout")  # Optional timeout override
     # Per-call auto_delete overrides global config if specified
     auto_delete = arguments.get("auto_delete")
     if auto_delete is None:
         auto_delete = cfg["auto_delete_environments"]
-    
+
     # Per-call Torque config overrides
-    torque_url = arguments.get("torque_url") or cfg["torque_url"]
-    torque_token = arguments.get("torque_token") or cfg["torque_token"]
-    torque_space = arguments.get("torque_space") or cfg["torque_space"]
-    
+    connection = _resolve_connection(arguments, cfg)
+    torque_url, torque_space = connection["torque_url"], connection["torque_space"]
+
     # Must have at least command OR upload_files OR download_files
     if not command and not files and not download_files:
         return [TextContent(
@@ -3307,38 +3301,22 @@ async def handle_run_on_tunneled_ssh(arguments: dict, config: dict = None):
             text="Error: Must provide either 'command', 'upload_files', or 'download_files' (or any combination).",
         )]
 
-    if not all([target_ip, ssh_user]):
-        return [TextContent(
-            type="text",
-            text="Error: Missing required parameters. Need host and user (or configure defaults).",
-        )]
+    target, error = _resolve_ssh_target(arguments, cfg)
+    if error:
+        return [TextContent(type="text", text=error)]
+    target_ip, ssh_user = target["host"], target["user"]
+    ssh_private_key, ssh_password = target["private_key"], target["password"]
 
-    if not private_key_value and not ssh_password:
-        return [TextContent(
-            type="text",
-            text="Error: Missing authentication. Need private_key or password (or configure defaults).",
-        )]
-    
-    if not all([torque_url, torque_token, torque_space]):
-        return [TextContent(
-            type="text",
-            text="Error: Torque configuration missing. Need torque_url, torque_token, and torque_space (or configure defaults).",
-        )]
-    
+    error = _missing_torque_config(connection)
+    if error:
+        return [TextContent(type="text", text=error)]
+
     # Check for dangerous commands unless allow_dangerous_commands=true
     if command and not allow_dangerous_commands:
         warning = check_dangerous_command(command)
         if warning:
             return [TextContent(type="text", text=warning)]
-    
-    # Resolve SSH private key (only if provided)
-    ssh_private_key = ""
-    if private_key_value:
-        try:
-            ssh_private_key = resolve_ssh_private_key(private_key_value)
-        except ValueError as e:
-            return [TextContent(type="text", text=f"Error: {str(e)}")]
-    
+
     # Process files parameter - generate deployment commands (with croc for large files)
     files_info = []
     init_commands = None
@@ -3412,18 +3390,7 @@ async def handle_run_on_tunneled_ssh(arguments: dict, config: dict = None):
                 return [TextContent(type="text", text=f"Error starting croc file download receiver: {str(e)}")]
         
         # Create client with per-call or global cfg
-        client = TorqueClient(
-            base_url=torque_url,
-            token=torque_token,
-            space=torque_space,
-            default_agent=cfg["default_agent"],
-            init_commands=cfg["init_commands"],
-            finally_commands=cfg["finally_commands"],
-            retry_enabled=cfg.get("retry_enabled", True),
-            retry_budget_seconds=cfg.get("retry_budget_seconds", 600),
-            create_retry_budget_seconds=cfg.get("create_retry_budget_seconds", 600),
-            retry_max_backoff_seconds=cfg.get("retry_max_backoff_seconds", 15),
-        )
+        client = _connection_client(connection)
         async with client:
             __cred_name, __cred_ctx = await _prepare_credential(arguments, cfg, client, forward=True)
             result = await client.execute_remote_command(
@@ -3664,13 +3631,13 @@ async def handle_run_on_tunneled_persistent_container(arguments: dict, config: d
     container_description = arguments.get("container_description")
     files = arguments.get("upload_files", [])
     download_files = arguments.get("download_files", [])
-    agent = arguments.get("torque_agent")
+    agent = _resolve_agent(arguments, cfg)
     timeout = arguments.get("timeout")
     new_container = arguments.get("new_container", False)
     target_env_id = arguments.get("environment_id")
-    torque_url = arguments.get("torque_url")
-    torque_token = arguments.get("torque_token")
-    torque_space = arguments.get("torque_space")
+    connection = _resolve_connection(arguments, cfg)
+    torque_url, torque_token, torque_space = (
+        connection["torque_url"], connection["torque_token"], connection["torque_space"])
 
     # Must have at least command OR upload_files OR download_files
     if not command and not files and not download_files:
@@ -3759,7 +3726,7 @@ async def handle_run_on_tunneled_persistent_container(arguments: dict, config: d
                 return [TextContent(type="text", text=f"Error starting croc file download receiver: {str(e)}")]
         
         # Reuse the SSH execution logic - SSH from a disposable grain into the persistent container
-        async with get_torque_client(torque_url, torque_token, torque_space, config=cfg) as client:
+        async with _connection_client(connection) as client:
             # Arm the container's end time so it cannot die under this command
             try:
                 await client.set_scheduled_end_time(
@@ -3819,7 +3786,7 @@ async def handle_run_on_tunneled_persistent_container(arguments: dict, config: d
         else:
             duration_str = "N/A"
         
-        env_url = f"{torque_url or cfg['torque_url']}/{torque_space or cfg['torque_space']}/environments/{result.environment_id}"
+        env_url = _environment_url(connection, result.environment_id)
         agent_name = agent or cfg["default_agent"]
         
         files_summary = ""
@@ -3888,11 +3855,11 @@ async def handle_run_on_tunneled_disposable_container(arguments: dict, config: d
     command_description = arguments.get("command_description")
     files = arguments.get("upload_files", [])
     download_files = arguments.get("download_files", [])
-    agent = arguments.get("torque_agent")
+    agent = _resolve_agent(arguments, cfg)
     timeout = arguments.get("timeout")  # Optional timeout override
-    torque_url = arguments.get("torque_url")
-    torque_token = arguments.get("torque_token")
-    torque_space = arguments.get("torque_space")
+    connection = _resolve_connection(arguments, cfg)
+    torque_url, torque_token, torque_space = (
+        connection["torque_url"], connection["torque_token"], connection["torque_space"])
 
     # Must have at least command OR upload_files OR download_files
     if not command and not files and not download_files:
@@ -3965,7 +3932,7 @@ async def handle_run_on_tunneled_disposable_container(arguments: dict, config: d
             except Exception as e:
                 return [TextContent(type="text", text=f"Error starting croc file download receiver: {str(e)}")]
         
-        async with get_torque_client(torque_url, torque_token, torque_space, config=cfg) as client:
+        async with _connection_client(connection) as client:
             __cred_name, __cred_ctx = await _prepare_credential(arguments, cfg, client, forward=False)
             result = await client.execute_local_command(
                 command=effective_command,
@@ -4002,7 +3969,7 @@ async def handle_run_on_tunneled_disposable_container(arguments: dict, config: d
             duration_str = "N/A"
         
         # Build environment URL for reference
-        env_url = f"{torque_url or cfg['torque_url']}/{torque_space or cfg['torque_space']}/environments/{result.environment_id}"
+        env_url = _environment_url(connection, result.environment_id)
         agent_name = agent or cfg["default_agent"]
         
         # Build files summary if any were uploaded
@@ -4070,49 +4037,30 @@ async def handle_run_on_tunneled_ssh_async(arguments: dict, config: dict = None,
                                            profile_name: Optional[str] = None):
     """Start a remote SSH command without waiting for completion."""
     cfg = config or _config
-    target_ip = arguments.get("host") or cfg["default_target_ip"]
-    ssh_user = arguments.get("user") or cfg["default_ssh_user"]
-    # SSH auth mutual exclusion: if args specify either auth method, use only args;
-    # only fall back to config defaults when neither is provided in args.
-    private_key_value = arguments.get("private_key")
-    ssh_password = arguments.get("password")
-    if not private_key_value and not ssh_password:
-        private_key_value = cfg.get("default_ssh_key")
-        ssh_password = cfg.get("default_ssh_password")
     command = arguments.get("command")
     command_description = arguments.get("command_description")
     files = arguments.get("upload_files", [])
     download_files = arguments.get("download_files", [])
-    agent = arguments.get("torque_agent")
+    agent = _resolve_agent(arguments, cfg)
     allow_dangerous_commands = arguments.get("allow_dangerous_commands", False)
     timeout = arguments.get("timeout")
-    torque_url = arguments.get("torque_url")
-    torque_token = arguments.get("torque_token")
-    torque_space = arguments.get("torque_space")
-    
+    connection = _resolve_connection(arguments, cfg, profile_name)
+
     if not command and not files and not download_files:
         return [TextContent(type="text", text="Error: Must provide either 'command', 'upload_files', or 'download_files' (or any combination).")]
 
-    if not all([target_ip, ssh_user]):
-        return [TextContent(type="text", text="Error: Missing required parameters. Need host and user (or configure defaults).")]
-    
-    if not private_key_value and not ssh_password:
-        return [TextContent(type="text", text="Error: Missing authentication. Need private_key or password (or configure defaults).")]
-    
+    target, error = _resolve_ssh_target(arguments, cfg)
+    if error:
+        return [TextContent(type="text", text=error)]
+    target_ip, ssh_user = target["host"], target["user"]
+    ssh_private_key, ssh_password = target["private_key"], target["password"]
+
     # Check for dangerous commands
     if command and not allow_dangerous_commands:
         warning = check_dangerous_command(command)
         if warning:
             return [TextContent(type="text", text=warning)]
-    
-    # Resolve SSH private key (only if provided)
-    ssh_private_key = ""
-    if private_key_value:
-        try:
-            ssh_private_key = resolve_ssh_private_key(private_key_value)
-        except ValueError as e:
-            return [TextContent(type="text", text=f"Error: {str(e)}")]
-    
+
     # Process files parameter - generate deployment commands (with croc for large files)
     files_info = []
     init_commands = None
@@ -4164,7 +4112,7 @@ async def handle_run_on_tunneled_ssh_async(arguments: dict, config: dict = None,
             except Exception as e:
                 return [TextContent(type="text", text=f"Error starting croc file download receiver: {str(e)}")]
         
-        async with get_torque_client(torque_url, torque_token, torque_space, config=cfg) as client:
+        async with _connection_client(connection) as client:
             __cred_name, __cred_ctx = await _prepare_credential(arguments, cfg, client, forward=True)
             environment_id = await client.start_environment(
                 target_ip=target_ip,
@@ -4197,11 +4145,10 @@ async def handle_run_on_tunneled_ssh_async(arguments: dict, config: dict = None,
             _croc_async_state[environment_id] = async_state
         
         # Start background streaming of grain log to stderr
-        _remember_async_connection(environment_id, _connection(
-            cfg, profile_name, torque_url, torque_token, torque_space))
+        _remember_async_connection(environment_id, dict(connection, profile=profile_name))
         _start_background_streamer(environment_id)
         
-        env_url = f"{torque_url or cfg['torque_url']}/{torque_space or cfg['torque_space']}/environments/{environment_id}"
+        env_url = _environment_url(connection, environment_id)
         
         files_summary = ""
         if files_info:
@@ -4248,13 +4195,13 @@ async def handle_run_on_tunneled_persistent_container_async(arguments: dict, con
     container_description = arguments.get("container_description")
     files = arguments.get("upload_files", [])
     download_files = arguments.get("download_files", [])
-    agent = arguments.get("torque_agent")
+    agent = _resolve_agent(arguments, cfg)
     new_container = arguments.get("new_container", False)
     target_env_id = arguments.get("environment_id")
     timeout = arguments.get("timeout")
-    torque_url = arguments.get("torque_url")
-    torque_token = arguments.get("torque_token")
-    torque_space = arguments.get("torque_space")
+    connection = _resolve_connection(arguments, cfg)
+    torque_url, torque_token, torque_space = (
+        connection["torque_url"], connection["torque_token"], connection["torque_space"])
 
     if not command and not files and not download_files:
         return [TextContent(type="text", text="Error: Must provide either 'command', 'upload_files', or 'download_files' (or any combination).")]
@@ -4320,7 +4267,7 @@ async def handle_run_on_tunneled_persistent_container_async(arguments: dict, con
                 return [TextContent(type="text", text=f"Error starting croc file download receiver: {str(e)}")]
         
         # Start the SSH command asynchronously - SSH from disposable grain into persistent container
-        async with get_torque_client(torque_url, torque_token, torque_space, config=cfg) as client:
+        async with _connection_client(connection) as client:
             __cred_name, __cred_ctx = await _prepare_credential(arguments, cfg, client, forward=True)
             environment_id = await client.start_environment(
                 target_ip=container_ip,
@@ -4365,11 +4312,10 @@ async def handle_run_on_tunneled_persistent_container_async(arguments: dict, con
                 pass
 
         # Start background streaming of grain log to stderr
-        _remember_async_connection(environment_id, _connection(
-            cfg, profile_name, torque_url, torque_token, torque_space))
+        _remember_async_connection(environment_id, dict(connection, profile=profile_name))
         _start_background_streamer(environment_id)
         
-        env_url = f"{torque_url or cfg['torque_url']}/{torque_space or cfg['torque_space']}/environments/{environment_id}"
+        env_url = _environment_url(connection, environment_id)
         agent_name = agent or cfg["default_agent"]
         
         files_summary = ""
@@ -4412,11 +4358,11 @@ async def handle_run_on_tunneled_disposable_container_async(arguments: dict, con
     command_description = arguments.get("command_description")
     files = arguments.get("upload_files", [])
     download_files = arguments.get("download_files", [])
-    agent = arguments.get("torque_agent")
+    agent = _resolve_agent(arguments, cfg)
     timeout = arguments.get("timeout")
-    torque_url = arguments.get("torque_url")
-    torque_token = arguments.get("torque_token")
-    torque_space = arguments.get("torque_space")
+    connection = _resolve_connection(arguments, cfg)
+    torque_url, torque_token, torque_space = (
+        connection["torque_url"], connection["torque_token"], connection["torque_space"])
 
     if not command and not files and not download_files:
         return [TextContent(type="text", text="Error: Must provide either 'command', 'upload_files', or 'download_files' (or any combination).")]
@@ -4465,7 +4411,7 @@ async def handle_run_on_tunneled_disposable_container_async(arguments: dict, con
             except Exception as e:
                 return [TextContent(type="text", text=f"Error starting croc file download receiver: {str(e)}")]
         
-        async with get_torque_client(torque_url, torque_token, torque_space, config=cfg) as client:
+        async with _connection_client(connection) as client:
             __cred_name, __cred_ctx = await _prepare_credential(arguments, cfg, client, forward=False)
             environment_id = await client.start_local_environment(
                 command=effective_command,
@@ -4492,11 +4438,10 @@ async def handle_run_on_tunneled_disposable_container_async(arguments: dict, con
             _croc_async_state[environment_id] = async_state
         
         # Start background streaming of grain log to stderr
-        _remember_async_connection(environment_id, _connection(
-            cfg, profile_name, torque_url, torque_token, torque_space))
+        _remember_async_connection(environment_id, dict(connection, profile=profile_name))
         _start_background_streamer(environment_id)
         
-        env_url = f"{torque_url or cfg['torque_url']}/{torque_space or cfg['torque_space']}/environments/{environment_id}"
+        env_url = _environment_url(connection, environment_id)
         agent_name = agent or cfg["default_agent"]
         
         files_summary = ""
@@ -4939,7 +4884,7 @@ TRANSFER_DEFAULT_LIFETIME_SECONDS = 8 * 3600
 @dataclass
 class _TransferEndpoint:
     """One side of a transfer, fully resolved: the machine and how to reach it."""
-    role: str                      # "source" | "destination"
+    role: str                      # "sender" | "receiver"
     profile: Optional[str]
     cfg: dict
     connection: dict
@@ -4961,53 +4906,52 @@ class _TransferEndpoint:
 
 
 async def _resolve_transfer_endpoint(spec: dict, role: str) -> _TransferEndpoint:
-    """Resolve an endpoint against ITS OWN profile (each side can be another Torque).
+    """Resolve one endpoint exactly as a run_* tool call resolves its arguments.
+
+    The endpoint object is treated as that call's arguments: its `profile` through
+    _resolve_call_profile (each side can name another profile, even another Torque), then
+    _resolve_agent, _resolve_connection and, for an SSH endpoint, _resolve_ssh_target -
+    the same functions the run_* tools use. Only `type` and `environment_id` are the
+    transfer's own (see the persistent-container branch).
 
     Raises ValueError with a message for the caller.
     """
     if not isinstance(spec, dict):
         raise ValueError(f"{role} must be an object")
-    profile = spec.get("profile") or None
-    if profile:
-        if not _loaded_config:
-            raise ValueError(f"{role}: profile {profile!r} given, but no config file with profiles is loaded")
-        profile_values = config_module.resolve_profile(_loaded_config, profile)
-        cfg = config_module.apply_profile_to_config(_config, profile_values)
-        args = config_module.inject_profile_into_arguments(spec, profile_values)
-    else:
-        if _default_profile_warning:
-            raise ValueError(f"{role}: {_default_profile_warning} Give the {role} a profile explicitly.")
-        cfg, args = _config, dict(spec)
+
+    def failed(error: str) -> ValueError:
+        return ValueError(f"{role}: {error.removeprefix('Error: ')}")
+
+    args, cfg, profile, error = await _resolve_call_profile(spec)
+    if error:
+        raise failed(error)
+    agent = _resolve_agent(args, cfg)
+    connection = _resolve_connection(args, cfg, profile)
+    error = _missing_torque_config(connection)
+    if error:
+        raise failed(error)
 
     kind = args.get("type") or "ssh"
-    agent = args.get("torque_agent") or cfg["default_agent"]
-    connection = _connection(cfg, profile, args.get("torque_url"), args.get("torque_token"),
-                             args.get("torque_space"))
-    for key in ("torque_url", "torque_token", "torque_space"):
-        if not connection[key]:
-            raise ValueError(f"{role}: Torque configuration missing ({key}); give it a profile or run setup")
-
     if kind == "ssh":
-        host = args.get("host") or cfg["default_target_ip"]
-        user = args.get("user") or cfg["default_ssh_user"]
-        key_value, password = args.get("private_key"), args.get("password")
-        if not key_value and not password:
-            key_value, password = cfg.get("default_ssh_key"), cfg.get("default_ssh_password")
-        if not host or not user:
-            raise ValueError(f"{role}: host and user are required (or configure defaults)")
-        if not key_value and not password:
-            raise ValueError(f"{role}: private_key or password is required (or configure defaults)")
-        private_key = resolve_ssh_private_key(key_value) if key_value else ""
-        return _TransferEndpoint(role, profile, cfg, connection, host, user, private_key,
-                                 password or "", agent, label=f"{user}@{host}")
+        target, error = _resolve_ssh_target(args, cfg)
+        if error:
+            raise failed(error)
+        return _TransferEndpoint(role, profile, cfg, connection, target["host"], target["user"],
+                                 target["private_key"], target["password"] or "", agent,
+                                 label=f"{target['user']}@{target['host']}")
 
     if kind == "persistent_container":
+        # Not the persistent-container tools' _ensure_persistent_container: that one uses
+        # the default container when no environment_id is given, and creates a NEW one
+        # when the given container is gone. A new, empty container is never what a
+        # transfer means - as a source it has nothing to send, as a destination the files
+        # would land where nobody looks. So the container must be named and running.
         env_id = args.get("environment_id")
         if not env_id:
             raise ValueError(f"{role}: environment_id of the persistent container is required")
         info = await _attach_persistent_container(env_id, connection)
         return _TransferEndpoint(role, profile, cfg, connection, info["container_ip"], "root",
-                                 info["private_key"], "", args.get("torque_agent") or info.get("agent") or agent,
+                                 info["private_key"], "", agent,
                                  container_env_id=env_id, label=f"persistent container {env_id}")
 
     raise ValueError(f"{role}: unknown type {kind!r} (expected 'ssh' or 'persistent_container')")
@@ -5202,13 +5146,13 @@ async def _start_transfer(arguments: dict) -> tuple[Optional[_TransferHandle], s
     if errors:
         return None, "Error in files:\n" + "\n".join(f"- {e}" for e in errors)
     try:
-        source = await _resolve_transfer_endpoint(arguments.get("source") or {}, "source")
-        destination = await _resolve_transfer_endpoint(arguments.get("destination") or {}, "destination")
+        source = await _resolve_transfer_endpoint(arguments.get("sender") or {}, "sender")
+        destination = await _resolve_transfer_endpoint(arguments.get("receiver") or {}, "receiver")
     except Exception as e:
         return None, f"Error: {e}"
     if _same_place(source, destination) and source.host == destination.host:
         return None, (
-            f"Error: source and destination are the same machine ({source.label} via agent "
+            f"Error: sender and receiver are the same machine ({source.label} via agent "
             f"{source.agent}). Use a command (cp/mv) on it instead, or check that both 'host' "
             f"values were given.")
 
@@ -5523,8 +5467,8 @@ async def _cli_transfer(args) -> None:
         sys.exit(1)
     arguments = {
         "command_description": getattr(args, "description", None) or "file transfer",
-        "source": _cli_transfer_endpoint(args, "from"),
-        "destination": _cli_transfer_endpoint(args, "to"),
+        "sender": _cli_transfer_endpoint(args, "from"),
+        "receiver": _cli_transfer_endpoint(args, "to"),
         "files": files,
         "timeout": getattr(args, "timeout", None),
     }
@@ -6746,7 +6690,7 @@ PERFORMANCE TIP:
     transfer_parser = subparsers.add_parser(
         "transfer", parents=[common_parser],
         help="Copy files between two remote machines that cannot reach each other (data does not pass through this machine)")
-    for prefix, role in (("from", "source"), ("to", "destination")):
+    for prefix, role in (("from", "sender"), ("to", "receiver")):
         transfer_parser.add_argument(f"--{prefix}-host", help=f"The {role} machine's IP or hostname")
         transfer_parser.add_argument(f"--{prefix}-user", help=f"SSH user on the {role}")
         transfer_parser.add_argument(f"--{prefix}-key", help=f"SSH private key for the {role} - file path, key content, or base64")

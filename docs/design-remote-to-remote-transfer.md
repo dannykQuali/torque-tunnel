@@ -48,14 +48,14 @@ environment exists, with both environment ids. The caller then polls
 ```jsonc
 {
   "command_description": "copy ova to esxi host",   // required, like every other tool
-  "source": {                        // an "endpoint"
+  "sender": {                        // an "endpoint"
     "type": "ssh",                   // "ssh" | "persistent_container"
     "host": "10.91.36.240", "user": "root",
     "private_key": "C:\\...\\key.pem",   // or "password"
     "profile": "cisco-jarvis",       // optional, per endpoint
     "torque_agent": null              // optional, per endpoint (DO-NOT-SET-unless-asked rule)
   },
-  "destination": { "type": "persistent_container", "environment_id": "abc123", "profile": "laptop-local" },
+  "receiver": { "type": "persistent_container", "environment_id": "abc123", "profile": "laptop-local" },
   "files": [
     { "source_path": "/data/image.vmdk", "destination_path": "/vmfs/tmp/image.vmdk", "mode": "644" },
     { "source_path": "/etc/app/",        "destination_path": "/opt/app-config" }
@@ -64,24 +64,72 @@ environment exists, with both environment ids. The caller then polls
 }
 ```
 
-- **Each endpoint resolves its own profile.** `call_tool` currently pops one `profile`
-  and builds one `effective_config`. This tool skips that and calls
-  `config_module.resolve_profile` / `inject_profile_into_arguments` /
-  `apply_profile_to_config` once per endpoint. Each side's `init_commands`, where proxy
-  settings live, come from **its own** profile.
-- Endpoint fields fall back to that profile's defaults (`default_target_ip`, etc.), as
-  `run_on_tunneled_ssh` does. If both endpoints resolve to the same host on the same
-  agent, the call is refused, since that's almost certainly two omitted `host` fields.
-- `persistent_container` endpoints run in SSH mode against `container_ip` as `root`. The
-  existing upload/download code for persistent containers already works this way.
-  *As built:* they go through `_attach_persistent_container`, not
-  `_ensure_persistent_container`. The latter silently **creates a new container** when
-  the given one is gone, and an empty new container is never a valid transfer
-  endpoint. A container that is not running is an error.
-- *As built:* the call-level `profile` handling and the default-profile-warning gate in
-  `call_tool` are skipped for the three transfer tools. Each endpoint applies them
-  itself: an endpoint without a `profile` is refused while the default profile is
-  broken.
+*As built:* `sender` / `receiver` were called `source` / `destination` until
+2026-11-03. They were renamed to match `get_transfer_status`'s
+`sender_environment_id` / `receiver_environment_id`, before anyone used the tool.
+
+- **Each endpoint resolves exactly like a run_* tool call** (see *Endpoint resolution*
+  below). Each side's `init_commands`, where the proxy settings live, come from **its
+  own** profile.
+- If both endpoints resolve to the same host on the same agent, the call is refused,
+  since that's almost certainly two omitted `host` fields.
+- `persistent_container` endpoints run in SSH mode against `container_ip` as `root`, as
+  the persistent-container tools do. Finding the container is the one exception to the
+  shared resolution (see below).
+- The call-level `profile` handling in `call_tool` is skipped for the three transfer
+  tools. Each endpoint applies it itself, through the same function.
+
+### Endpoint resolution (2026-11-03)
+
+DannyK asked that each value in `sender` / `receiver` resolve exactly as in the other
+tools, through the same code. Four functions in `mcp_tool` ("Argument resolution,
+shared by every tool") do it, and every caller uses them:
+
+| Function | What it resolves | Used by |
+|---|---|---|
+| `_resolve_call_profile` | `profile`: inject its tool-mappable values into the arguments, overlay the rest onto the config; refuse an unknown profile, or a missing one while the default profile is broken | `call_tool` (every tool), each transfer endpoint |
+| `_resolve_agent` | `torque_agent`, else the config's agent | all six run_* tools, each endpoint |
+| `_resolve_connection` | `torque_url` / `torque_token` / `torque_space`, else the config's | all six run_* tools, each endpoint |
+| `_resolve_ssh_target` | `host`, `user`, and exactly one auth pair (`private_key` via `resolve_ssh_private_key`: a path, the key's content, or base64; or `password`) | both SSH tools, each SSH endpoint |
+
+The schema descriptions of those arguments are also defined once (`_ARG_SCHEMAS`) and
+used by the six run_* tools and the endpoint schema, so each field reads the same
+everywhere.
+
+**Not through the shared code, and why:**
+- **`type`** (ssh / persistent_container) and **`environment_id`** belong to the
+  transfer alone.
+- **Finding a persistent container.** The tools use `_ensure_persistent_container`:
+  without an `environment_id` it takes the default container, and when the given one is
+  gone it **creates a new, empty one**. A transfer endpoint uses
+  `_attach_persistent_container` instead, which requires a named, running container
+  and never creates one. An empty new container is never what a transfer means: as a
+  sender it has nothing to send, and as a receiver the files would land where nobody
+  looks. The agent and Torque connection used to reach it still go through the shared
+  code.
+- **The CLI's `--from-*` / `--to-*` options** keep those names. They build the
+  `sender` / `receiver` objects, which then resolve like any MCP call.
+- **`setup`'s `torque_url`** is the URL to log in to, not a connection, so it keeps its
+  own handling.
+
+**Behaviour change in the SSH tools:** the key is now resolved together with host, user
+and auth. Before, it was resolved after the Torque-configuration and dangerous-command
+checks. So a call that is wrong in several ways at once reports a bad key first.
+Nothing else changed: `tests/test_argument_resolution.py` was written **before** the
+refactoring, as characterization tests, and passed unchanged after it.
+
+`tests/test_argument_resolution.py` checks every value at every level:
+- **Fields:** url, token, space, agent, host, user.
+- **Levels:** every non-empty combination of argument, profile and base config, with
+  and without a profile named.
+- **Profiles:** a missing config file, an unknown profile, a broken default profile, an
+  `extends` chain.
+- **Auth:** nine cases of the auth pair, plus no auth and no host at all.
+- **Key forms:** content, single-line, base64, path and `~` path, at each level.
+
+It runs these for the six run_* tools, and the same cases for `transfer-sender` and
+`transfer-receiver`. Mutation checks confirmed it fails when the precedence breaks, in
+a tool or in an endpoint.
 - Disposable containers are not endpoints. As a source they start empty, and as a
   destination their files are thrown away.
 - **The result names both environments and both profiles**, and spells out the exact
@@ -408,6 +456,7 @@ per-file results, `path` (`croc` / `direct`) and `transfer_seconds`.
 | `tests/test_croc_relay_per_profile.py` | the relay from a per-call profile, all six run tools, both directions |
 | `tests/test_remote_transfer_commands.py` | sender, receiver and direct copy run under WSL bash, with an ssh shim and a fake croc |
 | `tests/test_remote_transfer_tool.py` | orchestration, status, cancel, CLI and parsing, against a fake Torque with scripted logs |
+| `tests/test_argument_resolution.py` | every value at every level, for the six run_* tools and both transfer endpoints (see *Endpoint resolution*) |
 
 The plan was:
 

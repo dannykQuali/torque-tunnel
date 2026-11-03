@@ -164,7 +164,7 @@ def _ssh(host, profile=None, **extra):
 
 
 async def _transfer(source, destination, files=None, **extra):
-    args = {"command_description": "copy image", "source": source, "destination": destination,
+    args = {"command_description": "copy image", "sender": source, "receiver": destination,
             "files": files or [{"source_path": "/data/image.vmdk", "destination_path": "/dst/image.vmdk"}],
             **extra}
     return _text(await mcp_tool.call_tool("transfer_files_between_tunneled_hosts_async", args))
@@ -368,8 +368,8 @@ async def test_a_running_persistent_container_is_a_valid_source():
 ])
 @pytest.mark.asyncio
 async def test_bad_file_specs_are_rejected_before_anything_starts(files, expected):
-    args = {"command_description": "x", "source": _ssh("10.0.0.1", "alpha"),
-            "destination": _ssh("10.9.9.9", "beta"), "files": files}
+    args = {"command_description": "x", "sender": _ssh("10.0.0.1", "alpha"),
+            "receiver": _ssh("10.9.9.9", "beta"), "files": files}
     text = _text(await mcp_tool.call_tool("transfer_files_between_tunneled_hosts_async", args))
     assert expected in text
     assert WORLD.envs == {}
