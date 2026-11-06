@@ -18,6 +18,7 @@ Torque does, and run it under bash with ssh faked.
 """
 
 import base64
+import gzip
 import os
 import re
 import sys
@@ -63,6 +64,35 @@ def _render(payload):
     script = render(spec["activities"]["deploy"]["commands"][0]["command"])
     env = {k: render(v) for entry in spec.get("env-vars") or [] for k, v in entry.items()}
     return script, env
+
+
+@pytest.mark.parametrize("kind", ["ssh", "local"])
+@pytest.mark.asyncio
+async def test_every_command_input_is_gzipped(kind):
+    """Torque's payload limit is small (a grain hangs at ~450 KB), and inline uploads
+    ride in the call's init: every *_b64 command input is gzip, then base64, which is
+    what the blueprints decode (`base64 -d | gzip -d`)."""
+    _Capturing.payloads = []
+    client = _Capturing(base_url="https://torque.example", token="t", space="S",
+                        default_agent="agent", init_commands=PROFILE_INIT,
+                        finally_commands="echo finally")
+    upload = UPLOAD + "\n# " + "x" * 5000
+    if kind == "ssh":
+        await client.start_environment(target_ip="10.9.9.9", ssh_user="root", ssh_private_key=KEY,
+                                       command="echo cmd", init_commands=upload,
+                                       container_pre_commands="echo pre", download_commands="echo dl")
+    else:
+        await client.start_local_environment(command="echo cmd", init_commands=upload,
+                                             download_commands="echo dl")
+    inputs = _Capturing.payloads[0]["inputs"]
+    encoded = {n: v for n, v in inputs.items() if n.endswith("_b64") and v}
+    assert "call_init_commands_b64" in encoded and "init_commands_b64" in encoded
+    for name, value in encoded.items():
+        raw = base64.b64decode(value)
+        assert raw[:2] == b"\x1f\x8b", f"{name} is not gzip"
+        gzip.decompress(raw)
+    assert gzip.decompress(base64.b64decode(encoded["call_init_commands_b64"])).decode() == upload
+    assert len(encoded["call_init_commands_b64"]) < len(upload) // 10  # actually compressed
 
 
 # The target: save the script it was sent and run it, marked as running "on target".
