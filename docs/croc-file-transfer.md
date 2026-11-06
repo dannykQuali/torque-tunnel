@@ -42,19 +42,32 @@ Downloads **always** use croc regardless of file size. There is no inline altern
 
 ### Upload Transfer Modes
 
-**Container targets** (disposable/persistent):
+**Disposable containers** (the agent container is the target):
 ```
 Local machine --[croc relay]--> Agent container (receives directly)
 ```
-Croc install + receive commands are included in `init_commands`, which run on the container.
+Croc install + receive commands are included in the call's own init commands, which run on
+the container right before the command.
 
-**SSH targets**:
+**SSH targets and persistent containers** (a persistent container is reached over SSH):
 ```
 Local machine --[croc relay]--> Agent container --[SCP]--> SSH target
 ```
 Croc install + receive + SCP commands run on the agent container via the `container_pre_commands` blueprint mechanism, before the SSH connection to the target.
 
 The profile's `init_commands` are sourced first, in a subshell, just as the download section sources them. That's where proxy settings live. Until 2026-09-23 this slot skipped them. A profile pointing at a non-existent proxy then showed the split: downloads failed on the bad proxy, while uploads silently used whatever proxy the agent container happened to carry, and would have had none on an agent without one. The subshell keeps `init_commands` from changing the blueprint's own variables or working directory. `init_commands` are only run on the runner when there are pre-commands (see `tests/test_blueprint_init_scope.py`, which runs the real blueprint script under bash).
+
+**The profile's init and the call's own init travel separately** (2026-11-06). A call's own
+init commands - its uploads: inline file writes, and for a disposable container the croc
+receive - go in the blueprint input `call_init_commands_b64`, the profile's in
+`init_commands_b64`. Where the command runs, both run as one block (profile first, then
+the call's; a failure stops the command, as before). On the runner, before the
+pre-commands and the downloads, only the profile's are re-loaded. They used to share one
+input, and the runner re-ran the uploads: on a disposable container with a croc upload
+and a download in one call, the download step ran the croc receive a second time, which
+found no sender and ended the whole script (the call always failed); on SSH targets and
+persistent containers the small inline uploads were also written on the runner. Both were
+confirmed live and are pinned by `tests/test_call_init_scope.py`.
 
 ### Upload Flow
 

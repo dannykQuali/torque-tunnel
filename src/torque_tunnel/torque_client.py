@@ -160,6 +160,23 @@ def _shared_ssl_context() -> ssl.SSLContext:
     return _SSL_CONTEXT
 
 
+def _init_inputs(profile_init: Optional[str], call_init: Optional[str]) -> dict:
+    """The executor blueprints' two init inputs (only the non-empty ones).
+
+    `init_commands_b64` is the profile's init (proxy settings and the like): it runs
+    before the command, and the blueprint also re-loads it on the agent container for
+    its own steps (container pre-commands, downloads). `call_init_commands_b64` is this
+    call's own init - its file uploads: it runs right after, where the command runs, and
+    only there. When they shared one input, the agent container re-ran the uploads: a
+    second croc receive that failed the whole call, or files written to the wrong machine.
+    """
+    inputs = {}
+    for name, text in (("init_commands_b64", profile_init), ("call_init_commands_b64", call_init)):
+        if text:
+            inputs[name] = base64.b64encode(gzip.compress(text.encode())).decode()
+    return inputs
+
+
 def _secret_inputs(**secrets: Optional[str]) -> dict:
     """The executor blueprints' secret inputs, every one present ("" when unused).
 
@@ -638,15 +655,11 @@ class TorqueClient:
         if not environment_name:
             environment_name = build_environment_name(environment_kind, command_description, key)
 
-        # Combine instance defaults with per-call overrides:
-        # Global init (e.g. proxy vars) runs FIRST, then per-call init (e.g. file deployment)
-        if init_commands is not None and self.init_commands:
-            effective_init = self.init_commands + "\n" + init_commands
-        elif init_commands is not None:
-            effective_init = init_commands
-        else:
-            effective_init = self.init_commands
-        
+        # Global init (e.g. proxy vars) runs FIRST, then per-call init (e.g. file
+        # deployment). They travel separately: the blueprint re-loads only the global
+        # init on the agent container for its own steps (uploads' croc receive, downloads),
+        # and must not re-run the call's uploads there.
+
         # Finally commands: per-call replaces instance default (cleanup is context-specific)
         effective_finally = finally_commands if finally_commands is not None else self.finally_commands
         
@@ -674,8 +687,7 @@ class TorqueClient:
         # Only include optional inputs if they have values
         # All b64 inputs are gzip-compressed before base64 encoding to reduce payload size.
         # The blueprints decode with: base64 -d | gzip -d
-        if effective_init:
-            inputs["init_commands_b64"] = base64.b64encode(gzip.compress(effective_init.encode())).decode()
+        inputs.update(_init_inputs(self.init_commands, init_commands))
         if effective_finally:
             inputs["finally_commands_b64"] = base64.b64encode(gzip.compress(effective_finally.encode())).decode()
         if container_pre_commands:
@@ -750,16 +762,9 @@ class TorqueClient:
                 "disposable-container", command_description, key
             )
 
-        # Combine per-call init_commands with global init_commands
-        # Global init (e.g. proxy vars) runs FIRST, then per-call init (e.g. file deployment)
-        combined_init = None
-        if init_commands and self.init_commands:
-            combined_init = f"{self.init_commands}\n{init_commands}"
-        elif init_commands:
-            combined_init = init_commands
-        elif self.init_commands:
-            combined_init = self.init_commands
-        
+        # Global init (e.g. proxy vars) runs FIRST, then per-call init (e.g. file
+        # deployment) - sent separately, as for start_environment.
+
         # Calculate timeout in minutes (round up, minimum 5 minutes for Torque)
         effective_timeout = timeout if timeout is not None else self.timeout
         timeout_minutes = max(5, (effective_timeout + 59) // 60)
@@ -777,8 +782,7 @@ class TorqueClient:
         # Only include optional inputs if they have values
         # All b64 inputs are gzip-compressed before base64 encoding to reduce payload size.
         # The blueprints decode with: base64 -d | gzip -d
-        if combined_init:
-            inputs["init_commands_b64"] = base64.b64encode(gzip.compress(combined_init.encode())).decode()
+        inputs.update(_init_inputs(self.init_commands, init_commands))
         if self.finally_commands:
             inputs["finally_commands_b64"] = base64.b64encode(gzip.compress(self.finally_commands.encode())).decode()
         if download_commands:

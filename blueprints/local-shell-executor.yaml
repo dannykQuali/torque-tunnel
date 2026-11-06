@@ -17,7 +17,11 @@ inputs:
     description: Gzip-compressed and base64-encoded shell command(s) to execute on the agent
   init_commands_b64:
     type: string
-    description: Gzip-compressed and base64-encoded init commands (optional)
+    description: Gzip-compressed and base64-encoded init commands (optional). Also re-loaded for the download commands.
+    default: ""
+  call_init_commands_b64:
+    type: string
+    description: Gzip-compressed and base64-encoded init commands of this call alone (e.g., file uploads). Run once, right after init_commands, before the command.
     default: ""
   finally_commands_b64:
     type: string
@@ -94,6 +98,10 @@ grains:
                 echo '{{ .inputs.command_b64 }}' | base64 -d 2>/dev/null | gzip -d > "$SCRIPT_FILE" 2>/dev/null || true
                 INIT_FILE=$(mktemp)
                 echo '{{ .inputs.init_commands_b64 }}' | base64 -d 2>/dev/null | gzip -d > "$INIT_FILE" 2>/dev/null || true
+                # This call's own init (its uploads, e.g. a croc receive): runs once with
+                # the command, never re-loaded for the downloads like INIT_FILE is.
+                CALL_INIT_FILE=$(mktemp)
+                echo '{{ .inputs.call_init_commands_b64 }}' | base64 -d 2>/dev/null | gzip -d > "$CALL_INIT_FILE" 2>/dev/null || true
                 FINALLY_FILE=$(mktemp)
                 echo '{{ .inputs.finally_commands_b64 }}' | base64 -d 2>/dev/null | gzip -d > "$FINALLY_FILE" 2>/dev/null || true
 
@@ -242,6 +250,7 @@ grains:
                 }
                 echo "=== Commands (decoded for visibility) =========================================================================================================="
                 __tt_show_cmd "init commands" "$INIT_FILE"
+                __tt_show_cmd "init commands (this call)" "$CALL_INIT_FILE"
                 __tt_show_cmd "command" "$SCRIPT_FILE"
                 __tt_show_cmd "finally commands" "$FINALLY_FILE"
                 echo "==============================================================================================================================================="
@@ -271,11 +280,14 @@ grains:
                   fi
                   
                   # Add init commands if provided - check exit code and skip main if failed
-                  # Use curly braces (not subshell) so exports persist
-                  if [ -s "$INIT_FILE" ]; then
+                  # Use curly braces (not subshell) so exports persist. The profile's
+                  # init, then this call's own (its uploads), as one block.
+                  if [ -s "$INIT_FILE" ] || [ -s "$CALL_INIT_FILE" ]; then
                     echo "=== Running init commands ==="
                     echo '{' >> "$COMBINED"
                     cat "$INIT_FILE" >> "$COMBINED"
+                    echo '' >> "$COMBINED"
+                    cat "$CALL_INIT_FILE" >> "$COMBINED"
                     echo '' >> "$COMBINED"
                     echo '} </dev/null' >> "$COMBINED"
                     echo '__EXIT_CODE=$?' >> "$COMBINED"
@@ -339,7 +351,7 @@ grains:
                 # Always export outputs - this section MUST be reached
                 COMMAND_OUTPUT_B64=$(base64 < "$OUTPUT_FILE" 2>/dev/null | tr -d '\n' || echo "")
                 CMD_EXIT_CODE=$(cat "$EXIT_CODE_FILE" 2>/dev/null || echo "1")
-                rm -f "$OUTPUT_FILE" "$EXIT_CODE_FILE" "$SCRIPT_FILE" "$INIT_FILE" "$FINALLY_FILE" "$COMBINED" "$__TT_CRED_CTX" "$__TT_REDACT_PY" 2>/dev/null || true
+                rm -f "$OUTPUT_FILE" "$EXIT_CODE_FILE" "$SCRIPT_FILE" "$INIT_FILE" "$CALL_INIT_FILE" "$FINALLY_FILE" "$COMBINED" "$__TT_CRED_CTX" "$__TT_REDACT_PY" 2>/dev/null || true
                 
                 export command_output="$COMMAND_OUTPUT_B64"
                 export exit_code="$CMD_EXIT_CODE"
