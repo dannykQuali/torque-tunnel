@@ -7,6 +7,7 @@ import base64
 import gzip
 import random
 import re
+import ssl
 import sys
 import time
 import uuid
@@ -140,6 +141,35 @@ def _encode_credential_context(context: Optional[dict]) -> str:
 
     raw = _json.dumps(context, separators=(",", ":")).encode("utf-8")
     return base64.b64encode(gzip.compress(raw)).decode("ascii")
+
+
+_SSL_CONTEXT: Optional[ssl.SSLContext] = None
+
+
+def _shared_ssl_context() -> ssl.SSLContext:
+    """The SSL context every TorqueClient uses: exactly the one httpx would build itself
+    (certifi's CA bundle; SSL_CERT_FILE / SSL_CERT_DIR honoured), built once.
+
+    httpx builds a fresh one per client - per transport, so several when proxies come
+    from the environment - and each loads the whole CA bundle (~15 ms). A tool call
+    creates several clients.
+    """
+    global _SSL_CONTEXT
+    if _SSL_CONTEXT is None:
+        _SSL_CONTEXT = httpx.create_ssl_context(trust_env=True)
+    return _SSL_CONTEXT
+
+
+def _secret_inputs(**secrets: Optional[str]) -> dict:
+    """The executor blueprints' secret inputs, every one present ("" when unused).
+
+    Each is `sensitive: true` and reaches the grain only through its `env-vars` (as
+    croc_manager's *_ENV variables), never through the script text: Torque echoes a
+    grain's script into its log and shows ordinary inputs to anyone in the space, but
+    keeps sensitive env-vars out of both. Sent as-is - Torque passes multi-line values
+    through unchanged, line endings and final newline included.
+    """
+    return {name: value or "" for name, value in secrets.items()}
 
 
 #: Marker the discovery grains print their result on. Environment-level outputs are only
@@ -371,6 +401,7 @@ class TorqueClient:
                 "Content-Type": "application/json",
             },
             timeout=60.0,
+            verify=_shared_ssl_context(),
         )
     
     async def close(self):
@@ -559,6 +590,11 @@ class TorqueClient:
         parent_env_id: Optional[str] = None,
         credential_name: Optional[str] = None,
         credential_context: Optional[dict] = None,
+        aux_ssh_private_key: Optional[str] = None,
+        aux_ssh_password: Optional[str] = None,
+        croc_receive_code: Optional[str] = None,
+        croc_send_code: Optional[str] = None,
+        croc_relay_password: Optional[str] = None,
     ) -> str:
         """
         Start a new environment to execute remote command.
@@ -582,6 +618,13 @@ class TorqueClient:
             environment_kind: Naming kind ("ssh" or "persistent-command").
             parent_env_id: If set (persistent-command), added as a parent label linking
                 this command environment to its persistent container.
+            aux_ssh_private_key, aux_ssh_password: A second machine the commands reach
+                (a direct copy's source).
+            croc_receive_code, croc_send_code, croc_relay_password: For croc in the
+                container pre-commands (receive) and download commands (send).
+
+        Every secret argument becomes a sensitive input that the grain turns into an
+        environment variable (see _secret_inputs); none is ever written into a command.
 
         Returns:
             Environment ID
@@ -615,13 +658,16 @@ class TorqueClient:
             "agent": agent_name,
             "target_ip": target_ip,
             "ssh_user": ssh_user,
-            "ssh_private_key": ssh_private_key or "",
-            "ssh_password": ssh_password or "",
             "command_b64": base64.b64encode(gzip.compress(command.encode())).decode(),
             "timeout_minutes": str(timeout_minutes),
-            # Always sent (possibly empty), like the ssh_private_key/ssh_password pair:
-            # an input declared with `default: ""` accepts "" but must still be present.
+            # Always sent (possibly empty), like the secret inputs: an input declared
+            # with `default: ""` accepts "" but must still be present.
             "credential_context_b64": _encode_credential_context(credential_context),
+            **_secret_inputs(
+                ssh_private_key=ssh_private_key, ssh_password=ssh_password,
+                aux_ssh_private_key=aux_ssh_private_key, aux_ssh_password=aux_ssh_password,
+                croc_receive_code=croc_receive_code, croc_send_code=croc_send_code,
+                croc_relay_password=croc_relay_password),
         }
         if credential_name:
             inputs["credential"] = credential_name
@@ -670,6 +716,9 @@ class TorqueClient:
         command_description: Optional[str] = None,
         credential_name: Optional[str] = None,
         credential_context: Optional[dict] = None,
+        croc_receive_code: Optional[str] = None,
+        croc_send_code: Optional[str] = None,
+        croc_relay_password: Optional[str] = None,
     ) -> str:
         """
         Start a new environment to execute command locally on the agent container.
@@ -683,6 +732,9 @@ class TorqueClient:
             download_commands: Optional commands to run after execution completes
                 (e.g., croc send to local for file downloads).
             command_description: Optional human-oriented description embedded in the name.
+            croc_receive_code, croc_send_code, croc_relay_password: For croc in the
+                command (uploads, receive) and the download commands (send). Sensitive
+                inputs, as for start_environment.
 
         Returns:
             Environment ID
@@ -717,6 +769,8 @@ class TorqueClient:
             "command_b64": base64.b64encode(gzip.compress(command.encode())).decode(),
             "timeout_minutes": str(timeout_minutes),
             "credential_context_b64": _encode_credential_context(credential_context),
+            **_secret_inputs(croc_receive_code=croc_receive_code, croc_send_code=croc_send_code,
+                             croc_relay_password=croc_relay_password),
         }
         if credential_name:
             inputs["credential"] = credential_name
@@ -1586,6 +1640,7 @@ class TorqueClient:
         parent_env_id: Optional[str] = None,
         credential_name: Optional[str] = None,
         credential_context: Optional[dict] = None,
+        **secrets: Optional[str],
     ) -> EnvironmentResult:
         """
         Execute a remote command and wait for result.
@@ -1615,6 +1670,7 @@ class TorqueClient:
             command_description: Optional human-oriented description embedded in the env name.
             environment_kind: Naming kind ("ssh" or "persistent-command").
             parent_env_id: For persistent-command, the parent container's env id (label link).
+            **secrets: start_environment's other secret arguments (aux_ssh_*, croc_*).
 
         Returns:
             EnvironmentResult with command output
@@ -1635,8 +1691,9 @@ class TorqueClient:
             parent_env_id=parent_env_id,
             credential_name=credential_name,
             credential_context=credential_context,
+            **secrets,
         )
-        
+
         result = None
         try:
             result = await self.wait_for_environment(environment_id, timeout=timeout, log_callback=log_callback)
@@ -1668,6 +1725,7 @@ class TorqueClient:
         command_description: Optional[str] = None,
         credential_name: Optional[str] = None,
         credential_context: Optional[dict] = None,
+        **secrets: Optional[str],
     ) -> EnvironmentResult:
         """
         Execute a command locally on the Torque agent container.
@@ -1687,6 +1745,7 @@ class TorqueClient:
             download_commands: Optional commands to run after execution completes
                 (e.g., croc send to local for file downloads).
             command_description: Optional human-oriented description embedded in the env name.
+            **secrets: start_local_environment's secret arguments (croc_*).
 
         Returns:
             EnvironmentResult with command output
@@ -1699,6 +1758,7 @@ class TorqueClient:
             command_description=command_description,
             credential_name=credential_name,
             credential_context=credential_context,
+            **secrets,
         )
         
         result = None

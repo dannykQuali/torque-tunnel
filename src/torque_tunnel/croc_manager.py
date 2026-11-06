@@ -100,6 +100,13 @@ CROC_RECEIVE_RATE_LIMIT_BACKOFF_SECONDS = (20, 45, 70)
 # Croc exits immediately when no sender room exists; this controls the retry interval.
 CROC_RECEIVE_RETRY_SECONDS = 5
 
+# The local receive wrapper's other waits: how often a gated wrapper checks for the
+# ready signal, how often it checks on a running croc (and for an abort), and how long
+# start_croc_receive waits before checking that the wrapper did not crash on startup.
+CROC_RECEIVE_GATE_POLL_SECONDS = 0.25
+CROC_RECEIVE_CROC_POLL_SECONDS = 0.5
+CROC_RECEIVE_STARTUP_CHECK_SECONDS = 1
+
 # --- Download (remote→local) coordination protocol ---
 # The remote croc-send wrapper emits these sentinel lines on stdout. They reach the
 # local machine through the streamed grain log, where DownloadPlan.observe_output
@@ -451,15 +458,70 @@ def _validate_relay(relay: str) -> str:
     return relay
 
 
-def _relay_env_export(relay_password: str) -> list[str]:
-    """Shell lines exporting the relay password, or nothing when unset.
+# --- Secrets in generated scripts ---
+# The scripts generated here travel in ordinary blueprint inputs, which Torque shows to
+# anyone in the space, and run inside a grain whose source Torque echoes into its log.
+# So they never contain a secret: they name environment variables that the executor
+# blueprints fill from sensitive inputs through the grain's `env-vars`, which Torque keeps
+# out of both its log and its API. These names are part of the blueprints' contract.
+SSH_PRIVATE_KEY_ENV = "TT_SSH_PRIVATE_KEY"          # the environment's own target
+SSH_PASSWORD_ENV = "TT_SSH_PASSWORD"
+AUX_SSH_PRIVATE_KEY_ENV = "TT_AUX_SSH_PRIVATE_KEY"  # a second machine (a direct copy's source)
+AUX_SSH_PASSWORD_ENV = "TT_AUX_SSH_PASSWORD"
+CROC_RECEIVE_CODE_ENV = "TT_CROC_RECEIVE_CODE"      # croc receive on the agent: uploads, a transfer's receiver
+CROC_SEND_CODE_ENV = "TT_CROC_SEND_CODE"            # croc send on the agent: downloads, a transfer's sender
+CROC_RELAY_PASSWORD_ENV = "TT_CROC_RELAY_PASSWORD"
+
+
+def _relay_env_export() -> list[str]:
+    """Shell lines exporting the relay password, when the environment has one.
 
     The password goes through the environment rather than croc's ``--pass`` flag
     so it never shows up in the container's process list.
     """
-    if not relay_password:
-        return []
-    return [f"export CROC_PASS='{_shell_escape_single(relay_password)}'"]
+    return [f'if [ -n "${{{CROC_RELAY_PASSWORD_ENV}:-}}" ]; then '
+            f'export CROC_PASS="${CROC_RELAY_PASSWORD_ENV}"; fi']
+
+
+def _relay_env_unset() -> list[str]:
+    """Shell lines removing the relay password exported by _relay_env_export."""
+    return [f'if [ -n "${{{CROC_RELAY_PASSWORD_ENV}:-}}" ]; then unset CROC_PASS; fi']
+
+
+def _ssh_auth(tag: str, aux: bool = False) -> tuple[list[str], list[str]]:
+    """Shell lines defining ``__ssh_<tag>`` and ``__scp_<tag>`` (ssh and scp signed in as
+    one machine), and the lines that clean up.
+
+    The key or password comes from the environment (the AUX_ variables with ``aux``), so
+    the method is chosen when the script runs: the key if there is one, else the
+    password, which sshpass reads from SSHPASS so it never shows in the process list.
+    """
+    key_env, password_env = ((AUX_SSH_PRIVATE_KEY_ENV, AUX_SSH_PASSWORD_ENV) if aux
+                             else (SSH_PRIVATE_KEY_ENV, SSH_PASSWORD_ENV))
+    key_file = f"__{tag.upper()}_KEY"
+    lines = [
+        f'{key_file}=""',
+        f'if [ -n "${{{key_env}:-}}" ]; then',
+        f'  {key_file}=$(mktemp)',
+        f'  printf "%s" "${key_env}" > "${key_file}"',
+        # ssh rejects some key formats without their final newline
+        f'  if [ -n "$(tail -c 1 "${key_file}")" ]; then echo >> "${key_file}"; fi',
+        f'  chmod 600 "${key_file}"',
+        f'elif [ -n "${{{password_env}:-}}" ]; then',
+        "  if ! command -v sshpass &>/dev/null; then",
+        "    apt-get install -y -qq sshpass >/dev/null 2>&1 \\",
+        "      || { apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq sshpass >/dev/null 2>&1; }",
+        "  fi",
+        "else",
+        '  echo "ERROR: neither an SSH key nor a password was given for this machine" >&2',
+        "  exit 1",
+        "fi",
+    ]
+    for tool in ("ssh", "scp"):
+        lines.append(
+            f'__{tool}_{tag}() {{ if [ -n "${key_file}" ]; then {tool} -i "${key_file}" "$@"; '
+            f'else SSHPASS="${password_env}" sshpass -e {tool} -o PubkeyAuthentication=no "$@"; fi; }}')
+    return lines, [f'rm -f "${key_file}"']
 
 
 def effective_relay(relay: str = "") -> str:
@@ -559,8 +621,11 @@ _LAST_CROC_ERROR_SH = (
 )
 
 
-def generate_croc_receive_attempt(code: str, timeout: int, relay: str = "") -> list[str]:
+def generate_croc_receive_attempt(timeout: int, relay: str = "") -> list[str]:
     """Shell lines that receive via croc, retrying while the relay rate-limits us.
+
+    The code comes from CROC_RECEIVE_CODE_ENV, through the environment (not an
+    argument) so it is not in the process list either.
 
     Sets ``__CROC_RC`` to croc's exit code. croc's output still reaches stdout
     (through ``tee``) so transfer progress stays visible in the streamed grain
@@ -583,7 +648,7 @@ def generate_croc_receive_attempt(code: str, timeout: int, relay: str = "") -> l
         *(f'  {line}' for line in generate_dns_warmup(relay)),
         # The exit code goes through a file because the pipe into tee would
         # otherwise hide it, and PIPESTATUS is not portable to a plain sh grain.
-        f'  {{ timeout {timeout} bash -c \'CROC_SECRET="{code}" '
+        f'  {{ timeout {timeout} bash -c \'CROC_SECRET="${CROC_RECEIVE_CODE_ENV}" '
         f'croc {_croc_global_flags(relay)}--yes --overwrite\'; '
         f'echo $? > {_RECEIVE_RC_FILE}; }} 2>&1 | tee {_RECEIVE_LOG_FILE}',
         f'  __CROC_RC=$(cat {_RECEIVE_RC_FILE} 2>/dev/null || echo 1)',
@@ -694,16 +759,16 @@ def _validate_mode(mode: str) -> bool:
 
 
 def generate_croc_receive_commands(
-    code: str,
     file_transfers: list[dict],
     timeout: int = 600,
     relay: str = "",
-    relay_password: str = "",
 ) -> str:
     """Generate shell commands to receive files via croc and place them at destinations.
 
+    The code and the relay password come from the environment (CROC_RECEIVE_CODE_ENV,
+    CROC_RELAY_PASSWORD_ENV).
+
     Args:
-        code: The croc secret code (2048-bit).
         file_transfers: List of dicts, each with:
             - croc_filename: The uniquely-prefixed filename as croc will deliver it.
             - remote_destination_path: Where the file should end up on the target.
@@ -711,7 +776,6 @@ def generate_croc_receive_commands(
             - is_dir_tar: If True, the file is a gzipped tar of a directory; extract instead of move.
         timeout: Timeout in seconds for croc receive (default 600s).
         relay: Optional "host:port" of a private relay; must match the sender's.
-        relay_password: Optional password for that relay.
 
     Returns:
         Shell commands string.
@@ -720,9 +784,8 @@ def generate_croc_receive_commands(
     commands.append("# === Croc file receive ===")
     commands.append('__CROC_DIR=$(mktemp -d)')
     commands.append('cd "$__CROC_DIR"')
-    commands.extend(_relay_env_export(relay_password))
-    # Use CROC_SECRET env var (not command-line arg) to avoid leaking code in process list
-    commands.extend(generate_croc_receive_attempt(code, timeout, relay))
+    commands.extend(_relay_env_export())
+    commands.extend(generate_croc_receive_attempt(timeout, relay))
     commands.append('if [ $__CROC_RC -ne 0 ]; then')
     commands.append('  echo "ERROR: croc file receive failed (exit code: $__CROC_RC)${__CROC_ERR:+: $__CROC_ERR}" >&2')
     commands.append('  rm -rf "$__CROC_DIR"')
@@ -753,24 +816,19 @@ def generate_croc_receive_commands(
             commands.append(f"chmod {mode} '{escaped_dest}'")
 
     commands.append('rm -rf "$__CROC_DIR"')
-    if relay_password:
-        # These lines are prepended to the user's own commands; don't leave the
-        # relay password in their environment.
-        commands.append("unset CROC_PASS")
+    # These lines are prepended to the user's own commands; don't leave the relay
+    # password in their environment.
+    commands.extend(_relay_env_unset())
     commands.append("# === End croc file receive ===")
     return "\n".join(commands)
 
 
 def generate_croc_scp_commands(
-    code: str,
     file_transfers: list[dict],
     target_ip: str,
     ssh_user: str,
-    ssh_private_key: str = "",
-    ssh_password: str = "",
     timeout: int = 600,
     relay: str = "",
-    relay_password: str = "",
 ) -> str:
     """Generate shell commands to receive files via croc on the CONTAINER, then SCP to SSH target.
 
@@ -780,16 +838,15 @@ def generate_croc_scp_commands(
     3. SCP each file from the container to the SSH target (directories are tar-piped)
     4. Clean up
 
+    The target's key or password, the code and the relay password come from the
+    environment (SSH_*_ENV, CROC_RECEIVE_CODE_ENV, CROC_RELAY_PASSWORD_ENV).
+
     Args:
-        code: The croc secret code.
         file_transfers: List of dicts with croc_filename, remote_destination_path, mode, is_dir_tar.
         target_ip: SSH target IP/hostname.
         ssh_user: SSH username.
-        ssh_private_key: SSH private key content (PEM format).
-        ssh_password: SSH password (alternative to key).
         timeout: Timeout in seconds for croc receive (default 600s).
         relay: Optional "host:port" of a private relay; must match the sender's.
-        relay_password: Optional password for that relay.
 
     Returns:
         Shell commands string to run on the agent container (not on the target).
@@ -801,38 +858,17 @@ def generate_croc_scp_commands(
     escaped_user = _shell_escape_single(ssh_user)
     ssh_target = f"'{escaped_user}'@'{escaped_target}'"
 
-    # Set up SSH auth for SCP
-    scp_prefix = ""
-    scp_auth = ""
-    if ssh_private_key:
-        commands.append('__SCP_KEY=$(mktemp)')
-        commands.append("cat << '__SCP_KEYEOF' > \"$__SCP_KEY\"")
-        commands.append(ssh_private_key)
-        commands.append("__SCP_KEYEOF")
-        commands.append('chmod 600 "$__SCP_KEY"')
-        scp_auth = '-i "$__SCP_KEY"'
-    elif ssh_password:
-        # Install sshpass if needed
-        escaped_pw = _shell_escape_single(ssh_password)
-        commands.append("if ! command -v sshpass &>/dev/null; then")
-        commands.append("  apt-get install -y -qq sshpass >/dev/null 2>&1 \\")
-        commands.append("    || { apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq sshpass >/dev/null 2>&1; }")
-        commands.append("fi")
-        scp_prefix = f"sshpass -p '{escaped_pw}'"
-    else:
-        raise ValueError("Either ssh_private_key or ssh_password is required for SCP")
-
-    pubkey_opt = "" if ssh_private_key else "-o PubkeyAuthentication=no"
+    auth_lines, cleanup = _ssh_auth("tgt")
+    commands.extend(auth_lines)
 
     # Receive files via croc
     commands.append('__CROC_DIR=$(mktemp -d)')
     commands.append('cd "$__CROC_DIR"')
-    commands.extend(_relay_env_export(relay_password))
-    commands.extend(generate_croc_receive_attempt(code, timeout, relay))
+    commands.extend(_relay_env_export())
+    commands.extend(generate_croc_receive_attempt(timeout, relay))
     commands.append('if [ $__CROC_RC -ne 0 ]; then')
     commands.append('  echo "ERROR: croc file receive failed (exit code: $__CROC_RC)${__CROC_ERR:+: $__CROC_ERR}" >&2')
-    if ssh_private_key:
-        commands.append('  rm -f "$__SCP_KEY"')
+    commands.extend(f'  {line}' for line in cleanup)
     commands.append('  rm -rf "$__CROC_DIR"')
     commands.append('  exit 1')
     commands.append('fi')
@@ -851,7 +887,7 @@ def generate_croc_scp_commands(
         if is_dir_tar:
             # Directory was tarred on send; extract on target via ssh pipe
             commands.append(
-                f"{scp_prefix} ssh {ssh_opts} {scp_auth} {pubkey_opt} {ssh_target} "
+                f"__ssh_tgt {ssh_opts} {ssh_target} "
                 f"'mkdir -p '\"'\"'{escaped_dest}'\"'\"' && tar xzf - -C '\"'\"'{escaped_dest}'\"'\"'' "
                 f'< "$__CROC_DIR/"\'{escaped_croc_name}\''
                 f' || {{ echo "ERROR: Failed to transfer directory to {dest} on target" >&2; exit 1; }}'
@@ -861,14 +897,14 @@ def generate_croc_scp_commands(
             if dest_dir:
                 escaped_dir = _shell_escape_single(dest_dir)
                 commands.append(
-                    f"{scp_prefix} ssh {ssh_opts} {scp_auth} {pubkey_opt} {ssh_target} "
+                    f"__ssh_tgt {ssh_opts} {ssh_target} "
                     f"\"mkdir -p '{escaped_dir}'\""
                     f' || {{ echo "ERROR: Failed to create directory {dest_dir} on target" >&2; exit 1; }}'
                 )
 
             # SCP the file
             commands.append(
-                f'{scp_prefix} scp {ssh_opts} {scp_auth} {pubkey_opt} '
+                f'__scp_tgt {ssh_opts} '
                 f'"$__CROC_DIR/"\'{escaped_croc_name}\' {ssh_target}:\'{escaped_dest}\''
                 f' || {{ echo "ERROR: SCP failed for {dest}" >&2; exit 1; }}'
             )
@@ -876,16 +912,14 @@ def generate_croc_scp_commands(
         # Set permissions
         if mode and _validate_mode(mode):
             commands.append(
-                f"{scp_prefix} ssh {ssh_opts} {scp_auth} {pubkey_opt} {ssh_target} "
+                f"__ssh_tgt {ssh_opts} {ssh_target} "
                 f"\"chmod {mode} '{escaped_dest}'\""
             )
 
     # Cleanup
-    if ssh_private_key:
-        commands.append('rm -f "$__SCP_KEY"')
+    commands.extend(cleanup)
     commands.append('rm -rf "$__CROC_DIR"')
-    if relay_password:
-        commands.append("unset CROC_PASS")
+    commands.extend(_relay_env_unset())
     commands.append("# === End croc receive + SCP ===")
     return "\n".join(commands)
 
@@ -1045,11 +1079,9 @@ async def cleanup_croc_send(process: Optional[asyncio.subprocess.Process]) -> No
 
 
 def _generate_croc_send_core(
-    code: str,
     timeout: int,
     cleanup_commands: list[str],
     relay: str = "",
-    relay_password: str = "",
     transfers: Optional[int] = None,
 ) -> list[str]:
     """Shared croc-send block used by both download command generators.
@@ -1070,13 +1102,14 @@ def _generate_croc_send_core(
     5. Ends with an explicit DONE/FAILED sentinel and a non-zero exit on
        failure - a failed download must never look like success.
 
+    The code and the relay password come from the environment (CROC_SEND_CODE_ENV,
+    CROC_RELAY_PASSWORD_ENV, the latter through CROC_PASS).
+
     Args:
-        code: The croc secret code.
         timeout: Minimum (floor) croc send timeout in seconds.
         cleanup_commands: Extra cleanup lines to run after the send (e.g.
             removing a temporary SSH key), before the final status is emitted.
         relay: Optional "host:port" of a private relay; must match the receiver's.
-        relay_password: Optional password for that relay (via CROC_PASS).
         transfers: Optional number of parallel transfer streams.
 
     Returns:
@@ -1105,8 +1138,8 @@ def _generate_croc_send_core(
     c.append(f'    [ -n "$__DL_MD5" ] && echo "{CROC_SENTINEL_MD5} $__DL_MD5 $__DL_F"')
     c.append('  fi')
     c.append('done')
-    c.append(f'export CROC_SECRET="{code}"')
-    c.extend(_relay_env_export(relay_password))
+    c.append(f'export CROC_SECRET="${CROC_SEND_CODE_ENV}"')
+    c.extend(_relay_env_export())
     croc_send = f"croc {_croc_global_flags(relay)}send --no-local"
     if transfers:
         croc_send += f" --transfers {int(transfers)}"
@@ -1224,8 +1257,7 @@ def _generate_croc_send_core(
     c.append('  __croc_send_once')
     c.append('fi')
     c.append('unset CROC_SECRET')
-    if relay_password:
-        c.append('unset CROC_PASS')
+    c.extend(_relay_env_unset())
     c.append('cd /')
     c.append('rm -rf "$__DL_DIR"')
     c.extend(cleanup_commands)
@@ -1239,21 +1271,19 @@ def _generate_croc_send_core(
 
 
 def generate_croc_send_commands(
-    code: str,
     file_infos: list[dict],
     timeout: int = 300,
     relay: str = "",
-    relay_password: str = "",
     transfers: Optional[int] = None,
 ) -> str:
     """Generate shell commands to send files from the container/target to local via croc.
 
     Used for container-target and local-executor downloads. Files are staged into
     a temp dir with unique names, then sent via croc to the local machine which
-    runs ``croc receive`` in the background.
+    runs ``croc receive`` in the background. The code and the relay password come
+    from the environment (CROC_SEND_CODE_ENV, CROC_RELAY_PASSWORD_ENV).
 
     Args:
-        code: The croc secret code (2048-bit).
         file_infos: List of dicts, each with:
             - remote_source_path: Path on the container to download.
             - croc_filename: Uniquely-prefixed filename for staging.
@@ -1262,7 +1292,6 @@ def generate_croc_send_commands(
             multi-GB transfers are not killed mid-flight; croc may also hang
             after 100% through proxy relays, which this bounds.
         relay: Optional "host:port" of a private relay; must match the receiver's.
-        relay_password: Optional password for that relay.
         transfers: Optional number of parallel transfer streams.
 
     Returns:
@@ -1287,23 +1316,18 @@ def generate_croc_send_commands(
         )
 
     commands.extend(_generate_croc_send_core(
-        code, timeout, cleanup_commands=[],
-        relay=relay, relay_password=relay_password, transfers=transfers,
+        timeout, cleanup_commands=[], relay=relay, transfers=transfers,
     ))
     commands.append("# === End croc file download ===")
     return "\n".join(commands)
 
 
 def generate_croc_scp_download_commands(
-    code: str,
     file_infos: list[dict],
     target_ip: str,
     ssh_user: str,
-    ssh_private_key: str = "",
-    ssh_password: str = "",
     timeout: int = 300,
     relay: str = "",
-    relay_password: str = "",
     transfers: Optional[int] = None,
 ) -> str:
     """Generate shell commands to SCP files from SSH target to container, then croc send to local.
@@ -1312,13 +1336,13 @@ def generate_croc_scp_download_commands(
     1. SCP files from the SSH target to a temp dir on the container
     2. croc send the files from the container to the local machine
 
+    The target's key or password, the code and the relay password come from the
+    environment (SSH_*_ENV, CROC_SEND_CODE_ENV, CROC_RELAY_PASSWORD_ENV).
+
     Args:
-        code: The croc secret code.
         file_infos: List of dicts with remote_source_path and croc_filename.
         target_ip: SSH target IP/hostname.
         ssh_user: SSH username.
-        ssh_private_key: SSH private key content (PEM format).
-        ssh_password: SSH password (alternative to key).
         timeout: Minimum (floor) timeout in seconds for croc send (default 300s).
             The effective timeout scales with the staged payload size so
             multi-GB transfers are not killed mid-flight; croc may also hang
@@ -1334,27 +1358,8 @@ def generate_croc_scp_download_commands(
     escaped_user = _shell_escape_single(ssh_user)
     ssh_target = f"'{escaped_user}'@'{escaped_target}'"
 
-    # Set up SSH auth for SCP
-    scp_prefix = ""
-    scp_auth = ""
-    if ssh_private_key:
-        commands.append('__DL_KEY=$(mktemp)')
-        commands.append("cat << '__DL_KEYEOF' > \"$__DL_KEY\"")
-        commands.append(ssh_private_key)
-        commands.append("__DL_KEYEOF")
-        commands.append('chmod 600 "$__DL_KEY"')
-        scp_auth = '-i "$__DL_KEY"'
-    elif ssh_password:
-        escaped_pw = _shell_escape_single(ssh_password)
-        commands.append("if ! command -v sshpass &>/dev/null; then")
-        commands.append("  apt-get install -y -qq sshpass >/dev/null 2>&1 \\")
-        commands.append("    || { apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq sshpass >/dev/null 2>&1; }")
-        commands.append("fi")
-        scp_prefix = f"sshpass -p '{escaped_pw}'"
-    else:
-        raise ValueError("Either ssh_private_key or ssh_password is required for SCP download")
-
-    pubkey_opt = "" if ssh_private_key else "-o PubkeyAuthentication=no"
+    auth_lines, cleanup = _ssh_auth("tgt")
+    commands.extend(auth_lines)
     ssh_opts = "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
 
     # Create staging directory and SCP each file/dir from target
@@ -1367,16 +1372,14 @@ def generate_croc_scp_download_commands(
         escaped_name = _shell_escape_single(croc_name)
         # scp -r works for both files and directories
         commands.append(
-            f'{scp_prefix} scp -r {ssh_opts} {scp_auth} {pubkey_opt} '
+            f'__scp_tgt -r {ssh_opts} '
             f'{ssh_target}:\'{escaped_src}\' "$__DL_DIR/"\'{escaped_name}\''
             f" || {{ echo 'WARNING: SCP download failed for {escaped_src}' >&2; }}"
         )
 
     # croc send all staged files to local
-    cleanup_commands = ['rm -f "$__DL_KEY"'] if ssh_private_key else []
     commands.extend(_generate_croc_send_core(
-        code, timeout, cleanup_commands=cleanup_commands,
-        relay=relay, relay_password=relay_password, transfers=transfers,
+        timeout, cleanup_commands=cleanup, relay=relay, transfers=transfers,
     ))
     commands.append("# === End SCP download + croc send ===")
     return "\n".join(commands)
@@ -1424,39 +1427,21 @@ RELAY_MONITOR_TICK_SECONDS = 0.5
 _SSH_OPTS = "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
 
 
-def _ssh_function(name: str, key_var: str, target_ip: str, ssh_user: str,
-                  ssh_private_key: str = "", ssh_password: str = "") -> tuple[list[str], list[str]]:
+def _ssh_function(name: str, target_ip: str, ssh_user: str,
+                  aux: bool = False) -> tuple[list[str], list[str]]:
     """Shell lines defining ``name`` as "ssh to the target", and the lines that clean up.
 
     ``name <remote command>`` runs one remote command, which must already be quoted
     as ONE shell word (see ``_q``). Its stdin is the function's stdin, so callers pass
     ``</dev/null`` when not streaming data in. Files are copied by piping through ssh
     (``cat >``) rather than scp, whose remote-path quoting differs between the legacy
-    and the SFTP protocol.
+    and the SFTP protocol. The machine's key or password comes from the environment:
+    the environment's own target's, or with ``aux`` the second machine's (_ssh_auth).
     """
-    target = _q(f"{ssh_user}@{target_ip}")
-    if ssh_private_key:
-        lines = [
-            f'{key_var}=$(mktemp)',
-            f"cat << '{key_var}_EOF' > \"${key_var}\"",
-            ssh_private_key,
-            f"{key_var}_EOF",
-            f'chmod 600 "${key_var}"',
-            f'{name}() {{ ssh {_SSH_OPTS} -i "${key_var}" {target} "$@"; }}',
-        ]
-        return lines, [f'rm -f "${key_var}"']
-    if ssh_password:
-        lines = [
-            "if ! command -v sshpass &>/dev/null; then",
-            "  apt-get install -y -qq sshpass >/dev/null 2>&1 \\",
-            "    || { apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq sshpass >/dev/null 2>&1; }",
-            "fi",
-            # Through the environment (sshpass -e), so it is not in the process list.
-            f"{name}() {{ SSHPASS={_q(ssh_password)} sshpass -e ssh {_SSH_OPTS} "
-            f"-o PubkeyAuthentication=no {target} \"$@\"; }}",
-        ]
-        return lines, []
-    raise ValueError("Either ssh_private_key or ssh_password is required")
+    tag = name.strip("_")
+    lines, cleanup = _ssh_auth(tag, aux)
+    lines.append(f'{name}() {{ __ssh_{tag} {_SSH_OPTS} {_q(f"{ssh_user}@{target_ip}")} "$@"; }}')
+    return lines, cleanup
 
 
 def _q(s: str) -> str:
@@ -1477,14 +1462,10 @@ def _move_into_place(partial: str, dest: str) -> str:
 
 
 def generate_croc_relay_send_commands(
-    code: str,
     file_infos: list[dict],
     target_ip: str,
     ssh_user: str,
-    ssh_private_key: str = "",
-    ssh_password: str = "",
     relay: str = "",
-    relay_password: str = "",
     transfers: Optional[int] = None,
 ) -> str:
     """Shell commands for the SENDER side of a remote-to-remote transfer.
@@ -1501,15 +1482,15 @@ def generate_croc_relay_send_commands(
     sentinel (``exit_code=stage``) naming it: unlike a download, there is no local side
     that could report the missing file later.
 
+    The source's key or password, the code and the relay password come from the
+    environment (SSH_*_ENV, CROC_SEND_CODE_ENV, CROC_RELAY_PASSWORD_ENV).
+
     Args:
-        code: The croc secret code.
         file_infos: List of dicts with source_path and croc_filename.
-        target_ip, ssh_user, ssh_private_key, ssh_password: The source machine.
-        relay, relay_password, transfers: As for downloads; the receiver must use the
-            same relay.
+        target_ip, ssh_user: The source machine.
+        relay, transfers: As for downloads; the receiver must use the same relay.
     """
-    ssh_lines, cleanup = _ssh_function(
-        "__rl_src", "__RL_KEY", target_ip, ssh_user, ssh_private_key, ssh_password)
+    ssh_lines, cleanup = _ssh_function("__rl_src", target_ip, ssh_user)
     c = ["# === Remote transfer: stage from the source + croc send ==="]
     c.extend(ssh_lines)
     c.append('__DL_DIR=$(mktemp -d)')
@@ -1537,8 +1518,8 @@ def generate_croc_relay_send_commands(
                  f' || __rl_stage_fail "could not read {shown} on the source"')
         c.append('fi')
     c.extend(_generate_croc_send_core(
-        code, 300 + RELAY_RECEIVER_LAUNCH_BUDGET_SECONDS, cleanup_commands=cleanup,
-        relay=relay, relay_password=relay_password, transfers=transfers,
+        300 + RELAY_RECEIVER_LAUNCH_BUDGET_SECONDS, cleanup_commands=cleanup,
+        relay=relay, transfers=transfers,
     ))
     c.append("# === End remote transfer send ===")
     return "\n".join(c)
@@ -1550,14 +1531,10 @@ def relay_receive_timeout(total_bytes: int) -> int:
 
 
 def generate_croc_relay_receive_commands(
-    code: str,
     manifest: list[dict],
     target_ip: str,
     ssh_user: str,
-    ssh_private_key: str = "",
-    ssh_password: str = "",
     relay: str = "",
-    relay_password: str = "",
 ) -> str:
     """Shell commands for the RECEIVER side of a remote-to-remote transfer.
 
@@ -1577,15 +1554,16 @@ def generate_croc_relay_receive_commands(
        destination path. Directories (tar.gz) are extracted.
     5. Emits CROC_RX_SENTINEL_PLACED per file and DONE, or FAILED with the reason.
 
+    The destination's key or password, the code and the relay password come from the
+    environment (SSH_*_ENV, CROC_RECEIVE_CODE_ENV, CROC_RELAY_PASSWORD_ENV).
+
     Args:
-        code: The croc secret code.
         manifest: One dict per file: croc_filename, size (int), md5 (hex or None),
             is_dir (bool), destination_path, mode (optional).
-        target_ip, ssh_user, ssh_private_key, ssh_password: The destination machine.
-        relay, relay_password: Must match the sender's.
+        target_ip, ssh_user: The destination machine.
+        relay: Must match the sender's.
     """
-    ssh_lines, cleanup = _ssh_function(
-        "__rx_dst", "__RX_KEY", target_ip, ssh_user, ssh_private_key, ssh_password)
+    ssh_lines, cleanup = _ssh_function("__rx_dst", target_ip, ssh_user)
     total = sum(int(m.get("size") or 0) for m in manifest)
     c = ["# === Remote transfer: croc receive + place on the destination ==="]
     c.extend(ssh_lines)
@@ -1617,8 +1595,8 @@ def generate_croc_relay_receive_commands(
     c.append('  return 0')
     c.append('}')
     c.append(f'__tt_last_croc_error() {{ {_LAST_CROC_ERROR_SH}; }}')
-    c.append(f'export CROC_SECRET={_q(code)}')
-    c.extend(_relay_env_export(relay_password))
+    c.append(f'export CROC_SECRET="${CROC_RECEIVE_CODE_ENV}"')
+    c.extend(_relay_env_export())
     c.append(f'__RX_TIMEOUT={relay_receive_timeout(total)}')
     c.append('__rx_attempt() {')
     c.append('  : > .croc_recv.log')
@@ -1695,8 +1673,7 @@ def generate_croc_relay_receive_commands(
     c.append('  break')
     c.append('done')
     c.append('unset CROC_SECRET')
-    if relay_password:
-        c.append('unset CROC_PASS')
+    c.extend(_relay_env_unset())
     c.append('if [ "$__RX_OK" -ne 1 ]; then')
     # Same wording as the upload receive's error, so extract_transfer_errors finds it.
     c.append('  __rx_fail "croc file receive failed (exit code: $__RX_RC)${__RX_ERR:+: $__RX_ERR}; $__RX_BAD" "$__RX_RC"')
@@ -1754,17 +1731,17 @@ def generate_direct_copy_commands(files: list[dict], source: dict, destination: 
     CRC protects). Nothing is staged on the container's disk. Reports with the
     receiver's sentinels (CROC_RX_SENTINEL_*), so the status tool reads it the same way.
 
+    The environment targets the destination, so the destination's key or password
+    comes from SSH_*_ENV and the source's from AUX_SSH_*_ENV.
+
     Args:
         files: One dict per file: source_path, destination_path, mode (optional).
-        source, destination: Dicts with target_ip, ssh_user, ssh_private_key,
-            ssh_password.
+        source, destination: Dicts with target_ip and ssh_user.
     """
     src_lines, src_cleanup = _ssh_function(
-        "__dc_src", "__DC_SKEY", source["target_ip"], source["ssh_user"],
-        source.get("ssh_private_key", ""), source.get("ssh_password", ""))
+        "__dc_src", source["target_ip"], source["ssh_user"], aux=True)
     dst_lines, dst_cleanup = _ssh_function(
-        "__dc_dst", "__DC_DKEY", destination["target_ip"], destination["ssh_user"],
-        destination.get("ssh_private_key", ""), destination.get("ssh_password", ""))
+        "__dc_dst", destination["target_ip"], destination["ssh_user"])
     cleanup = src_cleanup + dst_cleanup + ['kill "$__DC_HB" 2>/dev/null']
     c = ["# === Remote transfer: direct copy (both endpoints behind one agent) ==="]
     # A failure on the SOURCE end of a pipe must fail the copy.
@@ -1894,6 +1871,8 @@ async def start_croc_receive(
         f"code = {code!r}\n"
         f"timeout = {timeout}\n"
         f"retry_interval = {CROC_RECEIVE_RETRY_SECONDS}\n"
+        f"gate_poll = {CROC_RECEIVE_GATE_POLL_SECONDS!r}\n"
+        f"croc_poll = {CROC_RECEIVE_CROC_POLL_SECONDS!r}\n"
         f"gated = {gated!r}\n"
         f"ready_f = os.path.join(receive_dir, {CROC_READY_SIGNAL!r})\n"
         f"abort_f = os.path.join(receive_dir, {CROC_ABORT_SIGNAL!r})\n"
@@ -1978,7 +1957,7 @@ async def start_croc_receive(
         "        log('abort signal received; giving up')\n"
         "        sys.exit(2)\n"
         "    if gated and not os.path.exists(ready_f):\n"
-        "        time.sleep(0.25)\n"
+        "        time.sleep(gate_poll)\n"
         "        continue\n"
         "    attempt += 1\n"
         "    log('croc attempt %d starting' % attempt)\n"
@@ -1999,7 +1978,7 @@ async def start_croc_receive(
         "                    kill_proc(proc)\n"
         "                    rc = -9\n"
         "                    break\n"
-        "                time.sleep(0.5)\n"
+        "                time.sleep(croc_poll)\n"
         "    except OSError as e:\n"
         "        log('failed to run croc: %s' % e)\n"
         "        rc = -1\n"
@@ -2034,7 +2013,7 @@ async def start_croc_receive(
     )
 
     # Brief pause to ensure the wrapper process started
-    await asyncio.sleep(1)
+    await asyncio.sleep(CROC_RECEIVE_STARTUP_CHECK_SECONDS)
 
     # Check if it crashed during startup (e.g. syntax error in script).
     # A clean exit (0) is legitimate: files may already be present / the

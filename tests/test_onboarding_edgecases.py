@@ -166,12 +166,12 @@ _NUMSIB = st.sampled_from(["", '"n": 1e400,', '"n": 1.000000000000000005,',
 @settings(max_examples=400, deadline=None, suppress_health_check=_SLOW)
 @given(base=st.sampled_from(_BASES), lead=_PAD, trail=_PAD, bom=st.booleans(),
        numsib=_NUMSIB, family=st.sampled_from(["mcpServers", "servers"]))
-def test_property_wrapped_and_numbers_safe(tmp_path_factory, base, lead, trail, bom, numsib, family):
+def test_property_wrapped_and_numbers_safe(base, lead, trail, bom, numsib, family):
     doc = base
     if numsib and doc.startswith("{") and doc != "{}":
         doc = "{" + numsib + doc[1:]            # inject a number/escape sibling after the root brace
     text = ("\ufeff" if bom else "") + lead + doc + trail
-    path = inv.fresh_path(tmp_path_factory, "e", "c.json")
+    path = inv.memory_path("c.json")
     res, after = inv.run_merge(path, text, family=family, entry=_entry(family))
     _assert_safe(text, after, res, family=family, entry=_entry(family))
 
@@ -184,11 +184,11 @@ _J5NOISE = st.sampled_from(["'", "0x1F", "//\n", "/*", ",}", "NaN", "Infinity",
 @given(base=st.sampled_from(_BASES),
        inserts=st.lists(st.tuples(st.integers(min_value=0, max_value=80), _J5NOISE), max_size=6),
        family=st.sampled_from(["mcpServers", "servers"]))
-def test_property_json5_noise_safe(tmp_path_factory, base, inserts, family):
+def test_property_json5_noise_safe(base, inserts, family):
     s = list(base)
     for pos, tok in inserts:
         s.insert(pos % (len(s) + 1), tok)
     text = "".join(s)
-    path = inv.fresh_path(tmp_path_factory, "e", "c.json")
+    path = inv.memory_path("c.json")
     res, after = inv.run_merge(path, text, family=family, entry=_entry(family))
     _assert_safe(text, after, res, family=family, entry=_entry(family))

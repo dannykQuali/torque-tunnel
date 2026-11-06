@@ -45,9 +45,9 @@ def _assert_safe_outcome(before, after, res, *, family, entry):
 @settings(max_examples=1000, deadline=None, suppress_health_check=_SLOW)
 @given(text=st.text(alphabet=st.sampled_from(_STRUCT), max_size=90),
        family=st.sampled_from(["mcpServers", "servers"]))
-def test_fuzz_structural_noise_never_corrupts(tmp_path_factory, text, family):
+def test_fuzz_structural_noise_never_corrupts(text, family):
     entry = onboarding.server_entry(family, python="/x/py")
-    path = inv.fresh_path(tmp_path_factory, "f", "c.json")
+    path = inv.memory_path("c.json")
     res, after = inv.run_merge(path, text, family=family, entry=entry)
     _assert_safe_outcome(text, after, res, family=family, entry=entry)
 
@@ -68,7 +68,7 @@ _BASES = [
                               st.sampled_from(list('{}[]":,/* \n\t'))),
                     max_size=10),
        family=st.sampled_from(["mcpServers", "servers"]))
-def test_fuzz_mutated_valid_never_corrupts(tmp_path_factory, base, ops, family):
+def test_fuzz_mutated_valid_never_corrupts(base, ops, family):
     s = list(base)
     for op, pos, ch in ops:
         if not s:
@@ -82,7 +82,7 @@ def test_fuzz_mutated_valid_never_corrupts(tmp_path_factory, base, ops, family):
             s.insert(i, s[i])
     text = "".join(s)
     entry = onboarding.server_entry(family, python="/x/py")
-    path = inv.fresh_path(tmp_path_factory, "f", "c.json")
+    path = inv.memory_path("c.json")
     res, after = inv.run_merge(path, text, family=family, entry=entry)
     _assert_safe_outcome(text, after, res, family=family, entry=entry)
 
@@ -114,13 +114,13 @@ _TOKENS = st.sampled_from(["\\", '"', "/*", "*/", "//", "\n", "\r\n", "\t", "}",
        inserts=st.lists(st.tuples(st.integers(min_value=0, max_value=400),
                                   st.one_of(_UNI, _TOKENS)), max_size=14),
        family=st.sampled_from(["mcpServers", "servers"]))
-def test_fuzz_unicode_and_unterminated_never_corrupts(tmp_path_factory, base, inserts, family):
+def test_fuzz_unicode_and_unterminated_never_corrupts(base, inserts, family):
     s = list(base)
     for pos, ch in inserts:
         s.insert(pos % (len(s) + 1), ch)
     text = "".join(s)
     entry = onboarding.server_entry(family, python="/x/py")
-    path = inv.fresh_path(tmp_path_factory, "f", "c.json")
+    path = inv.memory_path("c.json")
     res, after = inv.run_merge(path, text, family=family, entry=entry)
     _assert_safe_outcome(text, after, res, family=family, entry=entry)
 

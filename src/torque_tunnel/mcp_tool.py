@@ -589,29 +589,44 @@ def _croc_relay_settings(config: Optional[dict] = None) -> dict:
     }
 
 
+def _croc_secrets(plan: Optional["FileDeploymentPlan"], dl_plan: Optional["DownloadPlan"]) -> dict:
+    """The croc secrets an environment's commands need, as start_environment /
+    start_local_environment arguments: the upload's code (the agent receives), the
+    download's (it sends) and the relay password. They travel as sensitive inputs,
+    never inside the commands (see croc_manager's *_ENV names)."""
+    secrets = {}
+    if plan is not None and plan.needs_croc:
+        secrets["croc_receive_code"] = plan.croc_code
+        secrets["croc_relay_password"] = plan.croc_relay_password
+    if dl_plan is not None and dl_plan.needs_download:
+        secrets["croc_send_code"] = dl_plan.croc_code
+        secrets["croc_relay_password"] = dl_plan.croc_relay_password
+    return secrets
+
+
 def prepare_files_with_croc(
     files: list[dict],
     transfer_mode: str = "container",
     target_ip: str = "",
     ssh_user: str = "",
-    ssh_private_key: str = "",
-    ssh_password: str = "",
     config: Optional[dict] = None,
 ) -> FileDeploymentPlan:
     """Prepare file deployment, using croc for files exceeding the inline threshold.
-    
+
     Splits files into two groups:
     - Small files (compressed < 300KB): deployed via inline base64 (existing approach)
     - Large files: deployed via croc (peer-to-peer encrypted transfer)
-    
+
+    The generated commands hold no secret: the target's key or password, the croc
+    code and the relay password reach them through the environment's sensitive
+    inputs (see _croc_secrets and croc_manager's *_ENV names).
+
     Args:
         files: List of file specs (same format as prepare_files_deployment).
         transfer_mode: "container" for disposable/persistent containers,
                        "ssh" for SSH targets (requires croc receive on container + SCP).
         target_ip: SSH target IP (only for transfer_mode="ssh").
         ssh_user: SSH user (only for transfer_mode="ssh").
-        ssh_private_key: SSH private key (only for transfer_mode="ssh").
-        ssh_password: SSH password (only for transfer_mode="ssh").
         config: The call's effective config, for the croc relay (default: global).
 
     Returns:
@@ -839,25 +854,19 @@ def prepare_files_with_croc(
         if transfer_mode == "ssh":
             # For SSH: croc receive happens on the CONTAINER, then SCP to target
             croc_scp = croc_manager.generate_croc_scp_commands(
-                code=plan.croc_code,
                 file_transfers=croc_transfer_info,
                 target_ip=target_ip,
                 ssh_user=ssh_user,
-                ssh_private_key=ssh_private_key,
-                ssh_password=ssh_password,
                 timeout=croc_timeout,
                 relay=plan.croc_relay,
-                relay_password=plan.croc_relay_password,
             )
             plan.croc_container_pre_commands = croc_install + "\n" + croc_scp
         else:
             # For containers: croc receive runs directly in init_commands
             croc_recv = croc_manager.generate_croc_receive_commands(
-                code=plan.croc_code,
                 file_transfers=croc_transfer_info,
                 timeout=croc_timeout,
                 relay=plan.croc_relay,
-                relay_password=plan.croc_relay_password,
             )
             plan.croc_init_commands = croc_install + "\n" + croc_recv
     
@@ -1102,23 +1111,20 @@ def prepare_download_with_croc(
     transfer_mode: str = "container",
     target_ip: str = "",
     ssh_user: str = "",
-    ssh_private_key: str = "",
-    ssh_password: str = "",
     config: Optional[dict] = None,
 ) -> DownloadPlan:
     """Prepare download plan for remote→local file transfer via croc.
-    
+
     Generates shell commands to run on the remote side (croc send) and
-    prepares the local side (croc receive directory and file mappings).
-    
+    prepares the local side (croc receive directory and file mappings). Like
+    prepare_files_with_croc, the commands hold no secret (see _croc_secrets).
+
     Args:
         files: List of dicts with remote_source_path and local_destination_path.
         transfer_mode: "container" for disposable containers (files on container),
                        "ssh" for SSH targets (SCP from target to container, then croc send).
         target_ip: SSH target IP (only for transfer_mode="ssh").
         ssh_user: SSH user (only for transfer_mode="ssh").
-        ssh_private_key: SSH private key (only for transfer_mode="ssh").
-        ssh_password: SSH password (only for transfer_mode="ssh").
         config: The call's effective config, for the croc relay (default: global).
 
     Returns:
@@ -1167,23 +1173,17 @@ def prepare_download_with_croc(
     if transfer_mode == "ssh":
         # For SSH: SCP files from target to container, then croc send
         croc_send = croc_manager.generate_croc_scp_download_commands(
-            code=plan.croc_code,
             file_infos=file_infos,
             target_ip=target_ip,
             ssh_user=ssh_user,
-            ssh_private_key=ssh_private_key,
-            ssh_password=ssh_password,
             relay=plan.croc_relay,
-            relay_password=plan.croc_relay_password,
             transfers=plan.croc_transfers,
         )
     else:
         # For containers: croc send directly from the container
         croc_send = croc_manager.generate_croc_send_commands(
-            code=plan.croc_code,
             file_infos=file_infos,
             relay=plan.croc_relay,
-            relay_password=plan.croc_relay_password,
             transfers=plan.croc_transfers,
         )
     
@@ -3345,7 +3345,6 @@ async def handle_run_on_tunneled_ssh(arguments: dict, config: dict = None):
         plan = prepare_files_with_croc(
             files, transfer_mode="ssh",
             target_ip=target_ip, ssh_user=ssh_user,
-            ssh_private_key=ssh_private_key, ssh_password=ssh_password,
             config=cfg,
         )
         if plan.errors:
@@ -3366,7 +3365,6 @@ async def handle_run_on_tunneled_ssh(arguments: dict, config: dict = None):
         dl_plan = prepare_download_with_croc(
             download_files, transfer_mode="ssh",
             target_ip=target_ip, ssh_user=ssh_user,
-            ssh_private_key=ssh_private_key, ssh_password=ssh_password,
             config=cfg,
         )
         if dl_plan.errors:
@@ -3428,6 +3426,7 @@ async def handle_run_on_tunneled_ssh(arguments: dict, config: dict = None):
                 environment_kind="ssh",
                 credential_name=__cred_name,
                 credential_context=__cred_ctx,
+                **_croc_secrets(plan, dl_plan),
             )
             
             # Try to get grain log for additional context (especially useful on failures)
@@ -3678,7 +3677,6 @@ async def handle_run_on_tunneled_persistent_container(arguments: dict, config: d
         plan = prepare_files_with_croc(
             files, transfer_mode="ssh",
             target_ip=container_ip, ssh_user="root",
-            ssh_private_key=private_key,
             config=cfg,
         )
         if plan.errors:
@@ -3699,7 +3697,6 @@ async def handle_run_on_tunneled_persistent_container(arguments: dict, config: d
         dl_plan = prepare_download_with_croc(
             download_files, transfer_mode="ssh",
             target_ip=container_ip, ssh_user="root",
-            ssh_private_key=private_key,
             config=cfg,
         )
         if dl_plan.errors:
@@ -3766,6 +3763,7 @@ async def handle_run_on_tunneled_persistent_container(arguments: dict, config: d
                 parent_env_id=env_id,
                 credential_name=__cred_name,
                 credential_context=__cred_ctx,
+                **_croc_secrets(plan, dl_plan),
             )
 
             grain_log = None
@@ -3953,6 +3951,7 @@ async def handle_run_on_tunneled_disposable_container(arguments: dict, config: d
                 command_description=command_description,
                 credential_name=__cred_name,
                 credential_context=__cred_ctx,
+                **_croc_secrets(plan, dl_plan),
             )
 
             # Try to get grain log for additional context (especially useful on failures)
@@ -4074,7 +4073,6 @@ async def handle_run_on_tunneled_ssh_async(arguments: dict, config: dict = None,
         plan = prepare_files_with_croc(
             files, transfer_mode="ssh",
             target_ip=target_ip, ssh_user=ssh_user,
-            ssh_private_key=ssh_private_key, ssh_password=ssh_password,
             config=cfg,
         )
         if plan.errors:
@@ -4092,7 +4090,6 @@ async def handle_run_on_tunneled_ssh_async(arguments: dict, config: dict = None,
         dl_plan = prepare_download_with_croc(
             download_files, transfer_mode="ssh",
             target_ip=target_ip, ssh_user=ssh_user,
-            ssh_private_key=ssh_private_key, ssh_password=ssh_password,
             config=cfg,
         )
         if dl_plan.errors:
@@ -4132,6 +4129,7 @@ async def handle_run_on_tunneled_ssh_async(arguments: dict, config: dict = None,
                 environment_kind="ssh",
                 credential_name=__cred_name,
                 credential_context=__cred_ctx,
+                **_croc_secrets(plan, dl_plan),
             )
 
         # Track croc state for cleanup when execution completes
@@ -4228,7 +4226,6 @@ async def handle_run_on_tunneled_persistent_container_async(arguments: dict, con
         plan = prepare_files_with_croc(
             files, transfer_mode="ssh",
             target_ip=container_ip, ssh_user="root",
-            ssh_private_key=private_key,
             config=cfg,
         )
         if plan.errors:
@@ -4246,7 +4243,6 @@ async def handle_run_on_tunneled_persistent_container_async(arguments: dict, con
         dl_plan = prepare_download_with_croc(
             download_files, transfer_mode="ssh",
             target_ip=container_ip, ssh_user="root",
-            ssh_private_key=private_key,
             config=cfg,
         )
         if dl_plan.errors:
@@ -4287,6 +4283,7 @@ async def handle_run_on_tunneled_persistent_container_async(arguments: dict, con
                 parent_env_id=env_id,
                 credential_name=__cred_name,
                 credential_context=__cred_ctx,
+                **_croc_secrets(plan, dl_plan),
             )
             
             # Track croc state for cleanup when execution completes
@@ -4425,6 +4422,7 @@ async def handle_run_on_tunneled_disposable_container_async(arguments: dict, con
                 command_description=command_description,
                 credential_name=__cred_name,
                 credential_context=__cred_ctx,
+                **_croc_secrets(plan, dl_plan),
             )
 
         # Track croc state for cleanup when execution completes
@@ -4886,8 +4884,9 @@ class _TransferEndpoint:
         return "persistent-command" if self.container_env_id else "ssh"
 
     def ssh(self) -> dict:
-        return {"target_ip": self.host, "ssh_user": self.user,
-                "ssh_private_key": self.private_key, "ssh_password": self.password}
+        """Where the generated commands connect. The key or password is not here: it
+        reaches them as a sensitive input of the environment (see croc_manager._ssh_auth)."""
+        return {"target_ip": self.host, "ssh_user": self.user}
 
 
 async def _resolve_transfer_endpoint(spec: dict, role: str) -> _TransferEndpoint:
@@ -5154,6 +5153,7 @@ async def _start_direct_copy(description, files, source, destination, timeout):
             environment_id = await client.start_environment(
                 target_ip=destination.host, ssh_user=destination.user,
                 ssh_private_key=destination.private_key, ssh_password=destination.password or None,
+                aux_ssh_private_key=source.private_key, aux_ssh_password=source.password,
                 command="true", agent=destination.agent, timeout=timeout,
                 container_pre_commands=commands,
                 command_description=f"{description} (copy)",
@@ -5184,15 +5184,15 @@ async def _start_croc_transfer(description, files, source, destination, timeout)
     sender_commands = (
         croc_manager.generate_remote_croc_install_script(failure_sentinel=croc_manager.CROC_SENTINEL_FAILED)
         + "\n" + croc_manager.generate_croc_relay_send_commands(
-            code, [{"source_path": f["source_path"], "croc_filename": f["croc_filename"]} for f in files],
-            relay=relay["relay"], relay_password=relay["relay_password"],
-            transfers=relay["transfers"], **source.ssh())
+            [{"source_path": f["source_path"], "croc_filename": f["croc_filename"]} for f in files],
+            relay=relay["relay"], transfers=relay["transfers"], **source.ssh())
     )
     try:
         async with _connection_client(source.connection) as client:
             sender_id = await client.start_environment(
                 target_ip=source.host, ssh_user=source.user,
                 ssh_private_key=source.private_key, ssh_password=source.password or None,
+                croc_send_code=code, croc_relay_password=relay["relay_password"],
                 command="true", agent=source.agent, timeout=timeout,
                 download_commands=sender_commands,
                 command_description=f"{description} (send)",
@@ -5227,14 +5227,14 @@ async def _start_croc_transfer(description, files, source, destination, timeout)
     receiver_commands = (
         croc_manager.generate_remote_croc_install_script(failure_sentinel=croc_manager.CROC_RX_SENTINEL_FAILED)
         + "\n" + croc_manager.generate_croc_relay_receive_commands(
-            code, manifest, relay=relay["relay"], relay_password=relay["relay_password"],
-            **destination.ssh())
+            manifest, relay=relay["relay"], **destination.ssh())
     )
     try:
         async with _connection_client(destination.connection) as client:
             receiver_id = await client.start_environment(
                 target_ip=destination.host, ssh_user=destination.user,
                 ssh_private_key=destination.private_key, ssh_password=destination.password or None,
+                croc_receive_code=code, croc_relay_password=relay["relay_password"],
                 command="true", agent=destination.agent, timeout=timeout,
                 container_pre_commands=receiver_commands,
                 command_description=f"{description} (receive)",
@@ -5718,7 +5718,6 @@ async def cli_dispatch(args):
                 plan = prepare_files_with_croc(
                     uploads, transfer_mode="ssh",
                     target_ip=target_ip, ssh_user=ssh_user,
-                    ssh_private_key=ssh_key, ssh_password=ssh_password,
                 )
                 if plan.errors:
                     print("Error preparing files:", file=sys.stderr)
@@ -5739,7 +5738,6 @@ async def cli_dispatch(args):
                 dl_plan = prepare_download_with_croc(
                     downloads, transfer_mode="ssh",
                     target_ip=target_ip, ssh_user=ssh_user,
-                    ssh_private_key=ssh_key, ssh_password=ssh_password,
                 )
                 if dl_plan.errors:
                     print("Download preparation warnings:", file=sys.stderr)
@@ -5783,6 +5781,7 @@ async def cli_dispatch(args):
                         environment_kind="ssh",
                         credential_name=__cred_name,
                         credential_context=__cred_ctx,
+                        **_croc_secrets(plan, dl_plan),
                     )
             finally:
                 await cleanup_croc_resources(croc_process, plan.croc_staging_dir if plan else "")
@@ -5984,7 +5983,6 @@ async def cli_dispatch(args):
                     plan = prepare_files_with_croc(
                         uploads, transfer_mode="ssh",
                         target_ip=container_ip, ssh_user="root",
-                        ssh_private_key=private_key,
                     )
                     if plan.errors:
                         print("Error preparing files:", file=sys.stderr)
@@ -6006,7 +6004,6 @@ async def cli_dispatch(args):
                     dl_plan = prepare_download_with_croc(
                         downloads, transfer_mode="ssh",
                         target_ip=container_ip, ssh_user="root",
-                        ssh_private_key=private_key,
                     )
                     if dl_plan.errors:
                         print("Download preparation warnings:", file=sys.stderr)
@@ -6062,6 +6059,7 @@ async def cli_dispatch(args):
                             parent_env_id=used_env_id,
                             credential_name=__cred_name,
                             credential_context=__cred_ctx,
+                            **_croc_secrets(plan, dl_plan),
                         )
 
                         # Re-arm the idle timeout: the container dies
@@ -6204,6 +6202,7 @@ async def cli_dispatch(args):
                         command_description=command_description,
                         credential_name=__cred_name,
                         credential_context=__cred_ctx,
+                        **_croc_secrets(plan, dl_plan),
                     )
             finally:
                 await cleanup_croc_resources(croc_process, plan.croc_staging_dir if plan else "")

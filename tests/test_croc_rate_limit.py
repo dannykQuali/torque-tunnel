@@ -347,40 +347,35 @@ class TestLocalSendRelayOptions:
 class TestRemoteRelayOptions:
     def test_receive_commands_carry_the_relay(self):
         script = croc_manager.generate_croc_receive_commands(
-            code="abc",
             file_transfers=[{"croc_filename": "f", "remote_destination_path": "/tmp/f"}],
             relay="relay.internal:9009",
-            relay_password="s3kr1t",
         )
         assert "--relay relay.internal:9009" in script
-        assert "CROC_PASS=" in script
+        # The password from the environment (a sensitive input), when it has one
+        assert f'export CROC_PASS="${croc_manager.CROC_RELAY_PASSWORD_ENV}"' in script
         # Global options must precede the (implicit) receive, i.e. right after `croc`
         assert "croc --relay" in script
 
     def test_receive_commands_use_the_public_relay_without_a_password(self):
         script = croc_manager.generate_croc_receive_commands(
-            code="abc",
             file_transfers=[{"croc_filename": "f", "remote_destination_path": "/tmp/f"}],
         )
         assert f"--relay {croc_manager.DEFAULT_CROC_RELAY}" in script
-        assert "CROC_PASS" not in script
+        # CROC_PASS is set only when the environment holds a password
+        assert f'if [ -n "${{{croc_manager.CROC_RELAY_PASSWORD_ENV}:-}}" ]; then export CROC_PASS' in script
 
     def test_scp_commands_carry_the_relay(self):
         script = croc_manager.generate_croc_scp_commands(
-            code="abc",
             file_transfers=[{"croc_filename": "f", "remote_destination_path": "/tmp/f"}],
             target_ip="10.0.0.1",
             ssh_user="root",
-            ssh_private_key="-----BEGIN KEY-----",
             relay="relay.internal:9009",
-            relay_password="s3kr1t",
         )
         assert "--relay relay.internal:9009" in script
-        assert "CROC_PASS=" in script
+        assert f'export CROC_PASS="${croc_manager.CROC_RELAY_PASSWORD_ENV}"' in script
 
     def test_remote_send_commands_carry_the_relay(self):
         script = croc_manager.generate_croc_send_commands(
-            code="abc",
             file_infos=[{"remote_source_path": "/tmp/f", "croc_filename": "f"}],
             relay="relay.internal:9009",
             transfers=2,
@@ -391,7 +386,6 @@ class TestRemoteRelayOptions:
 
     def test_remote_send_commands_use_the_public_relay_and_default_streams(self):
         script = croc_manager.generate_croc_send_commands(
-            code="abc",
             file_infos=[{"remote_source_path": "/tmp/f", "croc_filename": "f"}],
         )
         assert f"croc --relay {croc_manager.DEFAULT_CROC_RELAY} send --no-local" in script
@@ -454,6 +448,7 @@ FAKE_CROC_RECEIVE = r"""#!/bin/bash
 #   other_fail   - any non-retryable failure
 #   ok           - receives the file
 d="$FAKE_CROC_DIR"
+printf '%s' "$CROC_SECRET" > "$d/secret"
 n=$(cat "$d/count" 2>/dev/null || echo 0)
 n=$((n+1)); echo "$n" > "$d/count"
 scenario=$(sed -n "${n}p" "$d/scenario.txt")
@@ -499,12 +494,13 @@ class TestReceiveRetryBehaviour:
         def run(scenarios, relay=""):
             (control / "scenario.txt").write_text(
                 "\n".join(scenarios) + "\n", encoding="utf-8", newline="\n")
-            lines = croc_manager.generate_croc_receive_attempt(
-                code="test-code", timeout=30, relay=relay)
+            lines = croc_manager.generate_croc_receive_attempt(timeout=30, relay=relay)
             script = tmp_path / "under_test.sh"
             body = FAKE_TIMEOUT_FUNC + "\n".join(lines) + '\necho "RC=$__CROC_RC"\n'
             script.write_text(body, encoding="utf-8", newline="\n")
-            return run_script(script, env={"FAKE_CROC_DIR": control},
+            # The code arrives as the grain's env-vars deliver it
+            return run_script(script, env={"FAKE_CROC_DIR": control,
+                                           croc_manager.CROC_RECEIVE_CODE_ENV: "test-code"},
                               prepend_path=[fake_bin], cwd=workdir)
 
         def attempts():
@@ -517,6 +513,10 @@ class TestReceiveRetryBehaviour:
         proc = harness["run"](["ok"])
         assert "RC=0" in proc.stdout, proc.stdout + proc.stderr
         assert harness["attempts"]() == 1
+
+    def test_croc_gets_the_code_from_the_environment(self, harness, tmp_path):
+        harness["run"](["ok"])
+        assert (tmp_path / "control" / "secret").read_text() == "test-code"
 
     def test_retries_through_rate_limits_then_succeeds(self, harness):
         proc = harness["run"](["rate_limited", "rate_limited", "ok"])
@@ -548,7 +548,6 @@ class TestReceiveRetryBehaviour:
         assert leftovers == [], f"left behind: {leftovers}"
 
     def test_relay_flag_reaches_the_receiver(self, harness):
-        lines = croc_manager.generate_croc_receive_attempt(
-            code="c", timeout=30, relay="relay.internal:9009")
+        lines = croc_manager.generate_croc_receive_attempt(timeout=30, relay="relay.internal:9009")
         joined = "\n".join(lines)
         assert "croc --relay relay.internal:9009 --yes --overwrite" in joined

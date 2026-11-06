@@ -114,10 +114,10 @@ case "$scenario" in
     ;;
   wait_then_ok)
     # Waits (no percentage line) for well over the harness's mid-stall window:
-    # CROC_SEND_MIDSTALL_CHECKS=2 checks x 10 ticks of FAST_TICK = ~1s.
+    # CROC_SEND_MIDSTALL_CHECKS=2 checks x 10 ticks of FAST_TICK = ~0.5s.
     echo "Sending 'x' (5 B)"
     echo "Code is: $CROC_SECRET"
-    sleep 3
+    sleep 1.5
     echo "_croc_dl_x 100% (5/5 B, 1 MB/s)"
     exit 0
     ;;
@@ -126,7 +126,7 @@ exit 3
 """
 
 # The send monitor's tick in these tests (production: 0.5s).
-FAST_TICK = 0.05
+FAST_TICK = 0.025
 
 # Records the requested timeout duration, then runs the command WITHOUT enforcing
 # it. A shell FUNCTION prepended to the script under test (functions outrank PATH
@@ -165,7 +165,10 @@ class TestSendCommandsBehavior:
             _write_text(control / "scenario.txt", "\n".join(scenarios) + "\n")
             script = tmp_path / "under_test.sh"
             _write_text(script, FAKE_TIMEOUT_FUNC + commands + "\n")
-            return run_script(script, env={"FAKE_CROC_DIR": control}, prepend_path=[fake_bin])
+            # The code arrives as the grain's env-vars deliver it
+            return run_script(script, env={"FAKE_CROC_DIR": control,
+                                           croc_manager.CROC_SEND_CODE_ENV: "test-code"},
+                              prepend_path=[fake_bin])
 
         def attempts():
             count_file = control / "count"
@@ -177,7 +180,6 @@ class TestSendCommandsBehavior:
         # The path as the script sees it
         posix_src = shell_path(src)
         return croc_manager.generate_croc_send_commands(
-            code="test-code",
             file_infos=[{
                 "remote_source_path": posix_src,
                 "croc_filename": "_croc_dl_0_data.bin",
@@ -253,7 +255,6 @@ class TestSendCommandsBehavior:
             f.write(b"\0")
         posix_big = shell_path(big)
         commands = croc_manager.generate_croc_send_commands(
-            code="c",
             file_infos=[{"remote_source_path": posix_big, "croc_filename": "_croc_dl_0_big.bin"}],
             timeout=1,  # floor of 1s so the size-scaled value must win
         )
@@ -318,7 +319,6 @@ class TestSendCommandsBehavior:
     def test_no_files_staged_fails_fast(self, harness, tmp_path):
         """If nothing could be staged, fail immediately without invoking croc."""
         commands = croc_manager.generate_croc_send_commands(
-            code="c",
             file_infos=[{
                 "remote_source_path": shell_path(tmp_path / "missing-file"),
                 "croc_filename": "_croc_dl_0_missing",
@@ -333,6 +333,9 @@ class TestSendCommandsBehavior:
 # ============================================================================
 # Local receive wrapper (start_croc_receive)
 # ============================================================================
+
+# How often the wrapper checks for the ready signal in these tests (production 0.25 s).
+GATE_POLL = 0.02
 
 FAKE_RECV_CONTROLLER = r"""
 import json, os, sys, time
@@ -379,6 +382,11 @@ class TestReceiveWrapper:
 
         monkeypatch.setenv("FAKE_RECV_DIR", str(control))
         monkeypatch.setattr(croc_manager, "CROC_RECEIVE_RETRY_SECONDS", 0.2)
+        # The wrapper's polls and start_croc_receive's startup pause (production
+        # 0.25 s / 0.5 s / 1 s): same logic, decided sooner.
+        monkeypatch.setattr(croc_manager, "CROC_RECEIVE_GATE_POLL_SECONDS", GATE_POLL)
+        monkeypatch.setattr(croc_manager, "CROC_RECEIVE_CROC_POLL_SECONDS", 0.05)
+        monkeypatch.setattr(croc_manager, "CROC_RECEIVE_STARTUP_CHECK_SECONDS", 0.2)
 
         def set_plan(steps):
             _write_text(control / "plan.json", json.dumps(steps))
@@ -426,8 +434,9 @@ class TestReceiveWrapper:
         recv["set_plan"]([{"rc": 1}])
         process = await self._start(recv, gated=True)
         try:
-            # No croc attempt may happen before the ready signal appears
-            await asyncio.sleep(1.5)
+            # No croc attempt may happen before the ready signal appears, over many
+            # gate polls
+            await asyncio.sleep(15 * GATE_POLL)
             assert recv["count"]() == 0
             (recv["receive_dir"] / croc_manager.CROC_READY_SIGNAL).touch()
             assert wait_until(lambda: recv["count"]() >= 1), "croc not invoked after ready signal"

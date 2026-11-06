@@ -214,12 +214,19 @@ on the destination side. See
 ### Transfer Code
 - Generated via `secrets.token_urlsafe(256)` → 2048-bit entropy (~342 characters)
 - Passed via `CROC_SECRET` environment variable on both send and receive sides (not visible in process list)
+- On the agent side it reaches the generated commands as the sensitive input
+  `croc_receive_code` / `croc_send_code` (env var `TT_CROC_RECEIVE_CODE` /
+  `TT_CROC_SEND_CODE`), never inside the commands, so Torque's log and inputs never
+  hold it; likewise the relay password and the SSH key or password the commands use.
+  See [secrets-in-torque.md](secrets-in-torque.md).
 - Used as the PAKE password for end-to-end encryption
 
 ### Shell Command Safety
 - File permissions (`mode`) are validated against `^[0-7]{3,4}$`
 - Filenames and paths are shell-escaped using single-quote escaping
-- SSH credentials (keys, passwords) are handled with proper quoting
+- SSH credentials (keys, passwords) never appear in the commands: they come from the
+  environment (`TT_SSH_*`, `TT_AUX_SSH_*`), a key through a 0600 temp file, a password
+  through `sshpass -e`
 
 ## Relay rate limiting
 

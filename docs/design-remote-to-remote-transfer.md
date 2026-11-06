@@ -380,7 +380,12 @@ path. *As built:* both ends are hashed separately instead of `tee`-ing the strea
 read of the source file.
 
 - It runs in container pre-commands, a blueprint slot that isn't printed in the
-  "decoded for visibility" dump, because the commands carry both SSH keys.
+  "decoded for visibility" dump. (The commands no longer carry either SSH key: since
+  2026-11-06 the destination's arrives as the environment's own `ssh_private_key` /
+  `ssh_password` input and the source's as `aux_ssh_private_key` / `aux_ssh_password`,
+  all sensitive inputs read through `env-vars` - see
+  [secrets-in-torque.md](secrets-in-torque.md). The same holds for the croc transfer's
+  keys, codes and relay password.)
 - *As built:* it runs in an environment targeting the **destination**, so it uses the
   destination profile's `init_commands`. Both sides are behind the same agent anyway.
 - It reports with the receiver's sentinels, and a 30 s heartbeat keeps its log moving.

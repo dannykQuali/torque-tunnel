@@ -62,31 +62,31 @@ class TestExplicitRelayEverywhere:
 
     def test_configured_relay_still_wins(self):
         script = croc_manager.generate_croc_receive_commands(
-            code="c", file_transfers=[{"croc_filename": "f", "remote_destination_path": "/tmp/f"}],
+            file_transfers=[{"croc_filename": "f", "remote_destination_path": "/tmp/f"}],
             relay="relay.internal:9009")
         assert "--relay relay.internal:9009" in script
         assert PUBLIC not in script
 
     def test_remote_receive_names_the_relay_when_none_is_configured(self):
         script = croc_manager.generate_croc_receive_commands(
-            code="c", file_transfers=[{"croc_filename": "f", "remote_destination_path": "/tmp/f"}])
+            file_transfers=[{"croc_filename": "f", "remote_destination_path": "/tmp/f"}])
         assert f"croc --relay {PUBLIC} --yes --overwrite" in script
 
     def test_remote_scp_receive_names_the_relay_when_none_is_configured(self):
         script = croc_manager.generate_croc_scp_commands(
-            code="c", file_transfers=[{"croc_filename": "f", "remote_destination_path": "/tmp/f"}],
-            target_ip="10.0.0.1", ssh_user="root", ssh_private_key="-----BEGIN KEY-----")
+            file_transfers=[{"croc_filename": "f", "remote_destination_path": "/tmp/f"}],
+            target_ip="10.0.0.1", ssh_user="root")
         assert f"croc --relay {PUBLIC} --yes --overwrite" in script
 
     def test_remote_send_names_the_relay_when_none_is_configured(self):
         script = croc_manager.generate_croc_send_commands(
-            code="c", file_infos=[{"remote_source_path": "/tmp/f", "croc_filename": "f"}])
+            file_infos=[{"remote_source_path": "/tmp/f", "croc_filename": "f"}])
         assert f"croc --relay {PUBLIC} send --no-local" in script
 
     def test_remote_scp_send_names_the_relay_when_none_is_configured(self):
         script = croc_manager.generate_croc_scp_download_commands(
-            code="c", file_infos=[{"remote_source_path": "/tmp/f", "croc_filename": "f"}],
-            target_ip="10.0.0.1", ssh_user="root", ssh_private_key="-----BEGIN KEY-----")
+            file_infos=[{"remote_source_path": "/tmp/f", "croc_filename": "f"}],
+            target_ip="10.0.0.1", ssh_user="root")
         assert f"croc --relay {PUBLIC} send --no-local" in script
 
     @pytest.mark.asyncio
@@ -236,7 +236,8 @@ class TestRemoteDnsWarmupAndErrors:
                 (control / f).write_text("1")
             script = tmp_path / "under_test.sh"
             bh.write_text(script, FAKE_TIMEOUT_FUNC + "\n".join(lines) + '\necho "RC=$__CROC_RC"\n')
-            return bh.run_script(script, env={"FAKE_DIR": control},
+            return bh.run_script(script, env={"FAKE_DIR": control,
+                                              croc_manager.CROC_RECEIVE_CODE_ENV: "c"},
                                  prepend_path=[fake_bin], cwd=work)
 
         def calls():
@@ -246,7 +247,7 @@ class TestRemoteDnsWarmupAndErrors:
         return {"run": run, "calls": calls}
 
     def _receive(self, relay=""):
-        return croc_manager.generate_croc_receive_attempt(code="c", timeout=30, relay=relay)
+        return croc_manager.generate_croc_receive_attempt(timeout=30, relay=relay)
 
     def test_lookup_precedes_every_croc_attempt(self, harness):
         harness["run"](self._receive(), ["rate_limited", "ok"])
@@ -274,8 +275,7 @@ class TestRemoteDnsWarmupAndErrors:
     def test_receive_failure_names_crocs_reason(self, harness):
         """The ERROR line is what the tool pulls from the log, so it must say why."""
         block = croc_manager.generate_croc_receive_commands(
-            code="c", file_transfers=[{"croc_filename": "payload.bin",
-                                       "remote_destination_path": "/tmp/p"}])
+            file_transfers=[{"croc_filename": "payload.bin", "remote_destination_path": "/tmp/p"}])
         proc = harness["run"]([block], ["blank_relay"])
         errors = [l for l in proc.stderr.splitlines() if "croc file receive failed" in l]
         assert errors, proc.stdout + proc.stderr
@@ -362,6 +362,8 @@ exit 1
     def test_failed_sentinel_carries_the_reason_but_never_the_code(self, tmp_path, monkeypatch):
         monkeypatch.setattr(croc_manager, "CROC_SEND_RETRY_DELAY_SECONDS", 0)
         monkeypatch.setattr(croc_manager, "CROC_DNS_WARMUP_SECONDS", 1)
+        # The send monitor's tick (production 0.5 s): same checks, decided sooner
+        monkeypatch.setattr(croc_manager, "CROC_SEND_MONITOR_TICK_SECONDS", 0.025)
         fake_bin = tmp_path / "bin"
         fake_bin.mkdir()
         control = tmp_path / "control"
@@ -373,12 +375,15 @@ exit 1
 
         secret = "SENTINEL-TEST-SECRET-do-not-leak-0123456789"
         cmds = croc_manager.generate_croc_send_commands(
-            code=secret,
             file_infos=[{"remote_source_path": bh.shell_path(src),
                          "croc_filename": "_croc_dl_0_data.bin"}])
+        assert secret not in cmds
         script = tmp_path / "send.sh"
         bh.write_text(script, self.TIMEOUT_FUNC + cmds + "\n")
-        proc = bh.run_script(script, env={"FAKE_DIR": control}, prepend_path=[fake_bin])
+        # The code arrives as the grain's env-vars deliver it
+        proc = bh.run_script(script, env={"FAKE_DIR": control,
+                                          croc_manager.CROC_SEND_CODE_ENV: secret},
+                             prepend_path=[fake_bin])
 
         failed = [l for l in proc.stdout.splitlines() if croc_manager.CROC_SENTINEL_FAILED in l]
         assert failed, proc.stdout + proc.stderr

@@ -20,6 +20,7 @@ from torque_tunnel import croc_manager
 
 
 KEY = "-----BEGIN OPENSSH PRIVATE KEY-----\nZmFrZQ==\n-----END OPENSSH PRIVATE KEY-----"
+CODE = "the-secret-code"
 
 # Runs the remote command locally. FAKE_SSH_CORRUPT=1 damages data piped into
 # `cat > ...` (a broken hop to the destination); FAKE_SSH_NO_MD5=1 makes `md5sum`
@@ -105,7 +106,9 @@ def harness(tmp_path, monkeypatch):
     (control / "payload").mkdir(parents=True)
     make_executable(fake_bin / "croc", FAKE_CROC)
 
-    monkeypatch.setattr(croc_manager, "RELAY_MONITOR_TICK_SECONDS", 0.05)
+    # Both monitors' ticks (production 0.5 s): the same check counts, decided sooner
+    monkeypatch.setattr(croc_manager, "RELAY_MONITOR_TICK_SECONDS", 0.025)
+    monkeypatch.setattr(croc_manager, "CROC_SEND_MONITOR_TICK_SECONDS", 0.025)
     monkeypatch.setattr(croc_manager, "CROC_RECEIVE_RETRY_DELAY_SECONDS", 0)
     monkeypatch.setattr(croc_manager, "CROC_RECEIVE_RATE_LIMIT_BACKOFF_SECONDS", (0, 0, 0))
     monkeypatch.setattr(croc_manager, "CROC_SEND_RETRY_DELAY_SECONDS", 0)
@@ -114,7 +117,10 @@ def harness(tmp_path, monkeypatch):
         write_text(control / "scenario.txt", "\n".join(scenarios) + "\n")
         script = tmp_path / "under_test.sh"
         write_text(script, FAKE_SSH_FUNC + commands + "\n")
-        return run_script(script, env={"FAKE_DIR": control, **env_extra},
+        # The secrets arrive as the grain's env-vars deliver them
+        secrets = {croc_manager.SSH_PRIVATE_KEY_ENV: KEY, croc_manager.AUX_SSH_PRIVATE_KEY_ENV: KEY,
+                   croc_manager.CROC_RECEIVE_CODE_ENV: CODE, croc_manager.CROC_SEND_CODE_ENV: CODE}
+        return run_script(script, env={"FAKE_DIR": control, **secrets, **env_extra},
                           prepend_path=[fake_bin])
 
     def attempts():
@@ -124,13 +130,13 @@ def harness(tmp_path, monkeypatch):
     def payload(name, data: bytes):
         (control / "payload" / name).write_bytes(data)
 
-    return {"run": run, "attempts": attempts, "payload": payload, "control": control}
+    return {"run": run, "attempts": attempts, "payload": payload, "control": control,
+            "bin": fake_bin}
 
 
 def _receive(manifest, **kw):
     return croc_manager.generate_croc_relay_receive_commands(
-        code="the-secret-code", manifest=manifest, target_ip="dst-host", ssh_user="root",
-        ssh_private_key=KEY, **kw)
+        manifest=manifest, target_ip="dst-host", ssh_user="root", **kw)
 
 
 def _file_entry(name, data, dest, **extra):
@@ -146,8 +152,7 @@ def _file_entry(name, data, dest, **extra):
 class TestSender:
     def _send(self, file_infos, **kw):
         return croc_manager.generate_croc_relay_send_commands(
-            code="the-secret-code", file_infos=file_infos, target_ip="src-host",
-            ssh_user="root", ssh_private_key=KEY, **kw)
+            file_infos=file_infos, target_ip="src-host", ssh_user="root", **kw)
 
     def test_stages_a_file_and_reports_its_size_and_hash(self, harness, tmp_path):
         src = tmp_path / "source" / "image.vmdk"
@@ -399,8 +404,8 @@ class TestDirectCopy:
     def _copy(self, files):
         return croc_manager.generate_direct_copy_commands(
             files,
-            {"target_ip": "src-host", "ssh_user": "root", "ssh_private_key": KEY},
-            {"target_ip": "dst-host", "ssh_user": "root", "ssh_private_key": KEY})
+            {"target_ip": "src-host", "ssh_user": "root"},
+            {"target_ip": "dst-host", "ssh_user": "root"})
 
     def test_a_file_is_copied_verified_and_placed(self, harness, tmp_path):
         src = tmp_path / "src" / "image.vmdk"
@@ -417,6 +422,36 @@ class TestDirectCopy:
         assert harness["attempts"]() == 0  # croc never ran
         targets = (harness["control"] / "ssh_targets.txt").read_text()
         assert "src-host" in targets and "dst-host" in targets
+
+    def test_passwords_of_both_machines_reach_sshpass_through_the_environment(self, harness, tmp_path):
+        """The destination's password is the environment's own, the source's the
+        second machine's; sshpass reads each from SSHPASS, never from its arguments."""
+        control = harness["control"]
+        write_text(control / "ssh_func.sh", FAKE_SSH_FUNC)
+        make_executable(harness["bin"] / "sshpass", r"""#!/bin/bash
+echo "argv: $*" >> "$FAKE_DIR/sshpass_calls"
+echo "SSHPASS=$SSHPASS" >> "$FAKE_DIR/sshpass_calls"
+. "$FAKE_DIR/ssh_func.sh"
+shift  # -e
+"$@"
+""")
+        src = tmp_path / "src" / "f"
+        src.parent.mkdir()
+        src.write_bytes(b"data")
+        dest = tmp_path / "dst" / "f"
+        no_keys = {croc_manager.SSH_PRIVATE_KEY_ENV: "", croc_manager.AUX_SSH_PRIVATE_KEY_ENV: ""}
+        proc = harness["run"](
+            self._copy([{"source_path": _posix(src), "destination_path": _posix(dest)}]), [],
+            **no_keys, **{croc_manager.SSH_PASSWORD_ENV: "dst-password-1",
+                          croc_manager.AUX_SSH_PASSWORD_ENV: "src-password-2"})
+
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert dest.read_bytes() == b"data"
+        calls = (control / "sshpass_calls").read_text()
+        assert "SSHPASS=dst-password-1" in calls and "SSHPASS=src-password-2" in calls
+        argv = "\n".join(l for l in calls.splitlines() if l.startswith("argv:"))
+        assert "PubkeyAuthentication=no" in argv
+        assert "dst-password-1" not in argv and "src-password-2" not in argv
 
     def test_a_directory_is_copied(self, harness, tmp_path):
         src = tmp_path / "src dir"

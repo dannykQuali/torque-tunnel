@@ -89,7 +89,7 @@ def _render(other, family, servers_or_none, indent, eol, add_comment):
     has_tt=st.booleans(),
     data=st.data(),
 )
-def test_merge_invariants(tmp_path_factory, other, family, servers, indent, eol, add_comment, has_tt, data):
+def test_merge_invariants(other, family, servers, indent, eol, add_comment, has_tt, data):
     entry = onboarding.server_entry(family, python="/x/py")
 
     # Optionally pre-place torque-tunnel so we also exercise the no-op path.
@@ -104,7 +104,7 @@ def test_merge_invariants(tmp_path_factory, other, family, servers, indent, eol,
     fam_present = isinstance(bdata.get(family), dict)
     tt_present = fam_present and "torque-tunnel" in bdata[family]
 
-    path = inv.fresh_path(tmp_path_factory, "p", "cfg.json")
+    path = inv.memory_path("cfg.json")
     res, after = inv.run_merge(path, text, family=family, entry=entry)
 
     # An abort is always acceptable IF the file is left untouched.
@@ -121,7 +121,7 @@ def test_merge_invariants(tmp_path_factory, other, family, servers, indent, eol,
 @settings(max_examples=200, deadline=None, suppress_health_check=[HealthCheck.too_slow])
 @given(other=_other_keys, family=_family, servers=st.one_of(st.none(), _servers),
        indent=_indent, eol=_eol, add_comment=st.booleans())
-def test_idempotent(tmp_path_factory, other, family, servers, indent, eol, add_comment):
+def test_idempotent(other, family, servers, indent, eol, add_comment):
     """After a successful add, a second run is a byte-identical no-op."""
     entry = onboarding.server_entry(family, python="/x/py")
     text = _render(other, family, servers, indent, eol, add_comment)
@@ -129,7 +129,7 @@ def test_idempotent(tmp_path_factory, other, family, servers, indent, eol, add_c
     assume(ok and isinstance(bdata, dict))
     assume(not (isinstance(bdata.get(family), dict) and "torque-tunnel" in bdata[family]))
 
-    path = inv.fresh_path(tmp_path_factory, "p", "cfg.json")
+    path = inv.memory_path("cfg.json")
     res1, after1 = inv.run_merge(path, text, family=family, entry=entry)
     assume(res1.status == "added")              # only continue from a successful add
     res2, after2 = inv.run_merge(path, None, family=family, entry=entry)  # re-run on the now-existing file

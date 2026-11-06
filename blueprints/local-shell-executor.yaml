@@ -31,6 +31,25 @@ inputs:
     type: string
     description: Gzip-compressed and base64-encoded JSON describing the attached Torque credential (variable names and non-secret values only - never a secret). Empty when no credential is used.
     default: ""
+  # Every secret is a sensitive input that reaches the script ONLY through the grain's
+  # env-vars (TT_* below), never templated into the script: Torque echoes the script
+  # source into the grain log and shows ordinary inputs to anyone in the space, but keeps
+  # sensitive env-vars out of both. The generated commands name these variables too.
+  croc_receive_code:
+    type: string
+    description: croc code for a croc receive in the command (uploads)
+    sensitive: true
+    default: ""
+  croc_send_code:
+    type: string
+    description: croc code for a croc send in the download commands (downloads)
+    sensitive: true
+    default: ""
+  croc_relay_password:
+    type: string
+    description: Password of the croc relay
+    sensitive: true
+    default: ""
   # __TT_CREDENTIAL_INPUT__
 
 outputs:
@@ -48,6 +67,10 @@ grains:
       agent:
         name: '{{ .inputs.agent }}'
       # __TT_CREDENTIAL_AUTH__
+      env-vars:
+        - TT_CROC_RECEIVE_CODE: '{{ .inputs.croc_receive_code }}'
+        - TT_CROC_SEND_CODE: '{{ .inputs.croc_send_code }}'
+        - TT_CROC_RELAY_PASSWORD: '{{ .inputs.croc_relay_password }}'
       activities:
         deploy:
           commands:
@@ -89,7 +112,7 @@ grains:
                 export __TT_CRED_CTX
                 __TT_REDACT_PY=$(mktemp)
                 cat > "$__TT_REDACT_PY" <<'__TT_REDACT_EOF'
-                import json, os, sys
+                import json, os, select, sys
 
                 try:
                     with open(os.environ.get("__TT_CRED_CTX", ""), "r") as _f:
@@ -114,6 +137,16 @@ grains:
                         continue
                     secrets.append(v)
 
+                # torque-tunnel's own secrets (the sensitive inputs, see env-vars). Nothing
+                # here prints them, but a command could. A multi-line value (a key) is masked
+                # line by line, as output shows it; its -----BEGIN/END----- armour is not
+                # secret and stays readable. Short values are left alone, as above.
+                for n in os.environ.get("__TT_OWN_SECRETS", "").split():
+                    for part in os.environ.get(n, "").replace("\r", "").split("\n"):
+                        part = part.strip()
+                        if len(part) >= minlen and not part.startswith("-----"):
+                            secrets.append(part)
+
                 # Longest first, so a secret that contains another is masked whole.
                 secrets = sorted(set(secrets), key=len, reverse=True)
 
@@ -135,18 +168,48 @@ grains:
 
                 # Operate on bytes so arbitrary command output cannot break the filter on decoding.
                 secrets_b = [s.encode("utf-8", "surrogateescape") for s in secrets]
-                stdin = sys.stdin.buffer
-                while True:
-                    line = stdin.readline()
-                    if not line:
-                        break
+                longest = max((len(s) for s in secrets_b), default=0)
+
+                def mask(b):
                     for s in secrets_b:
-                        if s in line:
-                            line = line.replace(s, b"***")
-                    out.write(line)
-                    out.flush()
+                        if s in b:
+                            b = b.replace(s, b"***")
+                    return b
+
+                def unsafe_tail(b):
+                    # Where the end of b might be the start of a secret still arriving.
+                    for i in range(max(0, len(b) - longest + 1), len(b)):
+                        if any(s.startswith(b[i:]) for s in secrets_b):
+                            return i
+                    return len(b)
+
+                # Chunk by chunk rather than line by line, so progress bars (redrawn with
+                # \r) and prompts without a newline still stream as they come: everything
+                # up to the last line break goes out at once, the rest after a short
+                # pause - minus a tail that could be the start of a secret.
+                fd = sys.stdin.fileno()
+                held = b""
+                while True:
+                    if held and not select.select([fd], [], [], 0.2)[0]:
+                        cut = unsafe_tail(held)
+                    else:
+                        data = os.read(fd, 65536)
+                        if not data:
+                            break
+                        held += data
+                        cut = max(held.rfind(b"\n"), held.rfind(b"\r")) + 1
+                    if cut:
+                        out.write(mask(held[:cut]))
+                        out.flush()
+                        held = held[cut:]
+                out.write(mask(held))
+                out.flush()
                 __TT_REDACT_EOF
-                if [ -s "$__TT_CRED_CTX" ] && command -v python3 >/dev/null 2>&1; then
+                # Masks the credential's secrets and torque-tunnel's own wherever this
+                # script's output can carry them: command and download output.
+                __TT_OWN_SECRETS="TT_CROC_RECEIVE_CODE TT_CROC_SEND_CODE TT_CROC_RELAY_PASSWORD"
+                export __TT_OWN_SECRETS
+                if command -v python3 >/dev/null 2>&1; then
                   __tt_filter() { python3 -u "$__TT_REDACT_PY"; }
                 else
                   if [ -s "$__TT_CRED_CTX" ]; then
@@ -235,9 +298,9 @@ grains:
                   
                   START_TIME=$(date +%s%3N 2>/dev/null || echo "$(date +%s)000")
                   # Run the script (commands inside already have </dev/null protection).
-                  # __tt_filter redacts attached-credential secrets from the stream BEFORE it
-                  # is tee'd, so neither the returned output nor the Torque UI log can carry
-                  # them. It is a plain `cat` when no credential is attached.
+                  # __tt_filter redacts the attached credential's secrets and torque-tunnel's
+                  # own from the stream BEFORE it is tee'd, so neither the returned output nor
+                  # the Torque UI log can carry them. It is a plain `cat` without python3.
                   timeout "${TIMEOUT_SECONDS}" \
                   bash "$COMBINED" 2>&1 | __tt_filter | tee "$OUTPUT_FILE"
                   CMD_STATUS=${PIPESTATUS[0]}
@@ -265,8 +328,8 @@ grains:
                   if [ -s "$INIT_FILE" ]; then
                     . "$INIT_FILE"
                   fi
-                  bash "$__DL_CMDS"
-                  __DL_CMD_RC=$?
+                  bash "$__DL_CMDS" 2>&1 | __tt_filter
+                  __DL_CMD_RC=${PIPESTATUS[0]}
                   if [ $__DL_CMD_RC -ne 0 ]; then
                     echo "WARNING: Download commands failed (exit code: $__DL_CMD_RC)" >&2
                   fi

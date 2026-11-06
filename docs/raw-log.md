@@ -4,8 +4,9 @@
 
 Torque's shell runner echoes the whole rendered grain script into the grain log before
 running it (`Executing command: ...`). The blueprints template their inputs into that
-script, so the echo contains every input in plain text — `remote-shell-executor` writes
-`{{ .inputs.ssh_private_key }}` into it twice. Torque has no log masking.
+script, so the echo contains every input in plain text — `remote-shell-executor` used to
+write `{{ .inputs.ssh_private_key }}` into it twice (no longer: see
+[secrets-in-torque.md](secrets-in-torque.md)). Torque has no log masking.
 
 torque-tunnel used to return that echo to the caller whenever the
 `=== Beginning of execution ===` marker was not yet in the log, as a troubleshooting
@@ -86,8 +87,10 @@ through it: `filter_grain_log` and `format_log_section` in `mcp_tool.py` (every 
 result that shows a log), the three log streamers (`stream_preamble`), and the timeout
 path of `TorqueClient.wait_for_environment`. Tests: `tests/test_raw_log_modes.py`.
 
-## Not covered here
+## Related
 
-The key still sits in the Torque log itself (visible in Torque's UI to anyone in the
-space) and in `container_pre_commands_b64`, an input not marked sensitive. Keeping
-secrets out of the rendered script is a separate change.
+Since [secrets-in-torque.md](secrets-in-torque.md), torque-tunnel's own secrets (SSH
+keys and passwords, croc codes, the relay password) are no longer in the rendered
+script or in any ordinary input, so the script echo no longer holds them either. The
+raw log can still hold whatever a user wrote into their own command, which is why it
+stays opt-in.

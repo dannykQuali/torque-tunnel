@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -21,6 +22,9 @@ from torque_tunnel.mcp_tool import (
     cleanup_download_resources,
 )
 
+# A recursive scp, plain or through the generated scripts' authenticated wrapper
+SCP_R = re.compile(r"\bscp\w* -r\b|\b__scp_\w+ -r\b")
+
 
 @pytest.fixture
 def temp_dir():
@@ -37,13 +41,13 @@ def temp_dir():
 class TestGenerateCrocSendCommands:
     def test_basic_single_file(self):
         cmds = croc_manager.generate_croc_send_commands(
-            code="test-code-123",
             file_infos=[{
                 "remote_source_path": "/var/log/app.log",
                 "croc_filename": "_croc_dl_0_app.log",
             }],
         )
-        assert 'CROC_SECRET="test-code-123"' in cmds
+        # The code comes from the environment (a sensitive input), never the text
+        assert f'CROC_SECRET="${croc_manager.CROC_SEND_CODE_ENV}"' in cmds
         assert f"croc --relay {croc_manager.DEFAULT_CROC_RELAY} send --no-local" in cmds
         assert "_croc_dl_0_app.log" in cmds
         assert "cp -r '/var/log/app.log'" in cmds
@@ -51,7 +55,6 @@ class TestGenerateCrocSendCommands:
 
     def test_multiple_files(self):
         cmds = croc_manager.generate_croc_send_commands(
-            code="multi-code",
             file_infos=[
                 {"remote_source_path": "/tmp/a.txt", "croc_filename": "_croc_dl_0_a.txt"},
                 {"remote_source_path": "/opt/b.bin", "croc_filename": "_croc_dl_1_b.bin"},
@@ -66,7 +69,6 @@ class TestGenerateCrocSendCommands:
 
     def test_directory_staging_uses_cp_r(self):
         cmds = croc_manager.generate_croc_send_commands(
-            code="dir-code",
             file_infos=[{
                 "remote_source_path": "/opt/results",
                 "croc_filename": "_croc_dl_0_results",
@@ -77,7 +79,6 @@ class TestGenerateCrocSendCommands:
 
     def test_cleanup_after_send(self):
         cmds = croc_manager.generate_croc_send_commands(
-            code="code",
             file_infos=[{"remote_source_path": "/f", "croc_filename": "f"}],
         )
         assert 'rm -rf "$__DL_DIR"' in cmds
@@ -85,14 +86,12 @@ class TestGenerateCrocSendCommands:
 
     def test_error_handling_on_copy_failure(self):
         cmds = croc_manager.generate_croc_send_commands(
-            code="code",
             file_infos=[{"remote_source_path": "/f", "croc_filename": "f"}],
         )
         assert "WARNING: Failed to stage" in cmds
 
     def test_error_handling_on_croc_failure(self):
         cmds = croc_manager.generate_croc_send_commands(
-            code="code",
             file_infos=[{"remote_source_path": "/f", "croc_filename": "f"}],
         )
         assert "__DL_RC" in cmds
@@ -105,7 +104,6 @@ class TestGenerateCrocSendCommands:
     def test_custom_timeout_is_floor(self):
         """The timeout arg is the floor; the effective value scales with payload size."""
         cmds = croc_manager.generate_croc_send_commands(
-            code="code",
             file_infos=[{"remote_source_path": "/f", "croc_filename": "f"}],
             timeout=120,
         )
@@ -114,14 +112,12 @@ class TestGenerateCrocSendCommands:
 
     def test_default_timeout_is_floor(self):
         cmds = croc_manager.generate_croc_send_commands(
-            code="code",
             file_infos=[{"remote_source_path": "/f", "croc_filename": "f"}],
         )
         assert '[ "$__DL_TIMEOUT" -lt 300 ] && __DL_TIMEOUT=300' in cmds
 
     def test_special_characters_in_path(self):
         cmds = croc_manager.generate_croc_send_commands(
-            code="code",
             file_infos=[{
                 "remote_source_path": "/tmp/it's a file.txt",
                 "croc_filename": "_croc_dl_0_it's a file.txt",
@@ -132,7 +128,6 @@ class TestGenerateCrocSendCommands:
 
     def test_changes_to_staging_dir_and_back(self):
         cmds = croc_manager.generate_croc_send_commands(
-            code="code",
             file_infos=[{"remote_source_path": "/f", "croc_filename": "f"}],
         )
         assert 'cd "$__DL_DIR"' in cmds
@@ -140,7 +135,6 @@ class TestGenerateCrocSendCommands:
 
     def test_start_and_end_comments(self):
         cmds = croc_manager.generate_croc_send_commands(
-            code="code",
             file_infos=[{"remote_source_path": "/f", "croc_filename": "f"}],
         )
         assert cmds.startswith("# === Croc file download")
@@ -154,102 +148,90 @@ class TestGenerateCrocSendCommands:
 class TestGenerateCrocScpDownloadCommands:
     def test_key_auth(self):
         cmds = croc_manager.generate_croc_scp_download_commands(
-            code="dl-code",
             file_infos=[{
                 "remote_source_path": "/var/log/syslog",
                 "croc_filename": "_croc_dl_0_syslog",
             }],
             target_ip="10.0.0.1",
             ssh_user="root",
-            ssh_private_key="-----BEGIN RSA PRIVATE KEY-----\nKEYDATA\n-----END RSA PRIVATE KEY-----",
         )
         assert "CROC_SECRET" in cmds
-        assert "scp -r" in cmds
+        assert SCP_R.search(cmds)
         assert "StrictHostKeyChecking=no" in cmds
-        assert "__DL_KEY" in cmds
+        assert f'"${croc_manager.SSH_PRIVATE_KEY_ENV}"' in cmds  # the key, from the environment
         assert "10.0.0.1" in cmds
         assert f"croc --relay {croc_manager.DEFAULT_CROC_RELAY} send --no-local" in cmds
 
     def test_password_auth(self):
         cmds = croc_manager.generate_croc_scp_download_commands(
-            code="dl-code",
             file_infos=[{
                 "remote_source_path": "/tmp/file.txt",
                 "croc_filename": "_croc_dl_0_file.txt",
             }],
             target_ip="10.0.0.1",
             ssh_user="admin",
-            ssh_password="secret123",
         )
-        assert "sshpass" in cmds
+        assert f'SSHPASS="${croc_manager.SSH_PASSWORD_ENV}" sshpass -e' in cmds
         assert "PubkeyAuthentication=no" in cmds
 
-    def test_no_auth_raises(self):
-        with pytest.raises(ValueError, match="ssh_private_key or ssh_password"):
-            croc_manager.generate_croc_scp_download_commands(
-                code="dl-code",
-                file_infos=[{
-                    "remote_source_path": "/tmp/file.txt",
-                    "croc_filename": "_croc_dl_0_file.txt",
-                }],
-                target_ip="10.0.0.1",
-                ssh_user="root",
-            )
+    def test_no_auth_fails_when_run(self):
+        """Which credential the target has is known only when the script runs (it
+        comes from the environment), so a missing one is an error there."""
+        cmds = croc_manager.generate_croc_scp_download_commands(
+            file_infos=[{
+                "remote_source_path": "/tmp/file.txt",
+                "croc_filename": "_croc_dl_0_file.txt",
+            }],
+            target_ip="10.0.0.1",
+            ssh_user="root",
+        )
+        assert "neither an SSH key nor a password" in cmds
 
     def test_multiple_files(self):
         cmds = croc_manager.generate_croc_scp_download_commands(
-            code="dl-code",
             file_infos=[
                 {"remote_source_path": "/tmp/a.txt", "croc_filename": "_croc_dl_0_a.txt"},
                 {"remote_source_path": "/opt/b.bin", "croc_filename": "_croc_dl_1_b.bin"},
             ],
             target_ip="10.0.0.1",
             ssh_user="root",
-            ssh_private_key="KEY",
         )
         assert "_croc_dl_0_a.txt" in cmds
         assert "_croc_dl_1_b.bin" in cmds
         # SCP for each file
-        assert cmds.count("scp -r") == 2
+        assert len(SCP_R.findall(cmds)) == 2
 
     def test_cleanup_key_file(self):
         cmds = croc_manager.generate_croc_scp_download_commands(
-            code="code",
             file_infos=[{"remote_source_path": "/f", "croc_filename": "f"}],
             target_ip="10.0.0.1",
             ssh_user="root",
-            ssh_private_key="KEY",
         )
-        assert 'rm -f "$__DL_KEY"' in cmds
+        assert 'rm -f "$__TGT_KEY"' in cmds
 
-    def test_no_key_cleanup_for_password(self):
+    def test_a_key_file_is_written_only_when_there_is_a_key(self):
         cmds = croc_manager.generate_croc_scp_download_commands(
-            code="code",
             file_infos=[{"remote_source_path": "/f", "croc_filename": "f"}],
             target_ip="10.0.0.1",
             ssh_user="root",
-            ssh_password="pass",
         )
-        assert "__DL_KEY" not in cmds
+        key_check = f'if [ -n "${{{croc_manager.SSH_PRIVATE_KEY_ENV}:-}}" ]; then'
+        assert cmds.index(key_check) < cmds.index("__TGT_KEY=$(mktemp)")
 
     def test_staging_dir_cleanup(self):
         cmds = croc_manager.generate_croc_scp_download_commands(
-            code="code",
             file_infos=[{"remote_source_path": "/f", "croc_filename": "f"}],
             target_ip="10.0.0.1",
             ssh_user="root",
-            ssh_private_key="KEY",
         )
         assert 'rm -rf "$__DL_DIR"' in cmds
         assert "unset CROC_SECRET" in cmds
 
     def test_custom_timeout(self):
         cmds = croc_manager.generate_croc_scp_download_commands(
-            code="code",
             file_infos=[{"remote_source_path": "/f", "croc_filename": "f"}],
             target_ip="10.0.0.1",
             ssh_user="root",
-            ssh_private_key="KEY",
             timeout=300,
         )
         assert '[ "$__DL_TIMEOUT" -lt 300 ] && __DL_TIMEOUT=300' in cmds
@@ -258,32 +240,26 @@ class TestGenerateCrocScpDownloadCommands:
     def test_scp_uses_r_flag(self):
         """scp -r works for both files and directories."""
         cmds = croc_manager.generate_croc_scp_download_commands(
-            code="code",
             file_infos=[{"remote_source_path": "/opt/dir", "croc_filename": "dir"}],
             target_ip="10.0.0.1",
             ssh_user="root",
-            ssh_private_key="KEY",
         )
-        assert "scp -r" in cmds
+        assert SCP_R.search(cmds)
 
     def test_start_and_end_comments(self):
         cmds = croc_manager.generate_croc_scp_download_commands(
-            code="code",
             file_infos=[{"remote_source_path": "/f", "croc_filename": "f"}],
             target_ip="10.0.0.1",
             ssh_user="root",
-            ssh_private_key="KEY",
         )
         assert cmds.startswith("# === SCP download")
         assert cmds.endswith("# === End SCP download + croc send ===")
 
     def test_special_chars_in_target_and_user(self):
         cmds = croc_manager.generate_croc_scp_download_commands(
-            code="code",
             file_infos=[{"remote_source_path": "/f", "croc_filename": "f"}],
             target_ip="host'name",
             ssh_user="user'name",
-            ssh_private_key="KEY",
         )
         # Should be escaped, not raw
         assert "host'\\''name" in cmds or "host'name" not in cmds.split("scp")[1]
@@ -323,7 +299,6 @@ class TestPrepareDownloadWithCroc:
             transfer_mode="ssh",
             target_ip="10.0.0.1",
             ssh_user="root",
-            ssh_private_key="KEY",
         )
         assert plan.needs_download
         assert "scp" in plan.download_commands

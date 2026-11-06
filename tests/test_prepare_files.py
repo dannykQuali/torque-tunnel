@@ -280,9 +280,8 @@ class TestPrepareFilesCroc:
             transfer_mode="ssh",
             target_ip="10.0.0.1",
             ssh_user="root",
-            ssh_private_key="KEY",
         )
-        
+
         assert plan.needs_croc
         assert plan.croc_container_pre_commands != ""
         assert plan.croc_init_commands == ""
@@ -421,6 +420,8 @@ class TestRelayConfigReachesBothSides:
             assert plan.croc_transfers == 1
             assert "--relay relay.internal:9009" in plan.croc_init_commands
             assert "CROC_PASS=" in plan.croc_init_commands
+            # ...from the environment: the password itself never goes into a command
+            assert "s3kr1t" not in plan.croc_init_commands
         finally:
             shutil.rmtree(plan.croc_staging_dir, ignore_errors=True)
 
@@ -438,7 +439,9 @@ class TestRelayConfigReachesBothSides:
             # Named explicitly even when unconfigured: croc's built-in default is
             # resolved in a 500 ms window and silently blanked when that's missed.
             assert f"--relay {croc_manager.DEFAULT_CROC_RELAY}" in plan.croc_init_commands
-            assert "CROC_PASS" not in plan.croc_init_commands
+            # No password to hand the environment (the commands only ever name the
+            # variable; an empty one exports no CROC_PASS).
+            assert plan.croc_relay_password == ""
         finally:
             shutil.rmtree(plan.croc_staging_dir, ignore_errors=True)
 

@@ -189,20 +189,19 @@ class TestRemoteInstallScript:
 class TestCrocReceiveCommands:
     def test_basic_file_receive(self):
         cmds = croc_manager.generate_croc_receive_commands(
-            code="test-code-123",
             file_transfers=[{
                 "croc_filename": "_croc_0_data.bin",
                 "remote_destination_path": "/tmp/data.bin",
             }],
         )
-        assert 'CROC_SECRET="test-code-123"' in cmds
+        # The code comes from the environment (a sensitive input), never the text
+        assert f'CROC_SECRET="${croc_manager.CROC_RECEIVE_CODE_ENV}"' in cmds
         assert f"croc --relay {croc_manager.DEFAULT_CROC_RELAY} --yes --overwrite" in cmds
         assert "_croc_0_data.bin" in cmds
         assert "/tmp/data.bin" in cmds
 
     def test_file_with_mode(self):
         cmds = croc_manager.generate_croc_receive_commands(
-            code="test-code",
             file_transfers=[{
                 "croc_filename": "_croc_0_script.sh",
                 "remote_destination_path": "/tmp/script.sh",
@@ -213,7 +212,6 @@ class TestCrocReceiveCommands:
 
     def test_invalid_mode_ignored(self):
         cmds = croc_manager.generate_croc_receive_commands(
-            code="test-code",
             file_transfers=[{
                 "croc_filename": "_croc_0_file.txt",
                 "remote_destination_path": "/tmp/file.txt",
@@ -224,7 +222,6 @@ class TestCrocReceiveCommands:
 
     def test_dir_tar_extraction(self):
         cmds = croc_manager.generate_croc_receive_commands(
-            code="test-code",
             file_transfers=[{
                 "croc_filename": "_croc_0_mydir.tar.gz",
                 "remote_destination_path": "/opt/mydir",
@@ -237,7 +234,6 @@ class TestCrocReceiveCommands:
 
     def test_multiple_files(self):
         cmds = croc_manager.generate_croc_receive_commands(
-            code="test-code",
             file_transfers=[
                 {"croc_filename": "_croc_0_a.txt", "remote_destination_path": "/tmp/a.txt"},
                 {"croc_filename": "_croc_1_b.txt", "remote_destination_path": "/opt/b.txt"},
@@ -250,7 +246,6 @@ class TestCrocReceiveCommands:
 
     def test_creates_parent_directories(self):
         cmds = croc_manager.generate_croc_receive_commands(
-            code="test-code",
             file_transfers=[{
                 "croc_filename": "_croc_0_config.yml",
                 "remote_destination_path": "/etc/app/config/deep/config.yml",
@@ -260,7 +255,6 @@ class TestCrocReceiveCommands:
 
     def test_error_handling_on_receive_failure(self):
         cmds = croc_manager.generate_croc_receive_commands(
-            code="code",
             file_transfers=[{"croc_filename": "f", "remote_destination_path": "/f"}],
         )
         assert "exit 1" in cmds
@@ -268,7 +262,6 @@ class TestCrocReceiveCommands:
 
     def test_cleanup_temp_dir(self):
         cmds = croc_manager.generate_croc_receive_commands(
-            code="code",
             file_transfers=[{"croc_filename": "f", "remote_destination_path": "/f"}],
         )
         assert "rm -rf" in cmds
@@ -276,7 +269,6 @@ class TestCrocReceiveCommands:
     def test_special_characters_in_path(self):
         """Paths with single quotes should be escaped."""
         cmds = croc_manager.generate_croc_receive_commands(
-            code="test-code",
             file_transfers=[{
                 "croc_filename": "_croc_0_file.txt",
                 "remote_destination_path": "/tmp/it's a file.txt",
@@ -287,7 +279,6 @@ class TestCrocReceiveCommands:
     def test_croc_dir_variable_expansion_in_mv(self):
         """$__CROC_DIR must be in double quotes for shell expansion, not single quotes."""
         cmds = croc_manager.generate_croc_receive_commands(
-            code="test-code",
             file_transfers=[{
                 "croc_filename": "_croc_0_data.bin",
                 "remote_destination_path": "/tmp/data.bin",
@@ -301,7 +292,6 @@ class TestCrocReceiveCommands:
     def test_croc_dir_variable_expansion_in_tar(self):
         """$__CROC_DIR must be in double quotes for tar extraction too."""
         cmds = croc_manager.generate_croc_receive_commands(
-            code="test-code",
             file_transfers=[{
                 "croc_filename": "_croc_0_mydir.tar.gz",
                 "remote_destination_path": "/opt/mydir",
@@ -319,47 +309,40 @@ class TestCrocReceiveCommands:
 class TestCrocScpCommands:
     def test_key_auth_scp(self):
         cmds = croc_manager.generate_croc_scp_commands(
-            code="test-code",
             file_transfers=[{
                 "croc_filename": "_croc_0_data.bin",
                 "remote_destination_path": "/tmp/data.bin",
             }],
             target_ip="10.0.0.1",
             ssh_user="root",
-            ssh_private_key="-----BEGIN RSA PRIVATE KEY-----\nKEYDATA\n-----END RSA PRIVATE KEY-----",
         )
         assert "CROC_SECRET" in cmds
         assert "scp" in cmds
         assert "StrictHostKeyChecking=no" in cmds
-        assert "__SCP_KEY" in cmds
+        assert f'"${croc_manager.SSH_PRIVATE_KEY_ENV}"' in cmds  # the key, from the environment
         assert "10.0.0.1" in cmds
 
     def test_password_auth_scp(self):
         cmds = croc_manager.generate_croc_scp_commands(
-            code="test-code",
             file_transfers=[{
                 "croc_filename": "_croc_0_data.bin",
                 "remote_destination_path": "/tmp/data.bin",
             }],
             target_ip="10.0.0.1",
             ssh_user="root",
-            ssh_password="mypassword",
         )
         assert "sshpass" in cmds
         assert "PubkeyAuthentication=no" in cmds
 
-    def test_no_auth_raises(self):
-        with pytest.raises(ValueError, match="ssh_private_key or ssh_password"):
-            croc_manager.generate_croc_scp_commands(
-                code="test-code",
-                file_transfers=[],
-                target_ip="10.0.0.1",
-                ssh_user="root",
-            )
+    def test_no_auth_fails_when_run(self):
+        """Which credential the target has is known only when the script runs (it
+        comes from the environment), so a missing one is an error there."""
+        cmds = croc_manager.generate_croc_scp_commands(
+            file_transfers=[], target_ip="10.0.0.1", ssh_user="root")
+        assert "neither an SSH key nor a password" in cmds
 
     def test_dir_tar_extraction_via_ssh(self):
         cmds = croc_manager.generate_croc_scp_commands(
-            code="test-code",
             file_transfers=[{
                 "croc_filename": "_croc_0_mydir.tar.gz",
                 "remote_destination_path": "/opt/mydir",
@@ -367,14 +350,12 @@ class TestCrocScpCommands:
             }],
             target_ip="10.0.0.1",
             ssh_user="root",
-            ssh_private_key="KEY",
         )
         assert "tar xzf" in cmds
         assert "mkdir -p" in cmds
 
     def test_mode_validated(self):
         cmds = croc_manager.generate_croc_scp_commands(
-            code="test-code",
             file_transfers=[{
                 "croc_filename": "_croc_0_script.sh",
                 "remote_destination_path": "/tmp/script.sh",
@@ -382,36 +363,32 @@ class TestCrocScpCommands:
             }],
             target_ip="10.0.0.1",
             ssh_user="root",
-            ssh_private_key="KEY",
         )
         # Invalid mode should be ignored
         assert "chmod abc" not in cmds
 
-    def test_password_with_special_chars(self):
-        """Password with single quotes should be escaped."""
+    def test_password_comes_from_the_environment(self):
+        """sshpass reads it from SSHPASS: never in the text, nor in the process list."""
         cmds = croc_manager.generate_croc_scp_commands(
-            code="test-code",
             file_transfers=[{
                 "croc_filename": "_croc_0_f.txt",
                 "remote_destination_path": "/f.txt",
             }],
             target_ip="10.0.0.1",
             ssh_user="root",
-            ssh_password="p@ss'word",
         )
-        assert "'\\''word" in cmds  # Escaped single quote in password
+        assert f'SSHPASS="${croc_manager.SSH_PASSWORD_ENV}" sshpass -e' in cmds
+        assert "sshpass -p" not in cmds
 
     def test_croc_dir_variable_expansion_in_scp(self):
         """$__CROC_DIR must be in double quotes for SCP source path."""
         cmds = croc_manager.generate_croc_scp_commands(
-            code="test-code",
             file_transfers=[{
                 "croc_filename": "_croc_0_data.bin",
                 "remote_destination_path": "/tmp/data.bin",
             }],
             target_ip="10.0.0.1",
             ssh_user="root",
-            ssh_private_key="KEY",
         )
         assert '"$__CROC_DIR/"' in cmds
         assert "'$__CROC_DIR/'" not in cmds
@@ -419,7 +396,6 @@ class TestCrocScpCommands:
     def test_croc_dir_variable_expansion_in_tar_pipe(self):
         """$__CROC_DIR must be in double quotes for tar pipe source path."""
         cmds = croc_manager.generate_croc_scp_commands(
-            code="test-code",
             file_transfers=[{
                 "croc_filename": "_croc_0_dir.tar.gz",
                 "remote_destination_path": "/opt/dir",
@@ -427,7 +403,6 @@ class TestCrocScpCommands:
             }],
             target_ip="10.0.0.1",
             ssh_user="root",
-            ssh_private_key="KEY",
         )
         assert '"$__CROC_DIR/"' in cmds
         assert "'$__CROC_DIR/'" not in cmds

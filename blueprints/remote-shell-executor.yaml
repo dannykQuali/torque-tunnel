@@ -28,6 +28,35 @@ inputs:
     description: SSH password for authentication (use this OR ssh_private_key)
     sensitive: true
     default: ""
+  # Every secret is a sensitive input that reaches the script ONLY through the grain's
+  # env-vars (TT_* below), never templated into the script: Torque echoes the script
+  # source into the grain log and shows ordinary inputs to anyone in the space, but keeps
+  # sensitive env-vars out of both. The generated commands name these variables too.
+  aux_ssh_private_key:
+    type: string
+    description: SSH private key of a second machine the commands reach (a direct copy's source)
+    sensitive: true
+    default: ""
+  aux_ssh_password:
+    type: string
+    description: SSH password of that second machine (use this OR aux_ssh_private_key)
+    sensitive: true
+    default: ""
+  croc_receive_code:
+    type: string
+    description: croc code for a croc receive in the container pre-commands (uploads, a transfer's receiver)
+    sensitive: true
+    default: ""
+  croc_send_code:
+    type: string
+    description: croc code for a croc send in the download commands (downloads, a transfer's sender)
+    sensitive: true
+    default: ""
+  croc_relay_password:
+    type: string
+    description: Password of the croc relay
+    sensitive: true
+    default: ""
   command_b64:
     type: string
     description: Gzip-compressed and base64-encoded shell command(s) to execute on the remote host
@@ -68,6 +97,14 @@ grains:
       agent:
         name: '{{ .inputs.agent }}'
       # __TT_CREDENTIAL_AUTH__
+      env-vars:
+        - TT_SSH_PRIVATE_KEY: '{{ .inputs.ssh_private_key }}'
+        - TT_SSH_PASSWORD: '{{ .inputs.ssh_password }}'
+        - TT_AUX_SSH_PRIVATE_KEY: '{{ .inputs.aux_ssh_private_key }}'
+        - TT_AUX_SSH_PASSWORD: '{{ .inputs.aux_ssh_password }}'
+        - TT_CROC_RECEIVE_CODE: '{{ .inputs.croc_receive_code }}'
+        - TT_CROC_SEND_CODE: '{{ .inputs.croc_send_code }}'
+        - TT_CROC_RELAY_PASSWORD: '{{ .inputs.croc_relay_password }}'
       activities:
         deploy:
           commands:
@@ -116,7 +153,7 @@ grains:
                 export __TT_CRED_CTX
                 __TT_REDACT_PY=$(mktemp)
                 cat > "$__TT_REDACT_PY" <<'__TT_REDACT_EOF'
-                import json, os, sys
+                import json, os, select, sys
 
                 try:
                     with open(os.environ.get("__TT_CRED_CTX", ""), "r") as _f:
@@ -141,6 +178,16 @@ grains:
                         continue
                     secrets.append(v)
 
+                # torque-tunnel's own secrets (the sensitive inputs, see env-vars). Nothing
+                # here prints them, but a command could. A multi-line value (a key) is masked
+                # line by line, as output shows it; its -----BEGIN/END----- armour is not
+                # secret and stays readable. Short values are left alone, as above.
+                for n in os.environ.get("__TT_OWN_SECRETS", "").split():
+                    for part in os.environ.get(n, "").replace("\r", "").split("\n"):
+                        part = part.strip()
+                        if len(part) >= minlen and not part.startswith("-----"):
+                            secrets.append(part)
+
                 # Longest first, so a secret that contains another is masked whole.
                 secrets = sorted(set(secrets), key=len, reverse=True)
 
@@ -162,18 +209,48 @@ grains:
 
                 # Operate on bytes so arbitrary command output cannot break the filter on decoding.
                 secrets_b = [s.encode("utf-8", "surrogateescape") for s in secrets]
-                stdin = sys.stdin.buffer
-                while True:
-                    line = stdin.readline()
-                    if not line:
-                        break
+                longest = max((len(s) for s in secrets_b), default=0)
+
+                def mask(b):
                     for s in secrets_b:
-                        if s in line:
-                            line = line.replace(s, b"***")
-                    out.write(line)
-                    out.flush()
+                        if s in b:
+                            b = b.replace(s, b"***")
+                    return b
+
+                def unsafe_tail(b):
+                    # Where the end of b might be the start of a secret still arriving.
+                    for i in range(max(0, len(b) - longest + 1), len(b)):
+                        if any(s.startswith(b[i:]) for s in secrets_b):
+                            return i
+                    return len(b)
+
+                # Chunk by chunk rather than line by line, so progress bars (redrawn with
+                # \r) and prompts without a newline still stream as they come: everything
+                # up to the last line break goes out at once, the rest after a short
+                # pause - minus a tail that could be the start of a secret.
+                fd = sys.stdin.fileno()
+                held = b""
+                while True:
+                    if held and not select.select([fd], [], [], 0.2)[0]:
+                        cut = unsafe_tail(held)
+                    else:
+                        data = os.read(fd, 65536)
+                        if not data:
+                            break
+                        held += data
+                        cut = max(held.rfind(b"\n"), held.rfind(b"\r")) + 1
+                    if cut:
+                        out.write(mask(held[:cut]))
+                        out.flush()
+                        held = held[cut:]
+                out.write(mask(held))
+                out.flush()
                 __TT_REDACT_EOF
-                if [ -s "$__TT_CRED_CTX" ] && command -v python3 >/dev/null 2>&1; then
+                # Masks the credential's secrets and torque-tunnel's own wherever this
+                # script's output can carry them: setup, command and download output.
+                __TT_OWN_SECRETS="TT_SSH_PRIVATE_KEY TT_SSH_PASSWORD TT_AUX_SSH_PRIVATE_KEY TT_AUX_SSH_PASSWORD TT_CROC_RECEIVE_CODE TT_CROC_SEND_CODE TT_CROC_RELAY_PASSWORD"
+                export __TT_OWN_SECRETS
+                if command -v python3 >/dev/null 2>&1; then
                   __tt_filter() { python3 -u "$__TT_REDACT_PY"; }
                 else
                   if [ -s "$__TT_CRED_CTX" ]; then
@@ -210,8 +287,8 @@ grains:
                       . "$INIT_FILE"
                     fi
                     bash "$__CONTAINER_PRE"
-                  )
-                  __PRE_RC=$?
+                  ) 2>&1 | __tt_filter
+                  __PRE_RC=${PIPESTATUS[0]}
                   rm -f "$__CONTAINER_PRE"
                   if [ $__PRE_RC -ne 0 ]; then
                     echo "ERROR: Container pre-commands failed (exit code: $__PRE_RC)" >&2
@@ -255,23 +332,20 @@ grains:
                 
                 # Wrap the main logic in a function so we can capture any errors
                 __run_main() {
-                  # Determine auth method: private key or password
-                  SSH_AUTH_ARGS=""
+                  # Determine auth method: private key or password. Both arrive as
+                  # environment variables (env-vars, from sensitive inputs), never in this
+                  # script's text, which Torque echoes into its log.
                   KEY_FILE=""
-                  SSH_PASS_PREFIX=""
-                  
-                  SSH_PASSWORD='{{ .inputs.ssh_password }}'
-                  SSH_PRIVATE_KEY='{{ .inputs.ssh_private_key }}'
-                  
-                  if [ -n "$SSH_PRIVATE_KEY" ]; then
+                  USE_SSHPASS=""
+
+                  if [ -n "${TT_SSH_PRIVATE_KEY:-}" ]; then
                     # Key-based authentication
                     KEY_FILE=$(mktemp)
-                    cat << 'KEYEOF' > "$KEY_FILE"
-                {{ .inputs.ssh_private_key }}
-                KEYEOF
+                    printf '%s' "$TT_SSH_PRIVATE_KEY" > "$KEY_FILE"
+                    # ssh rejects some key formats without their final newline
+                    if [ -n "$(tail -c 1 "$KEY_FILE")" ]; then echo >> "$KEY_FILE"; fi
                     chmod 600 "$KEY_FILE"
-                    SSH_AUTH_ARGS="-i $KEY_FILE"
-                  elif [ -n "$SSH_PASSWORD" ]; then
+                  elif [ -n "${TT_SSH_PASSWORD:-}" ]; then
                     # Password-based authentication using sshpass
                     if ! command -v sshpass &>/dev/null; then
                       # Try install without apt-get update first (~2s vs ~17s with update)
@@ -283,8 +357,7 @@ grains:
                         return
                       fi
                     fi
-                    SSH_AUTH_ARGS="-o PubkeyAuthentication=no"
-                    SSH_PASS_PREFIX="sshpass -p '$SSH_PASSWORD'"
+                    USE_SSHPASS=1
                   else
                     echo "ERROR: Either ssh_private_key or ssh_password must be provided." >&2
                     echo "1" > "$EXIT_CODE_FILE"
@@ -348,9 +421,10 @@ grains:
                   TIMEOUT_SECONDS=$(( {{ .inputs.timeout_minutes }} * 60 ))
                   
                   START_TIME=$(date +%s%3N 2>/dev/null || echo "$(date +%s)000")
-                  if [ -n "$SSH_PASS_PREFIX" ]; then
-                    timeout "${TIMEOUT_SECONDS}" \
-                    sshpass -p "$SSH_PASSWORD" \
+                  if [ -n "$USE_SSHPASS" ]; then
+                    # sshpass -e reads SSHPASS, so the password is not in the process list
+                    SSHPASS="$TT_SSH_PASSWORD" timeout "${TIMEOUT_SECONDS}" \
+                    sshpass -e \
                     ssh -o StrictHostKeyChecking=no \
                         -o UserKnownHostsFile=/dev/null \
                         -o LogLevel=ERROR \
@@ -394,8 +468,8 @@ grains:
                   if [ -s "$INIT_FILE" ]; then
                     . "$INIT_FILE"
                   fi
-                  bash "$__DL_CMDS"
-                  __DL_CMD_RC=$?
+                  bash "$__DL_CMDS" 2>&1 | __tt_filter
+                  __DL_CMD_RC=${PIPESTATUS[0]}
                   if [ $__DL_CMD_RC -ne 0 ]; then
                     echo "WARNING: Download commands failed (exit code: $__DL_CMD_RC)" >&2
                   fi

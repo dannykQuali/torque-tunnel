@@ -10,11 +10,11 @@ text with exactly ONE contiguous block inserted — i.e. nothing the user had wa
 removed, reordered, or rewritten.
 """
 
-import itertools
 import json
 import math
 import os
 import sys
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
@@ -25,31 +25,76 @@ from torque_tunnel import onboarding
 # Driving merge_entry on raw text (bytes preserved exactly — no newline xlat)
 # --------------------------------------------------------------------------
 
-_example_dirs: dict = {}
-_example_numbers = itertools.count()
+class MemoryPath:
+    """A config file held in memory instead of on disk, for the property suites.
 
+    Opening a file costs ~5 ms on the Windows dev machine (each new file is scanned),
+    and every example opened four, so disk I/O was ~80% of those suites' runtime.
+    They test merge_entry's TEXT logic, which runs unchanged here: run_merge points
+    its two file helpers at this object. Its disk side (atomic replace, lock retries,
+    backup, verify-or-restore, real CRLF/BOM round-trips) is covered by the real-file
+    tests in test_onboarding_hardening, test_onboarding and the corpus.
 
-def fresh_path(tmp_path_factory, prefix, filename):
-    """A path named `filename` in a new, empty directory - one per Hypothesis example.
-
-    `tmp_path_factory.mktemp()` per example was the bulk of these suites' runtime:
-    to number a directory it scans every directory already under the shared base
-    temp dir, which made thousands of examples quadratic. Here each test prefix gets
-    ONE mktemp'd parent, and each example a plain mkdir inside it.
+    Text is stored as decoded exactly as merge_entry reads a file (UTF-8, no newline
+    translation, a BOM kept as U+FEFF).
     """
-    parent = _example_dirs.get(prefix)
-    if parent is None:
-        parent = _example_dirs[prefix] = tmp_path_factory.mktemp(prefix)
-    directory = parent / str(next(_example_numbers))
-    directory.mkdir()
-    return directory / filename
+
+    def __init__(self, name="c.json", files=None):
+        self.name = name
+        self._files = {} if files is None else files
+
+    def exists(self):
+        return self.name in self._files
+
+    def read_bytes(self):
+        return self._files[self.name].encode("utf-8")
+
+    def write_bytes(self, data):
+        self._files[self.name] = data.decode("utf-8")
+
+    def with_name(self, name):
+        return MemoryPath(name, self._files)
+
+    @property
+    def parent(self):
+        return self
+
+    def mkdir(self, parents=False, exist_ok=False):
+        pass
+
+    # Stand-ins for onboarding._read_text_keep_newlines / _write_text_exact
+    def _read_text(self):
+        try:
+            return self._files[self.name]
+        except KeyError:
+            raise FileNotFoundError(self.name) from None
+
+    def _write_text(self, text):
+        self._files[self.name] = text
+
+    def __repr__(self):
+        return f"MemoryPath({self.name!r})"
+
+
+def memory_path(filename):
+    """A fresh, empty in-memory file named `filename` - one per Hypothesis example."""
+    return MemoryPath(filename)
+
 
 def run_merge(path, before_text, *, family, entry, server_name="torque-tunnel", make_backup=False):
     """Write `before_text` (or leave absent if None) to `path`, run merge_entry,
-    return (result, after_text or None). Bytes are written/read verbatim."""
+    return (result, after_text or None). Bytes are written/read verbatim.
+    `path` is a real path or a MemoryPath."""
     if before_text is not None:
         path.write_bytes(before_text.encode("utf-8"))
-    res = onboarding.merge_entry(path, family, entry, server_name=server_name, make_backup=make_backup)
+    if isinstance(path, MemoryPath):
+        with mock.patch.object(onboarding, "_read_text_keep_newlines", MemoryPath._read_text), \
+             mock.patch.object(onboarding, "_write_text_exact", MemoryPath._write_text):
+            res = onboarding.merge_entry(path, family, entry, server_name=server_name,
+                                         make_backup=make_backup)
+    else:
+        res = onboarding.merge_entry(path, family, entry, server_name=server_name,
+                                     make_backup=make_backup)
     after = path.read_bytes().decode("utf-8") if path.exists() else None
     return res, after
 

@@ -2,14 +2,40 @@
 
 ```bash
 python -m pip install -r requirements-dev.txt
-python -m pytest tests -n 16 --dist worksteal     # whole suite, ~50 s
+python -m pytest tests -n 16 --dist worksteal     # whole suite, ~20-25 s
 python -m pytest tests/test_remote_transfer_tool.py  # one file, serially
 ```
 
-On the 22-core dev laptop the suite takes **~50 s in parallel** and ~3 min serially (it
-took ~6 min before 2026-11-03). `--dist worksteal` matters: the long Hypothesis tests
-otherwise tend to start late and trail at the end. 16 workers beat `-n auto` (22): with
-more workers, Windows file I/O contention slows everything.
+On the 22-core dev laptop the suite takes **~20-25 s in parallel** and ~1:45 serially
+(2026-11-06; it was ~57 s / ~3:15 before, and ~6 min before 2026-11-03). Of the parallel
+time, ~8 s is startup: xdist has every worker import and collect every test module, and
+16 of them doing so at once take ~9 s where one takes ~3 s. 8 to 16 workers end up within
+noise of each other; `--dist worksteal` keeps a slow file from trailing at the end.
+
+## Where the time went (profiled 2026-11-06)
+
+- **Opening a file costs ~5 ms here** (each new file is scanned). The onboarding property
+  suites (Hypothesis, thousands of examples) opened four per example and spent ~80% of
+  their time in `open()`: ~83 s of a 196 s serial run, and a 21 s test that capped the
+  parallel run. They now run the real `merge_entry` against an in-memory file
+  (`_onboarding_invariants.MemoryPath`); its disk side is covered by the real-file tests.
+  Do not go back to per-example files on disk.
+- **Every `TorqueClient` built its own SSL context**, loading the whole CA bundle (~15 ms,
+  more per proxy transport): ~2 s per 8 tool-level tests. It is now built once per
+  process (`torque_client._shared_ssl_context`), which also helps production, where a
+  tool call creates several clients.
+- **Fixed waits in timing-based code** are module constants so tests can shrink them:
+  the send monitor's tick, the relay monitor's tick, and the local receive wrapper's
+  polls and startup pause (`CROC_RECEIVE_GATE_POLL_SECONDS`,
+  `CROC_RECEIVE_CROC_POLL_SECONDS`, `CROC_RECEIVE_STARTUP_CHECK_SECONDS`). A harness that
+  runs generated croc commands must shrink every tick its scripts use - one left at the
+  production 0.5 s made each sender test ~0.5 s slower.
+- What is left is mostly the WSL-run shell tests (~half of the parallel busy time): their
+  scripts and fakes live under `/mnt/c`, which WSL serves over 9P, and that contends
+  under 16 workers. WSL launches themselves are not the problem (~0.15 s, and they run
+  concurrently).
+- `PYTHONDONTWRITEBYTECODE=1` (set in some agent shells) stops pytest caching rewritten
+  test modules, but it measured within noise of an unset run at 16 workers.
 
 ## Shell scripts run under WSL
 
@@ -44,10 +70,9 @@ instead of minutes, with the same check counts. A fake croc that "waits" or "han
 only needs to outlast the shortened window; use `exec sleep` so the monitor's kill
 reaches it.
 
-Hypothesis suites must not call `tmp_path_factory.mktemp()` per example. It scans every
-existing numbered directory, which is quadratic over thousands of examples. Use
-`_onboarding_invariants.fresh_path()`: one parent directory per test, a plain `mkdir`
-per example. What is left in those suites is real file I/O through the code under test.
+Hypothesis suites must not touch the disk per example: `tmp_path_factory.mktemp()` scans
+every existing numbered directory (quadratic over thousands of examples), and even plain
+files cost ~5 ms per open. Use `_onboarding_invariants.memory_path()` with `run_merge()`.
 
 ## Live tests
 

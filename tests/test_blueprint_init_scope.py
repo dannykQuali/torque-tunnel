@@ -25,6 +25,7 @@ import yaml
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
+from torque_tunnel import croc_manager
 from torque_tunnel.torque_client import TorqueClient
 
 import _bash_harness as bh
@@ -81,8 +82,6 @@ class TestPreCommandsSeeTheProfileInit:
                 "credential_context_b64": "",
                 "ssh_user": "root",
                 "target_ip": "10.9.9.9",
-                "ssh_private_key": "-----BEGIN KEY-----\nnot-a-key\n-----END KEY-----",
-                "ssh_password": "",
                 "timeout_minutes": "1",
             }
             rendered = re.sub(r"\{\{ \.inputs\.(\w+) \}\}",
@@ -93,7 +92,11 @@ class TestPreCommandsSeeTheProfileInit:
             bh.write_text(script, f'export PATH="{fake_bin_posix}:$PATH"\n'
                                   "unset http_proxy https_proxy no_proxy HTTP_PROXY HTTPS_PROXY NO_PROXY\n"
                                   + FAKE_TIMEOUT_FUNC + rendered + "\n")
-            proc = bh.run_script(script, env={"FAKE_DIR": control})
+            # The key reaches the script as an environment variable, as the grain's
+            # env-vars deliver it.
+            proc = bh.run_script(script, env={
+                "FAKE_DIR": control,
+                croc_manager.SSH_PRIVATE_KEY_ENV: "-----BEGIN KEY-----\nnot-a-key\n-----END KEY-----"})
             calls = control / "ssh_calls"
             return proc, calls.exists()
 
