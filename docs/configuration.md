@@ -25,7 +25,6 @@ host: 10.0.0.1
 init_commands: "export HTTP_PROXY=http://proxy:80"
 # finally_commands: ""
 # auto_delete_environments: false   # leave off — see the warning under Available Keys
-# verbose: false
 # container_idle_timeout: 86400
 
 # ── Default profile ─────────────────────────────────────────────────
@@ -87,7 +86,6 @@ These can appear at the top level and/or inside any profile:
 | `init_commands` | Commands to run before every command (on the SSH target, or in the container). The usual place for proxy settings (`export HTTPS_PROXY=...`). For SSH targets they also run on the agent's runner container before croc file transfers, uploads and downloads alike, in a subshell there, so keep them to things that make sense on both (exports). |
 | `finally_commands` | Commands to run after every SSH command |
 | `auto_delete_environments` | **Off by default — leave it off.** Purges each environment's records from Torque's DB after termination. See [the warning below](#auto_delete_environments-use-at-your-own-risk). |
-| `verbose` | Show full unfiltered output |
 | `container_idle_timeout` | Idle timeout for persistent containers (seconds, default 86400 = 24h). The container's Torque scheduled end time is set to `now + idle_timeout` after every command (absolute — it both extends and shrinks), so the container dies exactly this long after its last use. At command start the end is armed to `now + max(idle_timeout, command_timeout + 30min)` so a running command can never outlive its container. The initial duration at creation is also `idle_timeout`. |
 | `retry_enabled` | Master switch for transient-error retries + idempotent creates (default `true`) |
 | `retry_budget_seconds` | Max consecutive outage tolerated while polling/monitoring, in seconds (default `600`, sized for a ~10-min Torque redeploy) |
@@ -159,6 +157,17 @@ These are recognized inside profiles but are not configuration values:
 | `expose_values` | Whether `list_profiles` shows this profile's values or just key names (default: `false`) |
 
 > **Note:** `expose_values` is **not** inherited through `extends`. Each level (top-level and each profile) independently controls whether its own values are exposed.
+
+### Command-line-only settings
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--raw-log off\|fallback\|always` | `off` | How much of Torque's raw grain log is returned. The raw log is Torque's echo of the rendered grain script, which holds every input, SSH private keys included, so by default it is never returned. See [raw-log.md](raw-log.md). |
+
+These cannot be set in the config file, a profile, an environment variable or a tool
+argument — only on the command line (for the MCP server, in the `args` of its entry in
+the client's MCP config). The old `verbose` config key is gone; a config file that still
+has it gets a warning on stderr and the key is ignored.
 
 ## Resolution Order
 

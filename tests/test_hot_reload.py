@@ -657,7 +657,6 @@ class TestCliOverrides:
             "ssh_user": "file-user",
             "host": "file-host",
             "init_commands": "echo hello",
-            "verbose": True,
             "container_idle_timeout": 3600,
         }), encoding="utf-8")
         mcp_tool._config_explicit_path = str(config_dir)
@@ -673,5 +672,4 @@ class TestCliOverrides:
         assert mcp_tool._config["default_ssh_user"] == "file-user"
         assert mcp_tool._config["default_target_ip"] == "file-host"
         assert mcp_tool._config["init_commands"] == "echo hello"
-        assert mcp_tool._config["verbose"] is True
         assert mcp_tool._config["container_idle_timeout"] == 3600

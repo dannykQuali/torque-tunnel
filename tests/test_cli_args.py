@@ -162,7 +162,7 @@ def test_common_defaults_present_when_absent(monkeypatch):
     args = p.parse_args(["ssh", "echo hi"])
     assert args.host is None
     assert args.torque_url is None
-    assert args.verbose is False
+    assert args.raw_log == "off"
     assert args.auto_delete_environments is False
     assert args.container_idle_timeout == 86400
 

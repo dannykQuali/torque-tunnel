@@ -31,7 +31,6 @@ CONFIG_KEY_MAP = {
     "init_commands": "init_commands",
     "finally_commands": "finally_commands",
     "auto_delete_environments": "auto_delete_environments",
-    "verbose": "verbose",
     "container_idle_timeout": "container_idle_timeout",
     "retry_enabled": "retry_enabled",
     "retry_budget_seconds": "retry_budget_seconds",
@@ -62,6 +61,12 @@ PROFILE_TO_TOOL_ARG = {
 
 # All valid configuration keys (the YAML key names)
 VALID_CONFIG_KEYS = set(CONFIG_KEY_MAP.keys())
+
+# Keys torque-tunnel once read and now ignores, with what to do instead. Unknown keys are
+# ignored silently; these are named so a user relying on one learns that it stopped working.
+REMOVED_CONFIG_KEYS = {
+    "verbose": "use the --raw-log command-line flag (it cannot be set in the config file)",
+}
 
 # Metadata-only keys in profiles (not config values)
 _PROFILE_META_KEYS = {"description", "extends", "expose_values"}
@@ -265,6 +270,20 @@ def list_profiles(config: dict) -> list[dict]:
         }
         result.append(entry)
     return result
+
+
+def find_removed_keys(config: dict) -> list[tuple[str, str, str]]:
+    """(where, key, what to do instead) for each REMOVED_CONFIG_KEYS key in the config,
+    at the top level or in a profile."""
+    found = []
+    places = [("the top level", config)]
+    profiles = config.get("profiles")
+    if isinstance(profiles, dict):
+        places += [(f"profile '{name}'", values) for name, values in profiles.items()]
+    for where, values in places:
+        if isinstance(values, dict):
+            found += [(where, key, REMOVED_CONFIG_KEYS[key]) for key in REMOVED_CONFIG_KEYS if key in values]
+    return found
 
 
 def get_top_level_defaults(config: dict) -> dict:

@@ -70,7 +70,6 @@ BASE_CONFIG = {
     "init_commands": None,
     "finally_commands": None,
     "auto_delete_environments": False,
-    "verbose": False,
     "container_idle_timeout": 86400,
     "retry_enabled": True,
     "retry_budget_seconds": 600,

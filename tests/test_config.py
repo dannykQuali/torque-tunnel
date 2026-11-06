@@ -249,7 +249,6 @@ class TestApplyProfileToConfig:
             "init_commands": None,
             "finally_commands": None,
             "auto_delete_environments": False,
-            "verbose": False,
             "container_idle_timeout": 7200,
         }
         profile_values = {

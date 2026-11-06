@@ -239,7 +239,8 @@ async def test_a_sender_failure_before_ready_ends_it_and_launches_nothing_else()
 
 @pytest.mark.asyncio
 async def test_a_sender_environment_ending_without_ready_is_a_failure():
-    WORLD.next_logs = [["", "ssh: connect to host 10.0.0.1 port 22: No route to host"]]
+    WORLD.next_logs = [["", "=== Running container pre-commands ===\n"
+                            "ssh: connect to host 10.0.0.1 port 22: No route to host"]]
     WORLD.next_statuses = [["Deploying", "Active"]]
     text = await _transfer(_ssh("10.0.0.1", "alpha"), _ssh("10.9.9.9", "beta"))
 

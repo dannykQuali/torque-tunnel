@@ -17,6 +17,8 @@ from dataclasses import dataclass
 
 import httpx
 
+from . import raw_log
+
 # Resolve blueprints directory relative to this file:
 # src/torque_tunnel/torque_client.py -> ../../.. -> project root -> /blueprints
 _BLUEPRINTS_DIR = Path(__file__).resolve().parent.parent.parent / "blueprints"
@@ -940,7 +942,8 @@ class TorqueClient:
         outage_start: Optional[float] = None  # monotonic start of the current outage, if any
         outage_attempt = 0           # backoff attempt counter for the current outage
         last_log_content = ""  # Track actual content to detect rotation
-        output_marker = "=== Output (streaming) =========================================================================================================================\n"
+        output_marker = re.compile(re.escape(
+            "=== Output (streaming) =========================================================================================================================\n"))
         timestamp_pattern = re.compile(r'^\[\d{2}:\d{2}:\d{2}\.\d{3}\] ', re.MULTILINE)
 
         def _healthy_elapsed(now: float) -> float:
@@ -975,12 +978,9 @@ class TorqueClient:
                 partial_output = ""
                 try:
                     full_log = await self.get_grain_log(environment_id) or ""
-                    # Extract only the output after the streaming marker
-                    marker_pos = full_log.find(output_marker)
-                    if marker_pos != -1:
-                        partial_output = full_log[marker_pos + len(output_marker):]
-                    else:
-                        partial_output = full_log
+                    # Only the output after the streaming marker; without it, what
+                    # --raw-log allows (by default nothing - see raw_log.py)
+                    partial_output = raw_log.command_output(full_log, output_marker)
                     # Strip timestamps from each line - format is "[HH:MM:SS.mmm] "
                     partial_output = timestamp_pattern.sub('', partial_output)
                 except Exception:

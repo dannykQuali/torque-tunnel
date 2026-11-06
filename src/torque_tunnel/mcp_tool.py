@@ -39,49 +39,60 @@ from . import auth as auth_module
 from . import onboarding as onboarding_module
 from . import credentials as credentials_module
 from . import remote_transfer
+from . import raw_log
 
 
 # Shared compiled patterns for filtering grain/execution logs.
-# Used by create_log_streamer (MCP streaming), cli_log_callback (CLI streaming),
-# and filter_grain_log (complete-log filtering on failures/timeouts).
-# Marker pattern - matches both "=== Beginning of execution ===" and "=== Beginning of local execution ==="
-# Requires 50+ trailing = chars to avoid false positives from user output
-_EXECUTION_MARKER = re.compile(r'=== Beginning of (?:local )?execution ={50,}\n')
+# Used by create_log_streamer (MCP streaming), _background_stream_grain_log and
+# cli_log_callback (CLI streaming). Complete logs go through filter_grain_log.
+# What may be shown of a log is decided by the raw_log module (--raw-log).
+_EXECUTION_MARKER = raw_log.EXECUTION_MARKER
 # Pattern for first line: [HH:MM:SS.mmm] >> Running on container. Storage: . Task Id: XXX
 _FIRST_LINE_PATTERN = re.compile(r'^(\[\d{2}:\d{2}:\d{2}\.\d{3}\] >> Running on .+)$', re.MULTILINE)
 
 
-def filter_grain_log(raw_log: str) -> str:
-    """Filter a complete grain log to strip Torque preamble, keeping only command output.
-    
-    Uses the same execution marker as the streaming filters. Returns everything
-    after the marker, or the full log if no marker is found.
+def filter_grain_log(log: str) -> str:
+    """The part of a complete grain log that may be returned: the command output after
+    the execution marker. What happens without the marker depends on --raw-log (see
+    raw_log.command_output); by default only the job's setup output, never Torque's
+    echo of the script.
     """
-    if not raw_log:
-        return raw_log
-    if _config.get('verbose', False):
-        return raw_log
-    match = _EXECUTION_MARKER.search(raw_log)
-    if match:
-        return raw_log[match.end():]
-    return raw_log
+    return raw_log.command_output(log)
+
+
+def format_log_section(heading: str, log: Optional[str], tail_chars: Optional[int] = None) -> str:
+    """A "**heading:**" + code block section for a grain log, or "" when there is nothing.
+
+    The one way a tool result shows a grain log: it is filtered by --raw-log, and a log
+    withheld entirely says so (with how to see it) instead of disappearing silently.
+    """
+    if not log:
+        return ""
+    if raw_log.withheld(log):
+        return f"\n\n**{heading}:** {raw_log.HIDDEN_NOTE}"
+    shown = filter_grain_log(log)
+    if tail_chars is not None:
+        shown = shown[-tail_chars:]
+    if not shown.strip():
+        return ""
+    return f"\n\n**{heading}:**\n{format_code_block(shown)}"
 
 
 def create_log_streamer(session) -> Callable[[str, str], Awaitable[None]]:
     """Create a log callback that streams to stderr and MCP client.
-    
-    By default, filters output to skip Torque preamble and show only:
+
+    Filters output to skip the Torque preamble and show only:
     - First line with "Running on" info + environment URL
     - Command output after the execution marker
-    
-    Use --verbose flag or VERBOSE=true to show full output.
+
+    With --raw-log always, the full output is streamed instead.
     """
-    verbose = _config.get('verbose', False)
+    show_all = raw_log.stream_preamble()
     torque_url = _config.get('torque_url', '')
     torque_space = _config.get('torque_space', '')
-    
+
     # State for tracking streaming progress
-    state = {'found': verbose, 'first_line_shown': verbose, 'buffer': ''}
+    state = {'found': show_all, 'first_line_shown': show_all, 'buffer': ''}
     
     async def stream_log(content: str, environment_id: str = "") -> None:
         try:
@@ -1559,7 +1570,6 @@ _config = {
     "init_commands": None,
     "finally_commands": None,
     "auto_delete_environments": False,
-    "verbose": False,
     "container_idle_timeout": 86400,  # 24h: container dies this long after its last use
     # Resilience to Torque redeploys (transient API errors). See docs/design-api-resilience.md.
     "retry_enabled": True,
@@ -1594,6 +1604,13 @@ _config_error: Optional[str] = None  # Last config load/parse error (None = heal
 _default_profile_warning: Optional[str] = None  # Warning when default_profile references a non-existent profile
 
 
+def _warn_removed_config_keys(loaded: dict) -> None:
+    """Say on stderr that a config-file key torque-tunnel no longer reads is ignored."""
+    for where, key, instead in config_module.find_removed_keys(loaded):
+        print(f"Warning: '{key}' in {where} of the config file is no longer supported and "
+              f"is ignored; {instead}.", file=sys.stderr)
+
+
 def _reload_config() -> None:
     """Reload config file and update _config for non-CLI-overridden keys.
 
@@ -1619,6 +1636,7 @@ def _reload_config() -> None:
         raise
 
     _loaded_config = loaded
+    _warn_removed_config_keys(loaded)
 
     # Update file tracking
     path = config_module.find_config_file(_config_explicit_path)
@@ -1780,7 +1798,7 @@ async def _background_stream_grain_log(environment_id: str) -> None:
     Stops when a terminal status is detected.
     """
     last_log_len = 0
-    filter_state = {'found': _config.get('verbose', False), 'buffer': ''}
+    filter_state = {'found': raw_log.stream_preamble(), 'buffer': ''}
     
     try:
         while True:
@@ -3473,12 +3491,7 @@ async def handle_run_on_tunneled_ssh(arguments: dict, config: dict = None):
 {partial_block}"""
             # Include grain log on failure for debugging
             elif grain_log:
-                filtered_log = filter_grain_log(grain_log)
-                log_block = format_code_block(filtered_log)
-                output_text += f"""
-
-**Grain Execution Log:**
-{log_block}"""
+                output_text += format_log_section("Grain Execution Log", grain_log)
         
         # Add tip if command took >60s
         if result.execution_duration is not None and result.execution_duration > 60:
@@ -3825,12 +3838,7 @@ async def handle_run_on_tunneled_persistent_container(arguments: dict, config: d
 **Partial Output:**
 {partial_block}"""
             elif grain_log:
-                filtered_log = filter_grain_log(grain_log)
-                log_block = format_code_block(filtered_log)
-                output_text += f"""
-
-**Grain Execution Log:**
-{log_block}"""
+                output_text += format_log_section("Grain Execution Log", grain_log)
         
         if result.execution_duration is not None and result.execution_duration > 60:
             output_text += "\n\n**TIP:** This command took over 60 seconds. Consider using `run_on_tunneled_persistent_container_async` for similar long-running commands to get progress updates while waiting."
@@ -4009,12 +4017,7 @@ async def handle_run_on_tunneled_disposable_container(arguments: dict, config: d
 {partial_block}"""
             # Include grain log on failure for debugging
             elif grain_log:
-                filtered_log = filter_grain_log(grain_log)
-                log_block = format_code_block(filtered_log)
-                output_text += f"""
-
-**Grain Execution Log:**
-{log_block}"""
+                output_text += format_log_section("Grain Execution Log", grain_log)
         
         # Add tip if command took >60s
         if result.execution_duration is not None and result.execution_duration > 60:
@@ -4697,13 +4700,7 @@ This may indicate a deployment failure. Check the environment URL for details.""
                 # Try to get partial output
                 try:
                     grain_log = await client.get_grain_log(environment_id)
-                    if grain_log:
-                        filtered_log = filter_grain_log(grain_log)
-                        log_block = format_code_block(filtered_log[-2000:])
-                        output_text += f"""
-
-**Grain Execution Log (tail):**
-{log_block}"""
+                    output_text += format_log_section("Grain Execution Log (tail)", grain_log, 2000)
                 except Exception:
                     pass
                 
@@ -4711,25 +4708,19 @@ This may indicate a deployment failure. Check the environment URL for details.""
             
             # Cancelled/released
             elif status in ("released", "cancelled", "terminating", "force_terminated"):
-                partial_output = ""
+                grain_log = ""
                 try:
                     grain_log = await client.get_grain_log(environment_id) or ""
-                    partial_output = filter_grain_log(grain_log)
                 except Exception:
                     pass
-                
+
                 output_text = f"""Execution was cancelled.
 
 **Status:** CANCELLED
 **Environment:** {env_url}"""
-                
-                if partial_output.strip():
-                    partial_block = format_code_block(partial_output)
-                    output_text += f"""
 
-**Output before cancellation:**
-{partial_block}"""
-                
+                output_text += format_log_section("Output before cancellation", grain_log)
+
                 # Auto-cleanup
                 if cfg["auto_delete_environments"]:
                     try:
@@ -4741,25 +4732,19 @@ This may indicate a deployment failure. Check the environment URL for details.""
             
             # Still running - get partial output
             else:
-                partial_output = ""
+                grain_log = ""
                 try:
                     grain_log = await client.get_grain_log(environment_id) or ""
-                    partial_output = filter_grain_log(grain_log)
                 except Exception:
                     pass
-                
+
                 output_text = f"""Command is still running.
 
 **Status:** RUNNING
 **Environment:** {env_url}"""
-                
-                if partial_output.strip():
-                    partial_block = format_code_block(partial_output)
-                    output_text += f"""
 
-**Partial Output (so far):**
-{partial_block}"""
-                
+                output_text += format_log_section("Partial Output (so far)", grain_log)
+
                 output_text += f"""
 
 Call `get_execution_status` again with {follow_up} and wait=10 to check progress."""
@@ -5088,10 +5073,9 @@ async def _wait_for_sender_ready(connection: dict, environment_id: str, deadline
             return report, ""
         if status in _TERMINAL_STATUSES:
             torque_errors = _environment_errors(env_data)
-            tail = format_code_block(filter_grain_log(log)[-1500:]) if log else ""
             return report, (f"the sending environment ended ({raw}) before its croc sender was ready"
                             + (f" - Torque: {torque_errors}" if torque_errors else "")
-                            + (f"\n\n**Sender log (tail):**\n{tail}" if tail else ""))
+                            + format_log_section("Sender log (tail)", log, 1500))
         if time.monotonic() > deadline:
             return report, "timed out waiting for the sender to copy, hash and register its files"
         await asyncio.sleep(TRANSFER_POLL_SECONDS)
@@ -5389,8 +5373,9 @@ async def _check_transfer(handle: _TransferHandle, wait_seconds: float):
             lines.append(f"**Progress:** {receiver.progress}")
     if state.status == "FAILED":
         tail_log = s_log if (sender is not None and sender.failure and not receiver.failure) else r_log
-        if tail_log:
-            lines.append("\n**Log (tail):**\n" + format_code_block(filter_grain_log(tail_log)[-1500:]))
+        tail_section = format_log_section("Log (tail)", tail_log, 1500)
+        if tail_section:
+            lines.append("\n" + tail_section.lstrip("\n"))
     if direct:
         lines.append(f"\n**Environment:** {_environment_url(receiver_conn, receiver_id)}")
     else:
@@ -5534,17 +5519,17 @@ async def cli_dispatch(args):
     """Dispatch CLI commands to appropriate handlers."""
     import json as json_module
     
-    verbose = getattr(args, 'verbose', False)
+    show_all = raw_log.stream_preamble()
     torque_url = _config.get('torque_url', '')
     torque_space = _config.get('torque_space', '')
-    
+
     def cli_log_callback(content: str):
         """Simple callback that prints to stderr for CLI streaming."""
         # State for tracking streaming progress
-        # - found: whether we've passed the execution marker (verbose=True skips filtering)
+        # - found: whether we've passed the execution marker (--raw-log always skips filtering)
         # - first_line_shown: whether we've printed the "Running on" header line
         # - buffer: accumulated data for finding markers
-        state = {'found': verbose, 'first_line_shown': verbose, 'buffer': ''}
+        state = {'found': show_all, 'first_line_shown': show_all, 'buffer': ''}
         
         async def _stream(data: str, environment_id: str = ""):
             if state['found']:
@@ -6440,7 +6425,8 @@ def build_parser():
         "init_commands": os.environ.get("INIT_COMMANDS"),
         "finally_commands": os.environ.get("FINALLY_COMMANDS"),
         "auto_delete_environments": os.environ.get("AUTO_DELETE_ENVIRONMENTS", "").lower() in ("true", "1", "yes"),
-        "verbose": False,
+        # Deliberately NOT env-backed (nor in the config file): see raw_log.py.
+        "raw_log": raw_log.OFF,
         "container_idle_timeout": int(os.environ.get("CONTAINER_IDLE_TIMEOUT", "86400")),
     }
     common_parser = argparse.ArgumentParser(add_help=False)
@@ -6511,10 +6497,14 @@ def build_parser():
         help="Automatically delete environments after completion",
     )
     common_parser.add_argument(
-        "--verbose", "-v",
-        action="store_true",
+        "--raw-log",
+        choices=raw_log.MODES,
         default=argparse.SUPPRESS,
-        help="Show full output including Torque preamble (default: skip to '=== Beginning of execution ===' marker)",
+        help="How much of Torque's raw grain log to return. The raw log holds the rendered "
+             "script with every input, SSH keys included. off (default): only the command's "
+             "output; fallback: also the whole raw log when the command never started "
+             "(still in setup, cancelled, failed or timed out before it); always: the whole "
+             "raw log everywhere, streaming included. Settable only by this flag.",
     )
     common_parser.add_argument(
         "--container-idle-timeout",
@@ -6839,6 +6829,8 @@ def main():
     """Main entry point - supports both MCP server mode and CLI commands."""
     parser = build_parser()
     args = parser.parse_args()
+    # The only place the raw-log mode is ever set (see raw_log.py).
+    raw_log.set_mode(args.raw_log)
 
     # The 'register-mcp-client' subcommand registers this MCP server with AI
     # clients. It does not need Torque config loaded, and handling it early
@@ -6855,10 +6847,11 @@ def main():
         _config_error = f"Failed to load config file: {e}"
         print(f"Warning: {_config_error}. Tools will fail until the config is fixed.", file=sys.stderr)
         _loaded_config = {}
-    
+    _warn_removed_config_keys(_loaded_config)
+
     # Apply config file defaults as base values
     file_defaults = config_module.get_defaults(_loaded_config)
-    
+
     # Apply startup profile (--profile or default_profile from config) on top of defaults
     startup_profile = getattr(args, 'profile', None)
     is_default_profile = False
@@ -6906,7 +6899,6 @@ def main():
     _config["finally_commands"] = args.finally_commands or file_defaults_with_profile.get("finally_commands")
     # Boolean/numeric: argparse defaults to False/86400, so only override from file if argparse didn't set explicitly
     _config["auto_delete_environments"] = args.auto_delete_environments or file_defaults_with_profile.get("auto_delete_environments", False)
-    _config["verbose"] = args.verbose or file_defaults_with_profile.get("verbose", False)
     _config["container_idle_timeout"] = args.container_idle_timeout if args.container_idle_timeout != 86400 else file_defaults_with_profile.get("container_idle_timeout", 86400)
     # No CLI flags for these by design: they are set in the config file or by the setup UI,
     # because enabling credentials is a deliberate per-profile decision rather than a
@@ -6936,7 +6928,6 @@ def main():
     if args.init_commands: _cli_overrides.add("init_commands")
     if args.finally_commands: _cli_overrides.add("finally_commands")
     if args.auto_delete_environments: _cli_overrides.add("auto_delete_environments")
-    if args.verbose: _cli_overrides.add("verbose")
     if args.container_idle_timeout != 86400: _cli_overrides.add("container_idle_timeout")
     # Track config file for hot-reload watcher
     cfg_path = config_module.find_config_file(_config_explicit_path)
