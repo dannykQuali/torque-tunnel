@@ -109,7 +109,7 @@ on stdout, which reach the local machine through the streamed grain log:
 |---|---|
 | `__CROC_DL_SIZE__ <bytes> <croc_filename>` | Staged file size (one per regular file) |
 | `__CROC_DL_MD5__ <md5hex> <croc_filename>` | Staged file content hash (one per regular file) |
-| `__CROC_SEND_READY__` | croc printed `Code is:` — the relay room is registered |
+| `__CROC_SEND_READY__` | croc printed `Code is:` **and** holds a live TCP connection — the relay room is registered (see *READY means a live relay connection*) |
 | `__CROC_SEND_RETRY__` | send failed; the wrapper restarts croc send once |
 | `__CROC_DL_DONE__ exit_code=N` | send finished (rc 0/124/137/143) |
 | `__CROC_DL_FAILED__ exit_code=N` | send failed after the retry; wrapper exits 1 |
@@ -207,6 +207,24 @@ default profile's connection, so an async call whose profile pointed at another 
 instance or space was polled on the wrong one. For a download, that also meant the
 gated local receiver never saw READY. The `_async` tools' results name the `profile`
 in the follow-up calls they suggest.
+
+**Location overrides travel with the follow-up calls too** (2026-11-11). An async run
+started with `torque_space` (or `torque_url` / `torque_token`) lives where that override
+put it, not where its profile points. On 2026-11-09 `get_execution_status`, given the
+profile the start result named, looked in the profile's space and reported "not found".
+Now:
+- the remembered connection wins whenever the call names the **same** profile (or none),
+  so in the server that started it the override is kept;
+- the start result names every location value its profile would not give back, e.g.
+  `environment_id="…", profile="beta", torque_space="OtherSpace"`. A token override is
+  asked for, never written out: `torque_token=<the torque_token you started it with>`;
+- `get_execution_status` and `cancel_execution` accept `torque_space`, `torque_url` and
+  `torque_token`, which win over everything else (after a server restart they are all
+  there is);
+- "not found" names the space and URL it looked in.
+
+Those three are all that locate an environment: the agent, the SSH target and the rest
+only matter when one is launched.
 
 ## Relay per call
 
@@ -316,6 +334,80 @@ from the tunnel container: `CONNECT 142.132.189.179:9009` through
 registers its room normally. Note the receiving side is the **agent container**,
 not the SSH target — croc is never installed on the target, so `command -v croc`
 there is empty by design.
+
+## Relay reachability check
+
+**Found 2026-11-09.** Agent `mgmt-168-7` (Quali lab, 10.88.168.0/24) drops every TCP
+connection to ports 9009-9013, for any destination (`portquiz.net:9009` too), while 80,
+443 and 8080 go out. A remote-to-remote transfer from there copied and MD5-hashed a
+3.5 GB file, said the sender was "waiting for the receiver", and failed a minute later
+with the receiver's `room (secure channel) not ready` as its reason. The real cause,
+`dial tcp 142.132.189.179:9009: i/o timeout`, was only in the sender's raw log.
+
+So every croc job now starts by checking that its machine reaches the relay, before
+the croc install, any staging, or launching the other side:
+
+| Where | Check | On failure |
+|---|---|---|
+| Agent container: upload receive, download send, a transfer's sender and receiver | `croc_manager.generate_relay_check_step()` (bash, first lines of the job) | `ERROR: <side> cannot reach the croc relay <host:port>: <cause>` and, where the other side waits on sentinels, `<FAILED sentinel> exit_code=relay reason=…`; exit 1 |
+| This machine: before the local croc send (uploads) or receive (downloads) | `croc_manager.check_relay()` (Python, `_check_local_relay`) | the call returns `Error starting croc file transfer: this machine cannot reach the croc relay …` before any environment starts |
+
+The cause says which of these happened:
+- `connecting to H:P … timed out after 6 s (no answer at all: a firewall is probably dropping the port)`
+- `connection refused by H:P …`
+- `DNS lookup of H failed`
+- `the HTTP proxy X:Y refused CONNECT H:P: HTTP/1.1 403 …`
+- `connected to H:P, but no croc answer came within 6 s` / `H:P answered, but not as a croc relay` (a port that is open, but no croc relay is there: a web server, or a firewall inspecting the traffic)
+- `the relay answers on port 9009 but not on its data port 9011: …`
+
+**It costs nothing against the relay's rate limit.** The check sends croc's own `ping`
+frame (`croc` + uint32 LE length + `ping`). The relay answers `pong` and closes, before
+any room or handshake exists. In croc's relay (`src/tcp/tcp.go`), `clientHandshake`
+returns at once for a ping, and the admission limiter (the ~30 joins/IP/minute, see
+*Relay rate limiting*) runs in `clientCommunication`, which a ping never reaches. croc
+v11's own client sends the same ping to every relay of its public pool before each send
+(`src/publicrelay`), so this is the intended way to check a relay. The pong also proves
+the port really is a croc relay, which a plain TCP connect would not.
+
+**It goes the way croc goes.** croc dials through `SOCKS5_PROXY`, else `HTTP_PROXY` (its
+`--socks5` and `--connect` flags read exactly those variables), except to a private or
+loopback relay IP, which it dials directly (`utils.IsLocalIP`). The check does the same:
+with `HTTP_PROXY` it sends `CONNECT host:port` first (Basic auth when the URL has
+credentials), and it skips private relay IPs. A SOCKS5 proxy is not checked: the check
+says it skipped and croc tries as before.
+
+**Ports.** The relay's control port always. For the public relay
+(`croc.schollz.com:9009`), its data ports 9010-9013 as well. After the handshake the relay tells each side
+to open its transfer connections there, so a network can pass 9009 and still break
+the transfer. A private relay announces its data ports only after the handshake, so
+only its control port is checked. All ports are checked in parallel and bounded by
+`RELAY_CHECK_TIMEOUT_SECONDS` (6 s), so a blocked network costs 6 s, not 30.
+
+In bash it uses only builtins for the connection (`/dev/tcp`, `read -t`), in subshells
+a watchdog kills, so a hung connect cannot outlive the timeout and no `timeout`,
+`nc` or `python3` is needed on the agent.
+
+## READY means a live relay connection
+
+croc prints `Code is: …` **before** it dials the relay (croc `src/croc/croc.go`, `Send`:
+the code, then the connect goroutine). So `__CROC_SEND_READY__`, printed when the code
+appeared, proved nothing. On 2026-11-09 it came 5 s before the
+`dial tcp …:9009: i/o timeout`, and the transfer tool launched the receiver on it.
+croc logs a successful relay connection only at debug level, and debug output is not
+safe to keep (it is verbose and not scrubbed).
+
+The send monitor now announces READY only when croc's code has appeared **and** the croc
+process holds an ESTABLISHED TCP connection: `__tt_croc_connected` matches the socket
+inodes in `/proc/<pid>/fd` of croc (or its `timeout` wrapper's child) against the
+state-`01` rows of `/proc/net/tcp` and `/proc/net/tcp6`. `croc send --no-local` opens no
+other TCP connection, so a live one is the relay, or the HTTP proxy carrying it, which
+the relay check has just shown leads to the relay. This is pure bash plus `readlink`: no awk,
+`ss` or `pgrep`, which slim images lack. Where `/proc/net/tcp` cannot be read, the code
+alone counts, as before.
+
+After croc exits, READY is still announced for a croc that succeeded between two
+monitor polls, but no longer for one that failed. Announcing a room that never existed
+made the gated receiver connect into nothing.
 
 ## Relay address resolution (croc's 500 ms lookup)
 

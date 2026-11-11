@@ -95,7 +95,7 @@ Full reference: [docs/configuration.md](docs/configuration.md).
 | `run_on_tunneled_ssh_async` | Start an SSH command asynchronously; returns an execution ID |
 | `run_on_tunneled_persistent_container_async` | Start a persistent-container command asynchronously |
 | `run_on_tunneled_disposable_container_async` | Start a disposable-container command asynchronously |
-| `get_execution_status` | Check the status/output of an async execution by ID (pass the same `profile` if the command used one) |
+| `get_execution_status` | Check the status/output of an async execution by ID (pass the same `profile`, and any `torque_space` / `torque_url` / `torque_token` the start result names) |
 | `cancel_execution` | Cancel a running async execution (same `profile` rule) |
 
 ### File transfer between two remote machines

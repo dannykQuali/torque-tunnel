@@ -83,7 +83,8 @@ class FakeTorque:
 
     def _env(self, env_id):
         env = WORLD.envs.get(env_id)
-        if env is None or env["url"] != self.base_url:
+        # Torque finds an environment only in the space it lives in
+        if env is None or env["url"] != self.base_url or env["space"] != self.space:
             import httpx
             raise httpx.HTTPStatusError("not found", request=httpx.Request("GET", "x"),
                                         response=httpx.Response(404))
@@ -475,6 +476,103 @@ async def test_without_memory_or_profiles_the_other_torque_is_not_found():
     assert "not found" in text
 
 
+# A side started with a location override (2026-11-09: the receiver's torque_space
+# override made get_transfer_status "not find" it, from the very arguments the start
+# result gave).
+
+@pytest.mark.asyncio
+async def test_the_start_result_names_a_sides_space_override_and_status_finds_it():
+    WORLD.next_logs = [[sender_ready_log(), ""], [""]]
+    text = await _transfer(_ssh("10.0.0.1", "alpha"), _ssh("10.9.9.9", "beta", torque_space="SpaceB2"))
+    assert WORLD.by_role("receive")[0]["space"] == "SpaceB2"
+    assert 'receiver_torque_space="SpaceB2"' in text, text
+    assert "sender_torque_space" not in text
+
+    # As the result says, in this server (it remembers) ...
+    status = await _status("env-1", "env-2", sender_profile="alpha", receiver_profile="beta")
+    assert "**Status:** RUNNING" in status, status
+    # ... and after a restart (it does not)
+    mcp_tool._async_env_connections.clear()
+    status = await _status("env-1", "env-2", sender_profile="alpha", receiver_profile="beta",
+                           receiver_torque_space="SpaceB2")
+    assert "**Status:** RUNNING" in status, status
+    assert 'receiver_torque_space="SpaceB2"' in status   # the next follow-up says it again
+
+
+@pytest.mark.asyncio
+async def test_not_found_names_the_side_and_the_space_it_looked_in():
+    WORLD.next_logs = [[sender_ready_log(), ""], [""]]
+    await _transfer(_ssh("10.0.0.1", "alpha"), _ssh("10.9.9.9", "beta", torque_space="SpaceB2"))
+    mcp_tool._async_env_connections.clear()
+
+    text = await _status("env-1", "env-2", sender_profile="alpha", receiver_profile="beta")
+
+    assert "receiver's environment env-2" in text and "'SpaceB'" in text, text
+    assert "receiver_torque_space" in text
+
+
+@pytest.mark.asyncio
+async def test_a_sides_url_and_token_overrides_reach_status_and_cancel():
+    WORLD.next_logs = [[sender_ready_log(), ""], [""]]
+    text = await _transfer(_ssh("10.0.0.1", "alpha"),
+                           _ssh("10.9.9.9", "beta", torque_url="https://gamma.example.com",
+                                torque_token="g-s3cret"))
+    assert 'receiver_torque_url="https://gamma.example.com"' in text, text
+    assert "receiver_torque_token=<the torque_token you started it with>" in text
+    assert "g-s3cret" not in text
+    mcp_tool._async_env_connections.clear()
+
+    out = _text(await mcp_tool.call_tool("cancel_transfer", {
+        "sender_environment_id": "env-1", "receiver_environment_id": "env-2",
+        "sender_profile": "alpha", "receiver_profile": "beta",
+        "receiver_torque_url": "https://gamma.example.com", "receiver_torque_token": "g-s3cret"}))
+    assert WORLD.envs["env-2"]["ended"], out
+
+
+@pytest.mark.asyncio
+async def test_the_status_and_cancel_schemas_take_each_sides_location():
+    tools = {t.name: t for t in await mcp_tool.list_tools()}
+    for name in ("get_transfer_status", "cancel_transfer"):
+        props = set(tools[name].inputSchema["properties"])
+        for side in ("sender", "receiver"):
+            assert {f"{side}_torque_space", f"{side}_torque_url", f"{side}_torque_token"} <= props, name
+
+
+# Both sides failed: the sender is the cause (2026-11-09: the sender could not reach the
+# relay at all; the receiver's "room not ready" was reported as the reason).
+
+RELAY_TIMEOUT = ("could not connect to croc.schollz.com:9009: comm.NewConnection failed: "
+                 "dial tcp 142.132.189.179:9009: i/o timeout")
+ROOM_NOT_READY = ("croc file receive failed (exit code: 1): securing channel...room (secure channel) "
+                  "not ready, maybe peer disconnected")
+
+
+@pytest.mark.asyncio
+async def test_when_both_sides_failed_the_senders_failure_is_the_reason():
+    sender_log = ("=== Beginning of execution " + "=" * 60 + "\n"
+                  f"{RELAY_TIMEOUT}\n{croc_manager.CROC_SENTINEL_RETRY} (first attempt failed)\n"
+                  f"{RELAY_TIMEOUT}\n{croc_manager.CROC_SENTINEL_FAILED} exit_code=1 reason={RELAY_TIMEOUT}\n")
+    receiver_log = f"{croc_manager.CROC_RX_SENTINEL_FAILED} exit_code=1 reason={ROOM_NOT_READY}\n"
+    s, r = await _started_pair([sender_log], ["Active"], [receiver_log], ["Active"])
+
+    text = await _status(s, r)
+
+    reason = next(l for l in text.splitlines() if l.startswith("**Reason:**"))
+    assert reason.startswith("**Reason:** sender: ") and "i/o timeout" in reason, reason
+    assert reason.index("i/o timeout") < reason.index("room (secure channel) not ready"), reason
+    tail = text[text.index("Sender log (tail)"):]
+    assert "dial tcp 142.132.189.179:9009" in tail, text
+
+
+@pytest.mark.asyncio
+async def test_a_receiver_failure_alone_is_still_its_own_reason():
+    receiver_log = f"{croc_manager.CROC_RX_SENTINEL_FAILED} exit_code=1 reason=croc file receive failed: x is corrupt\n"
+    s, r = await _started_pair([""], ["Deploying"], [receiver_log], ["Active"])
+    text = await _status(s, r)
+    reason = next(l for l in text.splitlines() if l.startswith("**Reason:**"))
+    assert "corrupt" in reason and "sender" not in reason, reason
+
+
 @pytest.mark.asyncio
 async def test_an_unreadable_log_is_not_a_failure(monkeypatch):
     s, r = await _started_pair([""], ["Deploying"], [None], ["Active"])
@@ -536,6 +634,16 @@ def test_the_cli_parses_both_endpoints_and_files():
     assert mcp_tool._parse_transfer_files(args.file) == [
         {"source_path": "/a", "destination_path": "/b"},
         {"source_path": "/c", "destination_path": "/d", "mode": "644"}]
+
+
+def test_the_cli_takes_each_sides_torque_location():
+    args = _cli_args("--from-host", "10.0.0.1", "--from-space", "ipam-rollout-test",
+                     "--to-host", "10.9.9.9", "--to-space", "torque-tunnel",
+                     "--to-url", "https://gamma.example.com", "--to-token", "t", "--file", "/a:/b")
+    assert mcp_tool._cli_transfer_endpoint(args, "from")["torque_space"] == "ipam-rollout-test"
+    to = mcp_tool._cli_transfer_endpoint(args, "to")
+    assert (to["torque_space"], to["torque_url"], to["torque_token"]) == (
+        "torque-tunnel", "https://gamma.example.com", "t")
 
 
 @pytest.mark.parametrize("spec", ["/only-one", "/a:/b:/c", ":/b", "/a:"])

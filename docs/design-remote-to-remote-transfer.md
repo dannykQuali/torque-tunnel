@@ -253,9 +253,11 @@ Two dedicated tools (decided by DannyK 2026-11-03):
 ```jsonc
 get_transfer_status({ "sender_environment_id": "...", "receiver_environment_id": "...",
                       "sender_profile": "...", "receiver_profile": "...",   // optional
+                      "receiver_torque_space": "...",   // optional, only when the result names it
                       "wait": 10 })
 cancel_transfer({ "sender_environment_id": "...", "receiver_environment_id": "...",
                   "sender_profile": "...", "receiver_profile": "..." })
+// Both also take {sender,receiver}_torque_{space,url,token}; see "Location overrides per side".
 ```
 
 **When the call returns.** Sender-first ordering means B can only be launched after
@@ -312,6 +314,49 @@ for both. `get_transfer_status` recognizes equal ids and reads one environment.
 *As built:* the tool call remembers both connections (`_async_env_connections`), so a
 status call without profiles also works while the MCP server keeps running. After a
 restart, the profiles named in the follow-up text are needed.
+
+**Location overrides per side** (2026-11-11). An endpoint can name its own
+`torque_space` / `torque_url` / `torque_token`, and its environment then lives there,
+not where its profile points. On 2026-11-09 the receiver was started with
+`torque_space: torque-tunnel` while its profile's space was `ipam-rollout-test`, and
+`get_transfer_status`, called exactly as the result said (ids and profiles), answered
+`environment not found`. Now:
+- the remembered connection wins when the call names the same profile (or none), so
+  the override holds in the server that started the transfer;
+- the result names every value a side's profile would not give back:
+  `receiver_torque_space="torque-tunnel"`, `receiver_torque_url="…"`, and for a token
+  only `receiver_torque_token=<the torque_token you started it with>`, never its value;
+- `get_transfer_status` and `cancel_transfer` take `sender_torque_space`,
+  `sender_torque_url`, `sender_torque_token` and the same three for the receiver,
+  which win over everything else;
+- "not found" names the side, and the space and URL it looked in.
+
+Those three are all that locate an environment. The agent, the SSH target and the
+files only matter when an environment is launched. The `torque_agent` the endpoint
+named is in its environment already.
+
+**Which failure is the reason** (2026-11-11). When both sides failed, the sender's
+failure is the cause: the receiver only joins the sender's room, so its error
+(`room (secure channel) not ready, maybe peer disconnected`) is how the sender's
+failure looks from the receiver. The reason reads
+`sender: <the sender's error>; the receiver then failed too: <the receiver's>`, and the
+log tail shown is the sender's (`Sender log (tail)`). Before, the receiver's error was
+the reason and the sender's real one (`dial tcp …:9009: i/o timeout`) was only in its
+raw log. A receiver that failed on its own is still reported as before.
+
+**Both sides check the relay first** (see croc-file-transfer.md, *Relay reachability
+check*). The sender checks before its croc install and before staging anything. A
+relay it cannot reach ends the call at once:
+`Transfer failed before any data was sent: the sender failed: the sending side (agent mgmt-168-7) cannot reach the croc relay croc.schollz.com:9009: connecting to … timed out after 6 s …`.
+The receiver checks at the start of its job, so a receiving agent that cannot reach the
+relay fails in seconds, with `the receiving side (agent …)` in the reason. It can still
+only do that once it is launched, i.e. after the sender has staged and hashed. Checking
+the receiver's agent earlier would need a separate environment started in parallel
+with the sender. That is not built.
+
+**READY now means a live relay connection** (croc-file-transfer.md, *READY means a live
+relay connection*), so "the sender … is waiting for the receiver" is true when the call
+says it.
 
 ### Prerequisite fix: `profile` on `get_execution_status` / `cancel_execution`
 

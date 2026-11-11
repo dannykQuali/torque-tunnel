@@ -551,6 +551,282 @@ def _croc_global_flags(relay: str) -> str:
     return f"--relay {effective_relay(relay)} "
 
 
+# --- Relay reachability check ---
+# Before anything expensive (staging and hashing gigabytes, launching the other side),
+# each side checks that it can reach the croc relay, so a blocked port fails in seconds
+# with its real cause instead of minutes later as the OTHER side's "room not ready"
+# (2026-11-09: the Quali lab drops every TCP port 9009-9013, the public relay's).
+#
+# The check speaks croc's own protocol: a "ping" frame, answered "pong" by the relay
+# before any room or handshake exists (croc src/tcp/tcp.go: clientHandshake returns at
+# once for "ping"). The relay's admission limiter (~30 joins/IP/minute) counts room
+# joins only - it runs in clientCommunication, which a ping never reaches - so a check
+# costs nothing against that budget. The same pong also proves the port is a croc relay
+# and not just any open port.
+#
+# It goes the way croc goes: through SOCKS5_PROXY or HTTP_PROXY (croc's --socks5 and
+# --connect flags read exactly those variables), except to a private or loopback relay
+# address, which croc dials directly (utils.IsLocalIP). Through an HTTP proxy it sends
+# CONNECT first, as croc does. A SOCKS5 proxy is not checked: the check is skipped.
+RELAY_CHECK_TIMEOUT_SECONDS = 6
+
+# croc frames every message as "croc" + uint32 little-endian length + payload.
+RELAY_PING_FRAME = b"croc\x04\x00\x00\x00ping"
+
+# The public relay's data ports: after the handshake it tells each side to open its
+# transfer connections there (its banner). A network can pass the control port and
+# still drop these, so they are checked too - only for the default relay, whose ports
+# are known; a private relay announces its own only after the handshake.
+DEFAULT_RELAY_DATA_PORTS = (9010, 9011, 9012, 9013)
+
+# Where croc dials without a proxy (croc src/utils/utils.go privateIPBlocks + IsLocalIP).
+_CROC_LOCAL_NETWORKS = ("127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+                        "169.254.0.0/16", "::1/128", "fe80::/10", "fc00::/7")
+
+
+def _relay_port(relay: str) -> int:
+    """Port part of a relay address (croc's default 9009 when none is given)."""
+    if relay.startswith("["):
+        _, _, rest = relay.partition("]")
+        return int(rest[1:]) if rest.startswith(":") and rest[1:].isdigit() else 9009
+    if relay.count(":") == 1:
+        port = relay.rsplit(":", 1)[1]
+        return int(port) if port.isdigit() else 9009
+    return 9009
+
+
+def _croc_dials_directly(host: str) -> bool:
+    """True when croc ignores its proxy settings for this relay host."""
+    import ipaddress
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return any(ip in ipaddress.ip_network(net) for net in _CROC_LOCAL_NETWORKS
+               if ipaddress.ip_network(net).version == ip.version)
+
+
+def relay_check_ports(relay: str = "") -> list[int]:
+    """The ports a side must reach: the relay's control port, plus the public relay's
+    data ports."""
+    address = effective_relay(relay)
+    ports = [_relay_port(address)]
+    if address == DEFAULT_CROC_RELAY:
+        ports += list(DEFAULT_RELAY_DATA_PORTS)
+    return ports
+
+
+def generate_relay_check(relay: str, where: str, on_failure: list[str]) -> list[str]:
+    """Shell lines that check this machine reaches the croc relay, before anything else.
+
+    On failure ``__TT_RELAY_ERR`` holds a one-line explanation that starts with
+    ``where`` and names the relay, the port and the cause (timed out, refused, DNS,
+    the proxy's answer, or "not a croc relay"), and ``on_failure`` runs. Uses only bash
+    builtins for the connection (``/dev/tcp``), so a hung connect is simply killed.
+    """
+    address = effective_relay(relay)
+    host = _relay_host(address)
+    ports = relay_check_ports(relay)
+    ticks = RELAY_CHECK_TIMEOUT_SECONDS * 10
+    q = _shell_escape_single
+    lines = [
+        "# --- croc relay reachability check (a croc ping: no room join, no rate-limit cost) ---",
+        # One ping to $1:$2, through the HTTP proxy $3:$4 (Basic auth $5) when $3 is set.
+        # Prints the stage it reached: CONNECTED, TUNNEL (proxy said 200), then PONG or
+        # NOPONG; or "PROXY <status line>" when the proxy refused.
+        "__tt_relay_ping() {",
+        "  local line",
+        '  if [ -n "$3" ]; then',
+        '    exec 3<>"/dev/tcp/$3/$4" || exit 3',
+        "    echo CONNECTED",
+        '    if [ -n "$5" ]; then',
+        "      printf 'CONNECT %s:%s HTTP/1.1\\r\\nHost: %s:%s\\r\\nProxy-Authorization: Basic %s\\r\\n\\r\\n'"
+        ' "$1" "$2" "$1" "$2" "$5" >&3',
+        "    else",
+        "      printf 'CONNECT %s:%s HTTP/1.1\\r\\nHost: %s:%s\\r\\n\\r\\n' \"$1\" \"$2\" \"$1\" \"$2\" >&3",
+        "    fi",
+        '    IFS= read -r line <&3 || { echo "PROXY (no answer)"; exit 4; }',
+        "    line=${line%$'\\r'}",
+        '    case "$line" in HTTP/*" 200"*) ;; *) echo "PROXY $line"; exit 4 ;; esac',
+        "    while IFS= read -r line <&3; do [ -z \"${line%$'\\r'}\" ] && break; done",
+        "    echo TUNNEL",
+        "  else",
+        '    exec 3<>"/dev/tcp/$1/$2" || exit 3',
+        "    echo CONNECTED",
+        "  fi",
+        "  printf 'croc\\004\\000\\000\\000ping' >&3",
+        # The answer is "croc" + length + "pong"; read up to the "g" (NUL bytes vanish).
+        "  IFS= read -r -d g line <&3",
+        '  case "$line" in *pon) echo PONG ;; *) echo NOPONG ;; esac',
+        "}",
+        # __tt_relay_check HOST PORT...: every port at once, each bounded by the timeout.
+        "__tt_relay_check() {",
+        '  local h=$1 ph="" pp="" pa="" via="" px p t=0 res err i=0 pids="" busy dir',
+        "  shift",
+        '  __TT_RELAY_ERR=""',
+    ]
+    if not _croc_dials_directly(host):
+        lines += [
+            '  if [ -n "${SOCKS5_PROXY:-}" ]; then',
+            '    echo "[torque-tunnel] croc relay check skipped: croc goes through SOCKS5_PROXY"',
+            "    return 0",
+            "  fi",
+            '  if [ -n "${HTTP_PROXY:-}" ]; then',
+            '    px=${HTTP_PROXY#*://}; px=${px%%/*}',
+            '    case "$px" in *@*) pa=$(printf "%s" "${px%@*}" | base64 | tr -d "\\n"); px=${px##*@} ;; esac',
+            '    ph=${px%:*}; pp=${px##*:}',
+            '    [ "$ph" = "$px" ] && pp=80',
+            '    via=" through the HTTP proxy $ph:$pp"',
+            "  fi",
+        ]
+    lines += [
+        '  dir=$(mktemp -d)',
+        '  for p in "$@"; do',
+        '    ( __tt_relay_ping "$h" "$p" "$ph" "$pp" "$pa" ) >"$dir/$p.out" 2>"$dir/$p.err" &',
+        '    pids="$pids $!"',
+        "  done",
+        f'  while [ "$t" -lt {ticks} ]; do',
+        "    busy=0",
+        '    for i in $pids; do kill -0 "$i" 2>/dev/null && busy=1; done',
+        '    [ "$busy" -eq 0 ] && break',
+        "    sleep 0.1; t=$((t + 1))",
+        "  done",
+        '  for i in $pids; do kill -9 "$i" 2>/dev/null; wait "$i" 2>/dev/null; done',
+        '  for p in "$@"; do',
+        '    res=$(tail -n 1 "$dir/$p.out" 2>/dev/null)',
+        "    err=$(head -n 2 \"$dir/$p.err\" 2>/dev/null | sed -e 's/^bash: //' -e 's/^line [0-9]*: //' | tr '\\n' ' ')",
+        '    case "$res" in',
+        "      PONG) continue ;;",
+        '      NOPONG) __TT_RELAY_ERR="$h:$p answered$via, but not as a croc relay" ;;',
+        '      "PROXY "*) __TT_RELAY_ERR="the HTTP proxy $ph:$pp refused CONNECT $h:$p: ${res#PROXY }" ;;',
+        f'      TUNNEL) __TT_RELAY_ERR="the HTTP proxy $ph:$pp opened a tunnel to $h:$p, but no croc answer came within {RELAY_CHECK_TIMEOUT_SECONDS} s" ;;',
+        '      CONNECTED)',
+        '        if [ -n "$ph" ]; then __TT_RELAY_ERR="connected to the HTTP proxy $ph:$pp, but it did not answer CONNECT $h:$p'
+        f' within {RELAY_CHECK_TIMEOUT_SECONDS} s"',
+        f'        else __TT_RELAY_ERR="connected to $h:$p, but no croc answer came within {RELAY_CHECK_TIMEOUT_SECONDS} s"; fi ;;',
+        '      *)',
+        '        case "$err" in',
+        '          *"Connection refused"*) __TT_RELAY_ERR="connection refused by ${ph:-$h}:${pp:-$p}$via (nothing listens there, or a firewall rejects it)" ;;',
+        '          *"not known"*|*"name resolution"*|*"No address associated"*|*"nodename nor servname"*)'
+        ' __TT_RELAY_ERR="DNS lookup of ${ph:-$h} failed" ;;',
+        '          *"unreachable"*|*"No route to host"*) __TT_RELAY_ERR="no route to ${ph:-$h}:${pp:-$p}: $err" ;;',
+        f'          "") __TT_RELAY_ERR="connecting to ${{ph:-$h}}:${{pp:-$p}}$via timed out after {RELAY_CHECK_TIMEOUT_SECONDS} s'
+        ' (no answer at all: a firewall is probably dropping the port)" ;;',
+        '          *) __TT_RELAY_ERR="could not connect to ${ph:-$h}:${pp:-$p}$via: $err" ;;',
+        "        esac ;;",
+        "    esac",
+        '    if [ "$p" != "$1" ]; then __TT_RELAY_ERR="the relay answers on port $1 but not on its data port $p: $__TT_RELAY_ERR"; fi',
+        "    break",
+        "  done",
+        '  rm -rf "$dir"',
+        '  [ -z "$__TT_RELAY_ERR" ]',
+        "}",
+        f"if ! __tt_relay_check '{q(host)}' {' '.join(str(p) for p in ports)}; then",
+        f"  __TT_RELAY_ERR='{q(where)} cannot reach the croc relay {q(address)}: '\"$__TT_RELAY_ERR\"",
+        *(f"  {line}" for line in on_failure),
+        "fi",
+    ]
+    return lines
+
+
+def generate_relay_check_step(relay: str, where: str,
+                              failure_sentinel: Optional[str] = None) -> str:
+    """The relay check as the FIRST step of a croc job: before the croc install and any
+    staging. On failure it prints ``ERROR: <where> cannot reach the croc relay ...``,
+    the ``failure_sentinel`` line (``exit_code=relay reason=...``) when given, and
+    exits 1 - the same contract as the croc install's failure."""
+    on_failure = ['echo "ERROR: $__TT_RELAY_ERR" >&2']
+    if failure_sentinel:
+        on_failure.append(f'echo "{failure_sentinel} exit_code=relay reason=$__TT_RELAY_ERR"')
+    on_failure.append("exit 1")
+    return "\n".join(generate_relay_check(relay, where, on_failure))
+
+
+def _relay_ping_once(host: str, port: int, timeout: float) -> str:
+    """One croc ping from THIS machine, the way croc would dial. "" when the relay
+    answered, else why not."""
+    proxy = ""
+    if not _croc_dials_directly(host):
+        if os.environ.get("SOCKS5_PROXY"):
+            return ""  # croc goes through the SOCKS5 proxy; not checked
+        proxy = os.environ.get("HTTP_PROXY", "")
+    ph, pp, auth = "", 0, ""
+    if proxy:
+        from urllib.parse import urlsplit
+        parsed = urlsplit(proxy if "://" in proxy else "http://" + proxy)
+        ph, pp = parsed.hostname or "", parsed.port or 80
+        if parsed.username is not None:
+            import base64 as _b64
+            from urllib.parse import unquote
+            creds = f"{unquote(parsed.username)}:{unquote(parsed.password or '')}"
+            auth = _b64.b64encode(creds.encode()).decode()
+    via = f" through the HTTP proxy {ph}:{pp}" if ph else ""
+    dial_host, dial_port = (ph, pp) if ph else (host, port)
+    try:
+        sock = socket.create_connection((dial_host, dial_port), timeout=timeout)
+    except socket.gaierror:
+        return f"DNS lookup of {dial_host} failed"
+    except ConnectionRefusedError:
+        return (f"connection refused by {dial_host}:{dial_port}{via} "
+                "(nothing listens there, or a firewall rejects it)")
+    except (socket.timeout, TimeoutError):
+        return (f"connecting to {dial_host}:{dial_port}{via} timed out after {timeout:g} s "
+                "(no answer at all: a firewall is probably dropping the port)")
+    except OSError as e:
+        return f"could not connect to {dial_host}:{dial_port}{via}: {e.strerror or e}"
+    try:
+        with sock:
+            if ph:
+                request = f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n"
+                if auth:
+                    request += f"Proxy-Authorization: Basic {auth}\r\n"
+                sock.sendall((request + "\r\n").encode())
+                head = b""
+                while b"\r\n\r\n" not in head and len(head) < 8192:
+                    chunk = sock.recv(1024)
+                    if not chunk:
+                        break
+                    head += chunk
+                status = head.split(b"\r\n", 1)[0].decode("latin-1").strip()
+                if not status.startswith("HTTP/") or " 200" not in status:
+                    return f"the HTTP proxy {ph}:{pp} refused CONNECT {host}:{port}: {status or '(no answer)'}"
+            sock.sendall(RELAY_PING_FRAME)
+            answer = b""
+            while len(answer) < 12:
+                chunk = sock.recv(12 - len(answer))
+                if not chunk:
+                    break
+                answer += chunk
+    except (socket.timeout, TimeoutError):
+        return f"connected to {host}:{port}{via}, but no croc answer came within {timeout:g} s"
+    except OSError as e:
+        return f"{host}:{port}{via} closed the connection: {e.strerror or e}"
+    if b"pong" not in answer:
+        return f"{host}:{port}{via} answered, but not as a croc relay"
+    return ""
+
+
+def check_relay(relay: str = "", timeout: float = RELAY_CHECK_TIMEOUT_SECONDS) -> str:
+    """Check THIS machine reaches the croc relay (see generate_relay_check). Blocking;
+    returns "" when every port answered, else why not (without a "who" prefix).
+    Never raises."""
+    from concurrent.futures import ThreadPoolExecutor
+    try:
+        address = effective_relay(relay)
+    except ValueError as e:
+        return str(e)
+    host = _relay_host(address)
+    ports = relay_check_ports(relay)
+    with ThreadPoolExecutor(max_workers=len(ports)) as pool:
+        results = list(pool.map(lambda p: _relay_ping_once(host, p, timeout), ports))
+    for port, problem in zip(ports, results):
+        if problem:
+            if port != ports[0]:
+                return f"the relay answers on port {ports[0]} but not on its data port {port}: {problem}"
+            return problem
+    return ""
+
+
 def generate_dns_warmup(relay: str = "") -> list[str]:
     """Shell lines that look up the relay host, so croc's own lookup hits a warm cache.
 
@@ -1078,6 +1354,42 @@ async def cleanup_croc_send(process: Optional[asyncio.subprocess.Process]) -> No
 # --- Download (remote→local) support ---
 
 
+# __tt_croc_connected PID: does croc (PID, or a child of it - PID is usually the
+# `timeout` wrapper) hold an ESTABLISHED TCP connection? 0 yes, 1 no, 2 cannot tell.
+# croc logs its relay connection only in debug mode, whose output is not safe to keep,
+# so this reads the kernel's TCP table instead: the process's socket inodes
+# (/proc/PID/fd) matched against /proc/net/tcp{,6} rows in state 01 (ESTABLISHED).
+# croc send --no-local opens no other TCP connection, so a live one is the relay - or
+# the HTTP proxy carrying it, which the relay check has just proved goes through.
+# Pure bash plus readlink: no awk, ss or pgrep, which slim images lack.
+_CROC_CONNECTED_SH = [
+    "__tt_croc_connected() {",
+    '  local kids="" p pp fd l inos=" " f sl la ra st q1 q2 q3 uid to ino rest',
+    "  [ -r /proc/net/tcp ] || return 2",
+    '  kids=$(cat /proc/"$1"/task/*/children 2>/dev/null)',
+    '  if [ -z "$kids" ]; then',
+    "    for p in /proc/[0-9]*; do",
+    '      read -r _ _ _ pp _ < "$p/stat" 2>/dev/null && [ "$pp" = "$1" ] && kids="$kids ${p#/proc/}"',
+    "    done",
+    "  fi",
+    '  for p in "$1" $kids; do',
+    '    for fd in /proc/"$p"/fd/*; do',
+    '      l=$(readlink "$fd" 2>/dev/null) || continue',
+    '      case "$l" in "socket:["*"]") l=${l#socket:[}; inos="$inos${l%]} " ;; esac',
+    "    done",
+    "  done",
+    '  [ "$inos" = " " ] && return 1',
+    "  for f in /proc/net/tcp /proc/net/tcp6; do",
+    '    [ -r "$f" ] || continue',
+    "    while read -r sl la ra st q1 q2 q3 uid to ino rest; do",
+    '      [ "$st" = "01" ] && case "$inos" in *" $ino "*) return 0 ;; esac',
+    '    done < "$f"',
+    "  done",
+    "  return 1",
+    "}",
+]
+
+
 def _generate_croc_send_core(
     timeout: int,
     cleanup_commands: list[str],
@@ -1092,9 +1404,10 @@ def _generate_croc_send_core(
     1. Emits a size sentinel per staged regular file so the local side can
        verify transfer completeness (rejecting partial files).
     2. Runs croc send in the background while tailing its output; emits the
-       READY sentinel the moment croc prints "Code is:" (relay room registered).
-       The local receiver connects only after that - sender-first by
-       construction, so the PAKE handshake can't race a half-open receiver.
+       READY sentinel once croc has printed "Code is:" AND holds a live TCP
+       connection (the relay room exists; see _CROC_CONNECTED_SH). The receiver
+       connects only after that - sender-first by construction, so the PAKE
+       handshake can't race a half-open receiver.
     3. Scales the croc-send timeout with the staged payload size (the fixed
        default killed healthy multi-GB transfers mid-flight).
     4. Retries the whole send once on failure (relay flakes), announcing it
@@ -1147,6 +1460,7 @@ def _generate_croc_send_core(
     c.append('__DL_BYTES=$(du -sb . 2>/dev/null | cut -f1)')
     c.append(f'__DL_TIMEOUT=$(( ${{__DL_BYTES:-0}} / {CROC_SEND_MIN_RATE_BYTES_PER_SEC} + 120 ))')
     c.append(f'[ "$__DL_TIMEOUT" -lt {timeout} ] && __DL_TIMEOUT={timeout}')
+    c.extend(_CROC_CONNECTED_SH)
     c.append('__croc_send_once() {')
     c.append('  set -- *')
     c.append('  : > .croc_send.log')
@@ -1172,9 +1486,17 @@ def _generate_croc_send_core(
     c.append('  __CROC_STALL_KILL=0')
     c.append('  __CROC_QUIET=0')
     c.append('  while kill -0 "$__CROC_PID" 2>/dev/null; do')
+    # READY = the room exists: croc printed its code AND holds a live connection.
+    # croc prints "Code is:" BEFORE it dials the relay (croc.go Send), so the code
+    # alone proved nothing: on 2026-11-09 READY came 5 s before "dial tcp ...:9009:
+    # i/o timeout". Where the TCP table cannot be read (status 2), the code alone
+    # still counts, as before.
     c.append("    if [ \"$__CROC_READY\" -eq 0 ] && grep -q 'Code is:' .croc_send.log 2>/dev/null; then")
-    c.append(f'      echo "{CROC_SENTINEL_READY}"')
-    c.append('      __CROC_READY=1')
+    c.append('      __tt_croc_connected "$__CROC_PID"')
+    c.append('      if [ $? -ne 1 ]; then')
+    c.append(f'        echo "{CROC_SENTINEL_READY}"')
+    c.append('        __CROC_READY=1')
+    c.append('      fi')
     c.append('    fi')
     # Surface croc's latest progress line every ~5s (its raw \r-updates would
     # otherwise flood the streamed log or be lost entirely)
@@ -1234,11 +1556,14 @@ def _generate_croc_send_core(
     c.append('  if [ "$__CROC_STALL_KILL" -eq 1 ]; then')
     c.append('    __DL_RC=1')
     c.append('  fi')
-    # Croc may have registered and exited between monitor polls - emit READY
-    # regardless so the local side knows the room existed
-    c.append("  if [ \"$__CROC_READY\" -eq 0 ] && grep -q 'Code is:' .croc_send.log 2>/dev/null; then")
-    c.append(f'    echo "{CROC_SENTINEL_READY}"')
-    c.append('  fi')
+    # A croc that finished between two monitor polls had a room (the transfer
+    # succeeded): say so, so the local side knows. A FAILED croc never had one that
+    # counted - announcing it would launch a receiver into nothing.
+    c.append('  case "$__DL_RC" in 0|124|137|143)')
+    c.append("    if [ \"$__CROC_READY\" -eq 0 ] && grep -q 'Code is:' .croc_send.log 2>/dev/null; then")
+    c.append(f'      echo "{CROC_SENTINEL_READY}"')
+    c.append('    fi ;;')
+    c.append('  esac')
     c.append('  __croc_tail | tail -n 3')
     # croc's last diagnostic line, kept for the FAILED sentinel: the send log is
     # deleted before that sentinel is emitted, and without it the caller only

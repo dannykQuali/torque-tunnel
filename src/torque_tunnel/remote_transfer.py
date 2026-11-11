@@ -172,6 +172,15 @@ def evaluate_pair(receiver: ReceiverReport, receiver_status: str, receiver_ended
             return PairState("RUNNING", "all files placed; the receiving environment is finishing")
         return PairState("COMPLETED", end_sender=sender is not None, end_receiver=True)
     if receiver.failure:
+        if sender is not None and sender.failure:
+            # Both failed: the sender's failure is the cause. The receiver only joins
+            # the sender's room, so its error ("room not ready, maybe peer
+            # disconnected") is what the sender's failure looks like from there
+            # (2026-11-09: the sender could not reach the relay at all).
+            return PairState("FAILED",
+                             f"sender: {describe_failure(sender.failure)}; "
+                             f"the receiver then failed too: {describe_failure(receiver.failure)}",
+                             end_sender=True, end_receiver=True)
         return PairState("FAILED", describe_failure(receiver.failure),
                          end_sender=sender is not None, end_receiver=True)
     if sender is not None and sender.failure:

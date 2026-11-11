@@ -273,6 +273,109 @@ async def test_status_and_cancel_schemas_accept_a_profile():
         assert "profile" in tools[name].inputSchema["properties"], name
 
 
+# --- a command started with a torque_space / torque_url / torque_token override ------
+# (2026-11-09: an async run started with torque_space was "not found" by
+# get_execution_status, which took the space from the profile the start result named.)
+
+def _where(method, env_id="env-1"):
+    return {(url, space) for url, space, m, e in _FakeTorque.calls if m == method and e == env_id}
+
+
+def _follow_up_lines(text):
+    return [l for l in text.splitlines() if "get_execution_status" in l or "cancel_execution" in l]
+
+
+@pytest.mark.parametrize("tool,args", ASYNC_TOOLS)
+@pytest.mark.asyncio
+async def test_status_as_the_start_result_says_finds_a_space_override(tool, args, monkeypatch):
+    """Exactly what the start result tells the caller to pass reaches the right space."""
+    text = await _start(tool, dict(args, torque_space="OtherSpace"), monkeypatch, profile="beta")
+    lines = _follow_up_lines(text)
+    assert lines and all('torque_space="OtherSpace"' in l and 'profile="beta"' in l for l in lines), text
+    _FakeTorque.calls.clear()
+
+    await mcp_tool.call_tool("get_execution_status", {
+        "environment_id": "env-1", "profile": "beta", "torque_space": "OtherSpace", "wait": 0})
+
+    assert _where("get_environment_status") == {(BETA_URL, "OtherSpace")}
+
+
+@pytest.mark.asyncio
+async def test_status_with_only_the_profile_still_finds_a_space_override_it_started(monkeypatch):
+    """The server remembers where it started the command: naming the same profile does
+    not replace that with the profile's own space."""
+    tool, args = ASYNC_TOOLS[0]
+    await _start(tool, dict(args, torque_space="OtherSpace"), monkeypatch, profile="beta")
+    _FakeTorque.calls.clear()
+
+    await mcp_tool.call_tool("get_execution_status", {"environment_id": "env-1", "profile": "beta", "wait": 0})
+
+    assert _where("get_environment_status") == {(BETA_URL, "OtherSpace")}
+
+
+@pytest.mark.asyncio
+async def test_after_a_restart_the_space_from_the_start_result_is_used(monkeypatch):
+    tool, args = ASYNC_TOOLS[0]
+    await _start(tool, dict(args, torque_space="OtherSpace"), monkeypatch, profile="beta")
+    mcp_tool._async_env_connections.clear()
+    _FakeTorque.status = "active"
+    _FakeTorque.calls.clear()
+
+    await mcp_tool.call_tool("cancel_execution", {
+        "environment_id": "env-1", "profile": "beta", "torque_space": "OtherSpace"})
+
+    assert _where("end_environment") == {(BETA_URL, "OtherSpace")}
+
+
+@pytest.mark.asyncio
+async def test_a_url_override_is_named_for_the_follow_up_and_used(monkeypatch):
+    tool, args = ASYNC_TOOLS[0]
+    text = await _start(tool, dict(args, torque_url="https://gamma.example.com"), monkeypatch)
+    assert all('torque_url="https://gamma.example.com"' in l for l in _follow_up_lines(text)), text
+    mcp_tool._async_env_connections.clear()
+    _FakeTorque.calls.clear()
+
+    await mcp_tool.call_tool("get_execution_status", {
+        "environment_id": "env-1", "torque_url": "https://gamma.example.com", "wait": 0})
+
+    assert _where("get_environment_status") == {("https://gamma.example.com", "DefaultSpace")}
+
+
+@pytest.mark.asyncio
+async def test_a_token_override_is_asked_for_but_never_written_out(monkeypatch):
+    tool, args = ASYNC_TOOLS[0]
+    text = await _start(tool, dict(args, torque_token="s3cret-token-value"), monkeypatch)
+    assert "s3cret-token-value" not in text
+    assert all("torque_token=<the torque_token you started it with>" in l for l in _follow_up_lines(text)), text
+
+
+@pytest.mark.asyncio
+async def test_no_override_means_no_location_arguments(monkeypatch):
+    tool, args = ASYNC_TOOLS[0]
+    text = await _start(tool, args, monkeypatch, profile="beta")
+    assert not any("torque_" in l for l in _follow_up_lines(text)), text
+
+
+@pytest.mark.asyncio
+async def test_not_found_names_the_space_and_the_overrides(monkeypatch):
+    import httpx
+
+    async def missing(self, env_id):
+        raise httpx.HTTPStatusError("nf", request=httpx.Request("GET", "x"), response=httpx.Response(404))
+
+    monkeypatch.setattr(_FakeTorque, "get_environment_status", missing)
+    text = _text(await mcp_tool.call_tool(
+        "get_execution_status", {"environment_id": "env-9", "profile": "beta", "wait": 0}))
+    assert "env-9" in text and "'BetaSpace'" in text and "torque_space" in text, text
+
+
+@pytest.mark.asyncio
+async def test_status_and_cancel_schemas_accept_the_location_overrides():
+    tools = {t.name: t for t in await mcp_tool.list_tools()}
+    for name in ("get_execution_status", "cancel_execution"):
+        assert {"torque_space", "torque_url", "torque_token"} <= set(tools[name].inputSchema["properties"]), name
+
+
 # --- background streaming ------------------------------------------------------------
 
 @pytest.mark.asyncio

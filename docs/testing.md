@@ -61,6 +61,18 @@ Use `tests/_bash_harness.py`:
 - **Coreutils fakes** (`timeout`, `ssh` in the transfer tests) are shell functions
   prepended to the script.
 
+## No test touches the network
+
+`croc_manager.check_relay` (the croc relay reachability check from this machine) opens
+real TCP connections, so `tests/conftest.py` replaces it, for every test, with one that
+reports the relay reachable. The check's own tests are marked `real_relay_check` and run
+against `tests/_fake_croc_relay.py`. That is a local relay that answers croc's ping,
+plus a silent port, a non-croc server, a CONNECT proxy that tunnels or refuses, a port
+whose full backlog drops SYNs like a firewall, and a closed port. The generated bash
+check runs against it inside WSL (one server process per test module and worker). The
+Python check runs against it in-process. A refused connection to a closed localhost port
+takes ~2 s on Windows (it retries the SYN), so that one test uses a longer timeout.
+
 ## Keeping timing-based tests fast
 
 The croc monitors poll on a tick and decide in "checks" of 10 ticks
