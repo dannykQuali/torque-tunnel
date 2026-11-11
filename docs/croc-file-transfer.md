@@ -78,6 +78,15 @@ confirmed live and are pinned by `tests/test_call_init_scope.py`.
 5. The Torque environment starts, and the remote side runs `croc receive`
 6. After execution, the croc process and staging directory are cleaned up
 
+A **symlinked directory** is tarred as the directory it points to
+(`tar.add(os.path.realpath(path), arcname=".")`). Links inside it stay links, as in the
+inline path. Until 2026-11-11 the croc path (directories too big to inline) passed the
+link itself to `tarfile`, which does not follow it, and the archive held a single entry,
+`. -> <target>`. Verified live: a 600 KB symlinked folder uploaded with matching MD5.
+
+Step 4 waits until the local `croc send` holds its relay connection, not just until it
+is alive. See *READY means a live relay connection*.
+
 ### Download Transfer Modes
 
 **Container targets** (disposable/persistent):
@@ -104,6 +113,20 @@ downloads are not affected: `scp -r` follows a symlink named on its command line
 SSH target --[SCP]--> Agent container --[croc relay]--> Local machine
 ```
 Container SCPs files from SSH target to a temp dir, then runs `croc send`. Local machine runs `croc receive` in background.
+`scp -r` follows **every** symlink, the named path and those inside a directory, so on
+this path links inside a downloaded directory arrive as copies of their targets
+(on containers they stay links).
+
+**A source that cannot be staged completely fails, with the reason** (2026-11-11), on
+both paths. On `.240`, `scp -r` of a directory holding a dangling link printed
+`scp: …/dangling: No such file or directory` and a WARNING, sent the rest, and the
+download reported `Downloaded` with exit 0, the entry silently missing. Now the
+partial copy is dropped and the agent emits `__CROC_DL_STAGE_FAILED__ <file index>
+reason=could not copy <path> completely: <scp's or cp's own error>`. `finalize_download`
+reports that source as
+`Download failed for <local path>: the agent could not copy <path> completely: …`, never
+placing anything for it, and the other sources still download. When nothing could be
+staged, the sender also fails as before (`exit_code=stage`). Verified live on `.240`.
 
 ### Download Coordination Protocol (sender-first handshake)
 
@@ -362,8 +385,8 @@ the croc install, any staging, or launching the other side:
 
 | Where | Check | On failure |
 |---|---|---|
-| Agent container: upload receive, download send, a transfer's sender and receiver | `croc_manager.generate_relay_check_step()` (bash, first lines of the job) | `ERROR: <side> cannot reach the croc relay <host:port>: <cause>` and, where the other side waits on sentinels, `<FAILED sentinel> exit_code=relay reason=…`; exit 1 |
-| This machine: before the local croc send (uploads) or receive (downloads) | `croc_manager.check_relay()` (Python, `_check_local_relay`) | the call returns `Error starting croc file transfer: this machine cannot reach the croc relay …` before any environment starts |
+| Agent container: upload receive, download send, a transfer's sender and receiver | `croc_manager.generate_transport_step()` (bash, first lines of the job; also checks the Piping Server, docs/piping-transport.md) | with croc unreachable the side uses the Piping Server; reaching neither: `ERROR: <side> can reach no file transport: croc relay <host:port>: <cause>; <the Piping Server's cause>` and, where the other side waits on sentinels, `<FAILED sentinel> exit_code=relay reason=…`; exit 1 |
+| This machine: when an upload or download is prepared, before staging | `croc_manager.check_relay()` + `piping.check_server()` (`mcp_tool._local_transports`) | it offers or accepts only what answered; neither answering: `Error preparing files/downloads: this machine can reach no file transport: …` before any environment starts |
 
 The cause says which of these happened:
 - `connecting to H:P … timed out after 6 s (no answer at all: a firewall is probably dropping the port)`
@@ -421,6 +444,21 @@ alone counts, as before.
 After croc exits, READY is still announced for a croc that succeeded between two
 monitor polls, but no longer for one that failed. Announcing a room that never existed
 made the gated receiver connect into nothing.
+
+**This machine's sender (uploads)** follows the same rule. `start_croc_send` used to count
+croc as registered once it had been alive `CROC_SEND_STARTUP_SECONDS` (3 s), while croc
+gives its relay dial 5 s (`durations` in croc's `Send`). It now also waits for
+`process_tcp_established(pid)`, which reads the OS's TCP table:
+- Linux: `/proc/<pid>/fd` socket inodes against `/proc/net/tcp{,6}`;
+- Windows: `GetExtendedTcpTable`, by owning PID;
+- elsewhere: `lsof`.
+
+Where none of these works, alive counts, as before. The wait allows
+`CROC_SEND_CONNECT_MIN_SECONDS` (60 s) plus the payload at 100 MB/s, because croc reads
+the files before it dials. A croc that is still alive but unconnected at the deadline is
+stopped, and the call fails with
+`croc send did not connect to the relay <relay> within N s: <croc's output>` before any
+environment starts. Verified live from Windows: a 600 KB upload to `cpoc-rtp-dev`.
 
 ## Relay address resolution (croc's 500 ms lookup)
 
@@ -496,6 +534,18 @@ That's harmless on these IPv4-only networks, and `croc_relay` can override it.
   the grain log (`extract_transfer_errors`) and list them as `UPLOAD FAILED:` under
   **Files Deployed:** (`format_upload_summary`). Previously a failed upload was
   still listed as deployed.
+
+  **The sender's failure comes first** (2026-11-11). When this machine's `croc send`
+  exited with an error, that is the cause, and the receiver's `room not ready` only
+  its symptom (the same rule as for remote-to-remote transfers).
+  `croc_manager.local_send_failure()` reads the sender's output before cleanup deletes
+  it, scrubbed of the code. The line then reads `UPLOAD FAILED: this machine's croc send
+  failed (exit code N): <croc's words>; the receiving side then reported: <…>`. This
+  applies to the blocking tools, the CLI (`upload_errors`) and `get_execution_status`.
+  For an async run, `get_execution_status` used to say only "Command failed" when its
+  upload failed. It now adds an **Upload:** section with the same lines for a run that
+  did not succeed. `cancel_execution` needed no change: it already stops and cleans up
+  the sender.
 
   The extractor only accepts lines that *start* with `ERROR:`, after an optional
   log timestamp. That's because the container blueprint echoes its commands into the

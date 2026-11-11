@@ -616,7 +616,7 @@ def relay_check_ports(relay: str = "") -> list[int]:
     return ports
 
 
-def generate_relay_check(relay: str, where: str, on_failure: list[str]) -> list[str]:
+def generate_relay_check(relay: str, where: str, on_failure: list[str], run: bool = True) -> list[str]:
     """Shell lines that check this machine reaches the croc relay, before anything else.
 
     On failure ``__TT_RELAY_ERR`` holds a one-line explanation that starts with
@@ -721,6 +721,10 @@ def generate_relay_check(relay: str, where: str, on_failure: list[str]) -> list[
         '  rm -rf "$dir"',
         '  [ -z "$__TT_RELAY_ERR" ]',
         "}",
+    ]
+    if not run:
+        return lines
+    lines += [
         f"if ! __tt_relay_check '{q(host)}' {' '.join(str(p) for p in ports)}; then",
         f"  __TT_RELAY_ERR='{q(where)} cannot reach the croc relay {q(address)}: '\"$__TT_RELAY_ERR\"",
         *(f"  {line}" for line in on_failure),
@@ -729,17 +733,240 @@ def generate_relay_check(relay: str, where: str, on_failure: list[str]) -> list[
     return lines
 
 
-def generate_relay_check_step(relay: str, where: str,
-                              failure_sentinel: Optional[str] = None) -> str:
-    """The relay check as the FIRST step of a croc job: before the croc install and any
-    staging. On failure it prints ``ERROR: <where> cannot reach the croc relay ...``,
-    the ``failure_sentinel`` line (``exit_code=relay reason=...``) when given, and
-    exits 1 - the same contract as the croc install's failure."""
-    on_failure = ['echo "ERROR: $__TT_RELAY_ERR" >&2']
+# --- Piping Server transport, the agent side (see docs/piping-transport.md) ---
+# Offered or chosen at the top of each croc job (generate_transport_step); the jobs
+# themselves fall back to croc alone when no step set the variables, which is what
+# every caller that does not know about piping (and the older tests) get.
+TRANSPORT_OFFER_SENTINEL = "__TT_OFFER__"          # "<sentinel> croc piping" (a sender's offers)
+TRANSPORT_CHOSEN_SENTINEL = "__TT_TRANSPORT__"     # "<sentinel> piping" (a receiver's choice)
+# "<sentinel> <encrypted bytes> <sha256 of the plaintext archive>": what a Piping Server
+# receiver needs to check what it got. It travels through Torque (this log line, or the
+# receiver's own commands), never through the Piping Server.
+PIPING_ARCHIVE_SENTINEL = "__TT_PP_ARCHIVE__"
+TRANSPORTS = ("croc", "piping")
+
+
+def generate_piping_functions(server: str = "") -> list[str]:
+    """Bash functions moving a directory through a Piping Server (see piping.py for the
+    protocol): __tt_pp_check; __tt_pp_prepare DIR (builds the encrypted archive and
+    prints its size and sha256 - to the Torque log only); __tt_pp_send STATE_DIR (run in
+    the background: the hello, then the chunks); __tt_pp_recv DIR (needs __TT_PP_SIZE and
+    __TT_PP_SHA, which reach the receiver through its commands).
+
+    The code comes from the variable named by __TT_PP_CODE_VAR and is split as
+    piping.split_code does: the key encrypts, the independent path token names the
+    paths. Only the constant hello and ciphertext ever cross the server.
+    """
+    from . import piping
+    server = piping.validate_server(server)
+    sent_ok = piping.SENT_OK
+    token = piping.PATH_TOKEN_CHARS
+    openssl = f"openssl enc -aes-256-ctr -pbkdf2 -iter {piping.PBKDF2_ITERATIONS} -pass env:__TT_PP_KEY"
+    return [
+        "# --- Piping Server transport (docs/piping-transport.md) ---",
+        f"__TT_PP_SERVER='{_shell_escape_single(server)}'",
+        f"__TT_PP_CHUNK={piping.CHUNK_BYTES}",
+        f"__TT_PP_STREAMS={piping.STREAMS}",
+        # The path from the code's token (piping.split_code); refuses a code too short
+        # to hold a separate one, rather than putting anything of the key on the wire.
+        "__tt_pp_url() {",
+        '  local c="${!__TT_PP_CODE_VAR}"',
+        f'  [ "${{#c}}" -ge {piping._MIN_CODE_CHARS} ] || return 1',
+        f"  printf '%s/tt-%s' \"$__TT_PP_SERVER\" \"${{c: -{token + 1}:{token}}}\"",
+        "}",
+        "__tt_pp_key() {",
+        '  local c="${!__TT_PP_CODE_VAR}"',
+        f'  printf "%s" "${{c:0:$(( ${{#c}} - {token + 1} ))}}"',
+        "}",
+        "__tt_pp_check() {",
+        "  local code err",
+        f"  err=$(mktemp); code=$(curl -sS -m {piping.CHECK_TIMEOUT_SECONDS} -o /dev/null -w '%{{http_code}}' \"$__TT_PP_SERVER/version\" 2>\"$err\")",
+        '  if [ "$code" = 200 ]; then rm -f "$err"; return 0; fi',
+        "  __TT_PP_ERR=\"the Piping Server $__TT_PP_SERVER did not answer: $(tr '\\n' ' ' < \"$err\" | sed 's/ *$//')\"",
+        '  [ "${code:-000}" != 000 ] && __TT_PP_ERR="the Piping Server $__TT_PP_SERVER answered HTTP $code"',
+        '  rm -f "$err"; return 1',
+        "}",
+        # One PUT; success only when the server's last line says the receiver got it all.
+        # $1 url, stdin = body; $2 (optional) a file created once the server says it is
+        # waiting for a receiver.
+        "__tt_pp_put() {",
+        "  local line ok=1",
+        "  while IFS= read -r line; do",
+        '    case "$line" in',
+        '      *"Waiting for"*) [ -n "$2" ] && : > "$2" ;;',
+        f'      *"{sent_ok}"*) ok=0 ;;',
+        "    esac",
+        '  done < <(curl -sS -N -T - "$1" 2>&1)',
+        "  return $ok",
+        "}",
+        # The encrypted archive, built before anything is offered. Its size and sha256
+        # (of the plaintext tar.gz) go to the log - Torque - and nowhere else.
+        "__tt_pp_prepare() {",
+        '  local dir=$1 sha size',
+        '  __TT_PP_W=$(mktemp -d)',
+        '  mkfifo "$__TT_PP_W/f"; sha256sum < "$__TT_PP_W/f" | cut -c1-64 > "$__TT_PP_W/sha" & local shp=$!',
+        '  if ! ( set -o pipefail; export __TT_PP_KEY="$(__tt_pp_key)"',
+        f'         tar -C "$dir" -cf - . | gzip -1 | tee "$__TT_PP_W/f" | {openssl} > "$__TT_PP_W/c" ); then',
+        '    wait "$shp"; __TT_PP_ERR="could not build the encrypted archive"; return 1',
+        "  fi",
+        '  wait "$shp"; sha=$(cat "$__TT_PP_W/sha"); size=$(stat -c %s "$__TT_PP_W/c")',
+        f'  echo "{PIPING_ARCHIVE_SENTINEL} $size $sha"',
+        "}",
+        "__tt_pp_send() {",
+        '  local st=$1 base size n i fail=0',
+        '  base=$(__tt_pp_url) || { echo "the transfer code is unusable" > "$st/err"; echo 1 > "$st/rc"; return 1; }',
+        # The hello waits for a receiver; collecting it is the receiver's choice of piping
+        '  until printf "hello\\n" | __tt_pp_put "$base-hello" "$st/offered"; do sleep 2; done',
+        '  : > "$st/chosen"',
+        '  size=$(stat -c %s "$__TT_PP_W/c"); n=$(( (size + __TT_PP_CHUNK - 1) / __TT_PP_CHUNK )); [ "$n" -lt 1 ] && n=1',
+        '  echo "[piping] the receiving side chose the Piping Server; sending $size encrypted bytes as $n chunk(s), up to $__TT_PP_STREAMS at a time"',
+        "  __tt_pp_put_one() {",
+        "    local a",
+        f"    for a in $(seq 1 {piping.CHUNK_RETRIES}); do",
+        '      if tail -c +$(( $1 * __TT_PP_CHUNK + 1 )) "$__TT_PP_W/c" | head -c "$__TT_PP_CHUNK" | __tt_pp_put "$base-$1"; then',
+        '        echo "[piping send] chunk $(( $1 + 1 ))/$n sent"; return 0',
+        "      fi",
+        "      sleep 2",
+        "    done",
+        '    echo "[piping send] chunk $(( $1 + 1 ))/$n failed" >&2; return 1',
+        "  }",
+        '  i=0',
+        '  while [ "$i" -lt "$n" ]; do',
+        '    while [ "$(jobs -rp | wc -l)" -ge "$__TT_PP_STREAMS" ]; do wait -n || fail=1; done',
+        '    __tt_pp_put_one "$i" & i=$((i + 1))',
+        "  done",
+        '  while [ "$(jobs -rp | wc -l)" -gt 0 ]; do wait -n || fail=1; done',
+        '  [ "$fail" -ne 0 ] && echo "a chunk could not be sent after retries" > "$st/err"',
+        '  echo "$fail" > "$st/rc"; return "$fail"',
+        "}",
+        # __tt_kill_tree PID: PID and all its descendants (the waiting curl of a withdrawn
+        # offer). Pure bash over /proc: slim images have no pkill.
+        "__tt_kill_tree() {",
+        "  local p pp kids=''",
+        "  for p in /proc/[0-9]*; do",
+        '    read -r _ _ _ pp _ < "$p/stat" 2>/dev/null && [ "$pp" = "$1" ] && kids="$kids ${p#/proc/}"',
+        "  done",
+        '  kill "$1" 2>/dev/null',
+        '  for p in $kids; do __tt_kill_tree "$p"; done',
+        "}",
+        "__tt_pp_recv() {",
+        '  local dir=$1 base w size=${__TT_PP_SIZE:-} sha=${__TT_PP_SHA:-} n i fail=0 got',
+        '  __TT_PP_ERR=""',
+        '  case "$size" in ""|*[!0-9]*) __TT_PP_ERR="the sender\'s archive size is missing"; return 1 ;; esac',
+        '  [ "${#sha}" = 64 ] || { __TT_PP_ERR="the sender\'s archive checksum is missing"; return 1; }',
+        '  base=$(__tt_pp_url) || { __TT_PP_ERR="the transfer code is unusable"; return 1; }',
+        '  w=$(mktemp -d)',
+        '  until curl -sS -f "$base-hello" -o /dev/null 2>/dev/null; do sleep 2; done',
+        '  n=$(( (size + __TT_PP_CHUNK - 1) / __TT_PP_CHUNK )); [ "$n" -lt 1 ] && n=1',
+        '  echo "[piping] receiving $size encrypted bytes through the Piping Server ($n chunk(s))"',
+        "  __tt_pp_get_one() {",
+        '    local a len',
+        '    if [ "$1" -lt $((n - 1)) ]; then len=$__TT_PP_CHUNK; else len=$((size - (n - 1) * __TT_PP_CHUNK)); fi',
+        f"    for a in $(seq 1 {piping.CHUNK_RETRIES}); do",
+        '      curl -sS -f "$base-$1" -o "$w/p.$1" 2>/dev/null',
+        '      got=$(stat -c %s "$w/p.$1" 2>/dev/null || echo 0)',
+        '      [ "$got" = "$len" ] && { echo "[piping receive] chunk $(( $1 + 1 ))/$n received"; return 0; }',
+        "      sleep 2",
+        "    done",
+        '    echo "[piping receive] chunk $(( $1 + 1 ))/$n failed ($got of $len bytes)" >&2; return 1',
+        "  }",
+        '  i=0',
+        '  while [ "$i" -lt "$n" ]; do',
+        '    while [ "$(jobs -rp | wc -l)" -ge "$__TT_PP_STREAMS" ]; do wait -n || fail=1; done',
+        '    __tt_pp_get_one "$i" & i=$((i + 1))',
+        "  done",
+        '  while [ "$(jobs -rp | wc -l)" -gt 0 ]; do wait -n || fail=1; done',
+        '  if [ "$fail" -ne 0 ]; then __TT_PP_ERR="a chunk did not arrive complete after retries"; rm -rf "$w"; return 1; fi',
+        '  mkfifo "$w/f"; sha256sum < "$w/f" | cut -c1-64 > "$w/sha" & local shp=$!',
+        '  if ! ( set -o pipefail; export __TT_PP_KEY="$(__tt_pp_key)"; i=0',
+        '         while [ "$i" -lt "$n" ]; do cat "$w/p.$i" && rm -f "$w/p.$i"; i=$((i + 1)); done \\',
+        f'           | {openssl} -d | tee "$w/f" | gzip -d | tar -C "$dir" -xf - ) 2>"$w/x"; then',
+        "    wait \"$shp\"; __TT_PP_ERR=\"the archive did not decrypt and unpack: $(tail -n 2 \"$w/x\" | tr '\\n' ' ')\"; rm -rf \"$w\"; return 1",
+        "  fi",
+        '  wait "$shp"',
+        '  if [ "$(cat "$w/sha")" != "$sha" ]; then __TT_PP_ERR="archive checksum mismatch (sha256 $(cat "$w/sha"), expected $sha)"; rm -rf "$w"; return 1; fi',
+        '  echo "[piping] archive verified (its sha256 matches the one the sender gave through Torque) and unpacked"',
+        '  rm -rf "$w"; return 0',
+        "}",
+    ]
+
+
+def generate_transport_step(role: str, relay: str, where: str, *,
+                            failure_sentinel: Optional[str] = None,
+                            piping_server: str = "",
+                            transports=TRANSPORTS,
+                            offered=None,
+                            piping_archive=None) -> str:
+    """The first step of a croc job: which transport(s) this side can use.
+
+    ``role="send"``: offer each transport in ``transports`` this side reaches; sets
+    __TT_OFFER_CROC / __TT_OFFER_PIPING and prints TRANSPORT_OFFER_SENTINEL.
+    ``role="receive"``: choose from ``offered`` (what the sender offers: croc first,
+    if this side reaches the relay; else piping, given ``piping_archive`` - the sender's
+    (encrypted bytes, sha256), which only Torque carries); sets __TT_TRANSPORT and
+    prints TRANSPORT_CHOSEN_SENTINEL.
+
+    Either way, a side that can use nothing prints ``ERROR: <where> cannot ...``
+    naming every cause, the ``failure_sentinel`` line (``exit_code=relay``) when given,
+    and exits 1 - before the croc install and any staging.
+    """
+    code_var = CROC_SEND_CODE_ENV if role == "send" else CROC_RECEIVE_CODE_ENV
+    allowed = [t for t in TRANSPORTS if t in (transports if role == "send" else (offered or ()))]
+    lines = [f"__TT_PP_CODE_VAR={code_var}"]
+    if role == "receive":
+        # A Piping Server receiver checks what arrives against the sender's size and
+        # sha256, which come through Torque (here), never through the server. Without
+        # them it does not take that transport.
+        size, sha = piping_archive if piping_archive else (None, None)
+        if isinstance(size, int) and size > 0 and isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{64}", sha):
+            lines.append(f"__TT_PP_SIZE={size}; __TT_PP_SHA={sha}")
+        else:
+            allowed = [t for t in allowed if t != "piping"]
+    lines += generate_piping_functions(piping_server)
+    lines += generate_relay_check(relay, where, on_failure=[], run=False)   # defines __tt_relay_check
+    q = _shell_escape_single
+    host, ports = _relay_host(effective_relay(relay)), relay_check_ports(relay)
+    croc_check = f"__tt_relay_check '{q(host)}' {' '.join(str(p) for p in ports)}"
+    fail = ['echo "ERROR: $__TT_TRANSPORT_ERR" >&2']
     if failure_sentinel:
-        on_failure.append(f'echo "{failure_sentinel} exit_code=relay reason=$__TT_RELAY_ERR"')
-    on_failure.append("exit 1")
-    return "\n".join(generate_relay_check(relay, where, on_failure))
+        fail.append(f'echo "{failure_sentinel} exit_code=relay reason=$__TT_TRANSPORT_ERR"')
+    fail.append("exit 1")
+    if role == "send":
+        lines += [
+            "__TT_OFFER_CROC=0; __TT_OFFER_PIPING=0; __TT_WHY=''",
+            *([f"if {croc_check}; then __TT_OFFER_CROC=1; else "
+               f"__TT_WHY=\"croc relay {q(effective_relay(relay))}: $__TT_RELAY_ERR\"; fi"] if "croc" in allowed else []),
+            *(['if __tt_pp_check; then __TT_OFFER_PIPING=1; else '
+               '__TT_WHY="${__TT_WHY:+$__TT_WHY; }$__TT_PP_ERR"; fi'] if "piping" in allowed else []),
+            'if [ "$__TT_OFFER_CROC$__TT_OFFER_PIPING" = 00 ]; then',
+            f"  __TT_TRANSPORT_ERR='{q(where)} can reach no file transport: '\"${{__TT_WHY:-none is enabled}}\"",
+            *(f"  {line}" for line in fail),
+            "fi",
+            f'echo "{TRANSPORT_OFFER_SENTINEL}$( [ "$__TT_OFFER_CROC" = 1 ] && printf " croc")'
+            f'$( [ "$__TT_OFFER_PIPING" = 1 ] && printf " piping")"',
+        ]
+    else:
+        lines += [
+            "__TT_TRANSPORT=''; __TT_WHY=''",
+            *([f"if {croc_check}; then __TT_TRANSPORT=croc; else "
+               f"__TT_WHY=\"croc relay {q(effective_relay(relay))}: $__TT_RELAY_ERR\"; fi"] if "croc" in allowed else []),
+            *(['if [ -z "$__TT_TRANSPORT" ]; then if __tt_pp_check; then __TT_TRANSPORT=piping; else '
+               '__TT_WHY="${__TT_WHY:+$__TT_WHY; }$__TT_PP_ERR"; fi; fi'] if "piping" in allowed else []),
+            'if [ -z "$__TT_TRANSPORT" ]; then',
+            f"  __TT_TRANSPORT_ERR='{q(where)} can reach none of the file transports the sender offers "
+            f"({' '.join(allowed) or 'none'}): '\"${{__TT_WHY:-nothing was offered}}\"",
+            *(f"  {line}" for line in fail),
+            "fi",
+            f'echo "{TRANSPORT_CHOSEN_SENTINEL} $__TT_TRANSPORT"',
+        ]
+    return "\n".join(lines)
+
+
+def croc_install_when_needed(install_script: str) -> str:
+    """The croc install, run only where croc is offered (sender) or chosen (receiver);
+    always when no transport step ran."""
+    return ('if [ "${__TT_OFFER_CROC:-1}" = 1 ] && [ "${__TT_TRANSPORT:-croc}" = croc ]; then\n'
+            + install_script + "\nfi")
 
 
 def _relay_ping_once(host: str, port: int, timeout: float) -> str:
@@ -1034,6 +1261,21 @@ def _validate_mode(mode: str) -> bool:
     return bool(re.match(r'^[0-7]{3,4}$', mode))
 
 
+def _receive_with_transport(timeout: int, relay: str) -> list[str]:
+    """Receive into the current directory over the transport this side chose
+    (__TT_TRANSPORT, set by generate_transport_step; croc when unset). Sets __CROC_RC,
+    __CROC_ERR, and __TT_RX_WHAT naming the transport for the error line."""
+    return [
+        'if [ "${__TT_TRANSPORT:-croc}" = piping ]; then',
+        '  __TT_RX_WHAT="file receive through the Piping Server"; __CROC_ERR=""',
+        '  if __tt_pp_recv "$PWD"; then __CROC_RC=0; else __CROC_RC=1; __CROC_ERR="$__TT_PP_ERR"; fi',
+        "else",
+        '  __TT_RX_WHAT="croc file receive"',
+        *(f"  {line}" for line in generate_croc_receive_attempt(timeout, relay)),
+        "fi",
+    ]
+
+
 def generate_croc_receive_commands(
     file_transfers: list[dict],
     timeout: int = 600,
@@ -1061,9 +1303,9 @@ def generate_croc_receive_commands(
     commands.append('__CROC_DIR=$(mktemp -d)')
     commands.append('cd "$__CROC_DIR"')
     commands.extend(_relay_env_export())
-    commands.extend(generate_croc_receive_attempt(timeout, relay))
+    commands.extend(_receive_with_transport(timeout, relay))
     commands.append('if [ $__CROC_RC -ne 0 ]; then')
-    commands.append('  echo "ERROR: croc file receive failed (exit code: $__CROC_RC)${__CROC_ERR:+: $__CROC_ERR}" >&2')
+    commands.append('  echo "ERROR: ${__TT_RX_WHAT:-croc file receive} failed (exit code: $__CROC_RC)${__CROC_ERR:+: $__CROC_ERR}" >&2')
     commands.append('  rm -rf "$__CROC_DIR"')
     commands.append('  exit 1')
     commands.append('fi')
@@ -1141,9 +1383,9 @@ def generate_croc_scp_commands(
     commands.append('__CROC_DIR=$(mktemp -d)')
     commands.append('cd "$__CROC_DIR"')
     commands.extend(_relay_env_export())
-    commands.extend(generate_croc_receive_attempt(timeout, relay))
+    commands.extend(_receive_with_transport(timeout, relay))
     commands.append('if [ $__CROC_RC -ne 0 ]; then')
-    commands.append('  echo "ERROR: croc file receive failed (exit code: $__CROC_RC)${__CROC_ERR:+: $__CROC_ERR}" >&2')
+    commands.append('  echo "ERROR: ${__TT_RX_WHAT:-croc file receive} failed (exit code: $__CROC_RC)${__CROC_ERR:+: $__CROC_ERR}" >&2')
     commands.extend(f'  {line}' for line in cleanup)
     commands.append('  rm -rf "$__CROC_DIR"')
     commands.append('  exit 1')
@@ -1198,6 +1440,138 @@ def generate_croc_scp_commands(
     commands.extend(_relay_env_unset())
     commands.append("# === End croc receive + SCP ===")
     return "\n".join(commands)
+
+
+# --- This machine's croc sender: registered means connected ---
+# croc prints its code before it dials the relay, and gives the dial 5 s (croc
+# src/croc/croc.go Send: durations 100 ms for the IPv6 relay, 5 s for IPv4). The local
+# sender used to count as registered once it had been alive CROC_SEND_STARTUP_SECONDS
+# (3 s), i.e. while it might still be dialing, and the environment was launched to
+# receive from a room that never came to be. Now it must also hold an ESTABLISHED TCP
+# connection (process_tcp_established), as the remote send monitor requires.
+CROC_SEND_CONNECT_POLL_SECONDS = 0.25
+# Longest wait for that connection: this floor plus the time croc may spend reading
+# the files before it dials (at this assumed rate).
+CROC_SEND_CONNECT_MIN_SECONDS = 60
+CROC_SEND_PREPARE_RATE_BYTES_PER_SEC = 100_000_000
+
+
+def _total_size(paths: list) -> int:
+    total = 0
+    for path in paths:
+        try:
+            total += os.path.getsize(path)
+        except OSError:
+            pass
+    return total
+
+
+def process_tcp_established(pid) -> Optional[bool]:
+    """Does process ``pid`` hold an ESTABLISHED TCP connection (IPv4 or IPv6)?
+
+    True / False, or None when this platform's TCP table cannot be read (callers then
+    fall back to not knowing). Linux: /proc/<pid>/fd socket inodes against
+    /proc/net/tcp{,6}. Windows: GetExtendedTcpTable (owning PID). Elsewhere: lsof.
+    """
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return None
+    try:
+        if sys.platform.startswith("linux"):
+            return _tcp_established_linux(pid)
+        if sys.platform == "win32":
+            return _tcp_established_windows(pid)
+        return _tcp_established_lsof(pid)
+    except Exception:
+        return None
+
+
+def _tcp_established_linux(pid: int) -> Optional[bool]:
+    inodes = set()
+    try:
+        for fd in os.listdir(f"/proc/{pid}/fd"):
+            try:
+                link = os.readlink(f"/proc/{pid}/fd/{fd}")
+            except OSError:
+                continue
+            if link.startswith("socket:["):
+                inodes.add(link[8:-1])
+    except FileNotFoundError:
+        return False   # the process is gone
+    except PermissionError:
+        return None
+    if not inodes:
+        return False
+    readable = False
+    for table in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            with open(table) as f:
+                rows = f.read().splitlines()[1:]
+        except OSError:
+            continue
+        readable = True
+        for row in rows:
+            fields = row.split()
+            if len(fields) > 9 and fields[3] == "01" and fields[9] in inodes:
+                return True
+    return False if readable else None
+
+
+def _tcp_established_windows(pid: int) -> Optional[bool]:
+    import ctypes
+    from ctypes import wintypes
+    get_table = ctypes.windll.iphlpapi.GetExtendedTcpTable
+    get_table.restype = wintypes.DWORD
+    TCP_TABLE_OWNER_PID_ALL = 5
+    MIB_TCP_STATE_ESTAB = 5
+    # (address family, DWORDs per row, index of dwState, index of dwOwningPid):
+    # MIB_TCPROW_OWNER_PID is 6 DWORDs (state, local addr, local port, remote addr,
+    # remote port, pid); MIB_TCP6ROW_OWNER_PID is 14 (16-byte local addr, scope, port,
+    # 16-byte remote addr, scope, port, state, pid).
+    for family, row_dwords, state_at, pid_at in ((2, 6, 0, 5), (23, 14, 12, 13)):
+        size = wintypes.DWORD(0)
+        get_table(None, ctypes.byref(size), False, family, TCP_TABLE_OWNER_PID_ALL, 0)
+        for _ in range(3):   # the table can grow between the two calls
+            buffer = (ctypes.c_byte * max(size.value, 4))()
+            result = get_table(buffer, ctypes.byref(size), False, family, TCP_TABLE_OWNER_PID_ALL, 0)
+            if result != 122:   # ERROR_INSUFFICIENT_BUFFER
+                break
+        if result != 0:
+            return None
+        count = ctypes.cast(buffer, ctypes.POINTER(wintypes.DWORD))[0]
+        rows = ctypes.cast(ctypes.addressof(buffer) + 4, ctypes.POINTER(wintypes.DWORD))
+        for i in range(count):
+            base = i * row_dwords
+            if rows[base + state_at] == MIB_TCP_STATE_ESTAB and rows[base + pid_at] == pid:
+                return True
+    return False
+
+
+def _tcp_established_lsof(pid: int) -> Optional[bool]:
+    try:
+        out = subprocess.run(["lsof", "-nP", "-a", "-p", str(pid), "-iTCP", "-sTCP:ESTABLISHED", "-Fn"],
+                             capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return any(line.startswith("n") for line in out.stdout.splitlines())
+
+
+async def _wait_for_relay_connection(process, deadline_seconds: float) -> bool:
+    """Wait until croc holds its relay connection, exits, or the deadline passes.
+
+    True when connected - or when this platform cannot tell (the previous behaviour:
+    alive counts). False when croc exited, or is alive without a connection at the
+    deadline.
+    """
+    loop = asyncio.get_running_loop()
+    end = loop.time() + deadline_seconds
+    while process.returncode is None:
+        state = await asyncio.to_thread(process_tcp_established, getattr(process, "pid", None))
+        if state is None or state:
+            return process.returncode is None
+        if loop.time() >= end:
+            return False
+        await asyncio.sleep(CROC_SEND_CONNECT_POLL_SECONDS)
+    return False
 
 
 async def start_croc_send(
@@ -1265,6 +1639,10 @@ async def start_croc_send(
     if relay_password:
         env["CROC_PASS"] = relay_password
 
+    # croc reads and hashes the files before it dials the relay, so the time to its
+    # connection grows with the payload.
+    connect_deadline = CROC_SEND_CONNECT_MIN_SECONDS + _total_size(files) / CROC_SEND_PREPARE_RATE_BYTES_PER_SEC
+
     log_fd, log_path = tempfile.mkstemp(prefix="torque_croc_send_", suffix=".log")
     os.close(log_fd)
 
@@ -1286,13 +1664,26 @@ async def start_croc_send(
                 env=env,
             )
 
-        # Give croc a few seconds to connect to the relay and register the code
+        # Give croc a few seconds, so a fast failure (rate limit, bad password) is
+        # caught here, then wait until it holds its relay connection.
         await asyncio.sleep(CROC_SEND_STARTUP_SECONDS)
+        connected = await _wait_for_relay_connection(process, connect_deadline)
 
-        if process.returncode is None:
-            # Registered and waiting for the receiver.
+        if process.returncode is None and connected:
+            # Registered and waiting for the receiver. The code stays in memory only,
+            # to scrub it from the output should croc fail later (local_send_failure).
             process.croc_log_path = log_path
+            process.croc_secret = code
             return process
+        if process.returncode is None:
+            # Alive but never connected: no room exists, so a receiver launched now
+            # would only fail with "room not ready".
+            output = read_croc_output_tail(log_path, secret=code)
+            await cleanup_croc_send(process)
+            _remove_quietly(log_path)
+            raise RuntimeError(
+                f"croc send did not connect to the relay {effective_relay(relay)} within "
+                f"{connect_deadline:.0f} s" + (f": {output}" if output else ""))
 
         output = read_croc_output_tail(log_path, secret=code)
         rate_limited = CROC_RATE_LIMIT_MARKER in output
@@ -1319,6 +1710,19 @@ async def start_croc_send(
                 " config to a private relay to leave the shared budget behind."
             )
         raise RuntimeError(message)
+
+
+def local_send_failure(process) -> str:
+    """Why this machine's croc sender failed, or "" (still running, finished cleanly,
+    or not a sender start_croc_send made). Read it BEFORE cleanup_croc_send, which
+    deletes the output. When an upload fails, this is the cause and the receiving
+    side's "room not ready" only its symptom."""
+    log_path = getattr(process, "croc_log_path", None)
+    code = getattr(process, "returncode", None)
+    if not isinstance(log_path, str) or not log_path or not isinstance(code, int) or code == 0:
+        return ""
+    output = read_croc_output_tail(log_path, secret=getattr(process, "croc_secret", "") or "")
+    return f"this machine's croc send failed (exit code {code})" + (f": {output}" if output else "")
 
 
 async def cleanup_croc_send(process: Optional[asyncio.subprocess.Process]) -> None:
@@ -1451,6 +1855,25 @@ def _generate_croc_send_core(
     c.append(f'    [ -n "$__DL_MD5" ] && echo "{CROC_SENTINEL_MD5} $__DL_MD5 $__DL_F"')
     c.append('  fi')
     c.append('done')
+    # The Piping Server offer (generate_transport_step decided it) waits in the
+    # background: its hello is collected only if the receiver chooses piping.
+    c.append("__TT_PP_PID=''; __TT_PP_STATE=''; __TT_PP_W=''")
+    # The encrypted archive is built first: its size and sha256 must be in the log
+    # (PIPING_ARCHIVE_SENTINEL) before READY, so the receiver can be given them.
+    c.append('if [ "${__TT_OFFER_PIPING:-0}" = 1 ] && ! __tt_pp_prepare "$__DL_DIR"; then')
+    c.append('  echo "WARNING: $__TT_PP_ERR; the Piping Server is not offered" >&2')
+    c.append('  __TT_OFFER_PIPING=0')
+    c.append('  if [ "${__TT_OFFER_CROC:-1}" != 1 ]; then')
+    c.append('    cd /; rm -rf "$__DL_DIR"')
+    c.extend(f'    {line}' for line in cleanup_commands)
+    c.append(f'    echo "{CROC_SENTINEL_FAILED} exit_code=stage reason=$__TT_PP_ERR"; exit 1')
+    c.append('  fi')
+    c.append('fi')
+    c.append('if [ "${__TT_OFFER_PIPING:-0}" = 1 ]; then')
+    c.append('  __TT_PP_STATE=$(mktemp -d)')
+    c.append('  __tt_pp_send "$__TT_PP_STATE" &')
+    c.append('  __TT_PP_PID=$!')
+    c.append('fi')
     c.append(f'export CROC_SECRET="${CROC_SEND_CODE_ENV}"')
     c.extend(_relay_env_export())
     croc_send = f"croc {_croc_global_flags(relay)}send --no-local"
@@ -1486,6 +1909,12 @@ def _generate_croc_send_core(
     c.append('  __CROC_STALL_KILL=0')
     c.append('  __CROC_QUIET=0')
     c.append('  while kill -0 "$__CROC_PID" 2>/dev/null; do')
+    # The receiver took the Piping Server offer instead: croc's room will stay empty
+    c.append('    if [ -n "$__TT_PP_STATE" ] && [ -f "$__TT_PP_STATE/chosen" ]; then')
+    c.append('      echo "[croc send] the receiving side chose the Piping Server; stopping croc"')
+    c.append('      kill "$__CROC_PID" 2>/dev/null')
+    c.append('      break')
+    c.append('    fi')
     # READY = the room exists: croc printed its code AND holds a live connection.
     # croc prints "Code is:" BEFORE it dials the relay (croc.go Send), so the code
     # alone proved nothing: on 2026-11-09 READY came 5 s before "dial tcp ...:9009:
@@ -1571,16 +2000,37 @@ def _generate_croc_send_core(
     # was only in Torque's grain log). __croc_tail has already dropped the code.
     c.append("  __CROC_ERR=$(__croc_tail | grep -v '%' | tail -n 1)")
     c.append('}')
-    c.append('__CROC_ERR=""')
-    c.append('__croc_send_once')
+    c.append('__CROC_ERR=""; __DL_RC=1')
+    c.append('__tt_pp_chosen() { [ -n "$__TT_PP_STATE" ] && [ -f "$__TT_PP_STATE/chosen" ]; }')
+    c.append('if [ "${__TT_OFFER_CROC:-1}" = 1 ]; then')
+    c.append('  __croc_send_once')
     # Exit codes 124 (timeout SIGTERM), 137 (SIGKILL) and 143 (stall-detection
     # TERM) can mean croc hung after a complete transfer; the local side
     # verifies received sizes either way.
-    c.append('if [ $__DL_RC -ne 0 ] && [ $__DL_RC -ne 124 ] && [ $__DL_RC -ne 137 ] && [ $__DL_RC -ne 143 ]; then')
-    c.append(f'  echo "{CROC_SENTINEL_RETRY} (first attempt failed with exit code $__DL_RC; retrying once)"')
-    c.append(f'  sleep {CROC_SEND_RETRY_DELAY_SECONDS}')
-    c.append('  __croc_send_once')
+    c.append('  if [ $__DL_RC -ne 0 ] && [ $__DL_RC -ne 124 ] && [ $__DL_RC -ne 137 ] && [ $__DL_RC -ne 143 ] && ! __tt_pp_chosen; then')
+    c.append(f'    echo "{CROC_SENTINEL_RETRY} (first attempt failed with exit code $__DL_RC; retrying once)"')
+    c.append(f'    sleep {CROC_SEND_RETRY_DELAY_SECONDS}')
+    c.append('    __croc_send_once')
+    c.append('  fi')
+    c.append('else')
+    # Piping only: ready once its hello waits at the server; then a receiver has the
+    # same size-scaled time to take it as it would have to join croc's room.
+    c.append('  until [ -f "$__TT_PP_STATE/offered" ] || ! kill -0 "$__TT_PP_PID" 2>/dev/null; do sleep 0.2; done')
+    c.append(f'  [ -f "$__TT_PP_STATE/offered" ] && echo "{CROC_SENTINEL_READY}"')
+    c.append('  __TT_PP_T0=$SECONDS')
+    c.append('  while kill -0 "$__TT_PP_PID" 2>/dev/null && { __tt_pp_chosen || [ $((SECONDS - __TT_PP_T0)) -lt "$__DL_TIMEOUT" ]; }; do sleep 1; done')
+    c.append('  __CROC_ERR="no receiver took the Piping Server offer within ${__DL_TIMEOUT}s"')
     c.append('fi')
+    c.append('if __tt_pp_chosen; then')
+    c.append('  wait "$__TT_PP_PID"')
+    c.append('  __DL_RC=$(cat "$__TT_PP_STATE/rc" 2>/dev/null || echo 1)')
+    c.append('  __CROC_ERR=$(cat "$__TT_PP_STATE/err" 2>/dev/null)')
+    c.append('  [ "$__DL_RC" = 0 ] && echo "[piping] every chunk sent"')
+    c.append('elif [ -n "$__TT_PP_PID" ]; then')
+    c.append('  __tt_kill_tree "$__TT_PP_PID"   # croc carried it (or nobody came): withdraw the offer')
+    c.append('fi')
+    c.append('[ -n "$__TT_PP_STATE" ] && rm -rf "$__TT_PP_STATE"')
+    c.append('[ -n "$__TT_PP_W" ] && rm -rf "$__TT_PP_W"')
     c.append('unset CROC_SECRET')
     c.extend(_relay_env_unset())
     c.append('cd /')
@@ -1593,6 +2043,34 @@ def _generate_croc_send_core(
     c.append('fi')
     c.append(f'echo "{CROC_SENTINEL_DONE} exit_code=$__DL_RC"')
     return c
+
+
+# "<sentinel> <file index> reason=<text>": that download source could not be staged
+# completely (a dangling link or an unreadable file inside a directory, a missing
+# path). Its partial copy is dropped, so it is reported as failed with this reason
+# instead of being delivered with pieces silently missing (2026-11-11: scp -r of a
+# directory holding a dangling link printed a warning, sent the rest, and the
+# download said "Downloaded").
+CROC_SENTINEL_STAGE_FAILED = "__CROC_DL_STAGE_FAILED__"
+
+
+def _staging_lines(index: int, copy_command: str, src: str, escaped_name: str) -> list[str]:
+    """Shell lines staging one download source into $__DL_DIR with ``copy_command``;
+    on failure: a WARNING with the tool's own error, the STAGE_FAILED sentinel, and
+    the partial copy removed."""
+    shown = re.sub(r'["$`\\]', "?", src)
+    staged = f'"$__DL_DIR/"\'{escaped_name}\''
+    return [
+        '__DL_SERR=$(mktemp)',
+        f'if ! {{ {copy_command}; }} 2>"$__DL_SERR"; then',
+        "  __DL_SMSG=$(grep -v '^[[:space:]]*$' \"$__DL_SERR\" | tail -n 2 | tr '\\n' ' ' | sed 's/ *$//')",
+        f'  echo "WARNING: Failed to stage {shown} for download${{__DL_SMSG:+: $__DL_SMSG}}" >&2',
+        f'  echo "{CROC_SENTINEL_STAGE_FAILED} {index} reason=could not copy {shown} completely'
+        '${__DL_SMSG:+: $__DL_SMSG}"',
+        f'  rm -rf {staged}',
+        'fi',
+        'rm -f "$__DL_SERR"',
+    ]
 
 
 def generate_croc_send_commands(
@@ -1626,7 +2104,7 @@ def generate_croc_send_commands(
     commands.append("# === Croc file download (send to local) ===")
     commands.append('__DL_DIR=$(mktemp -d)')
 
-    for fi in file_infos:
+    for index, fi in enumerate(file_infos):
         src = fi["remote_source_path"]
         croc_name = fi["croc_filename"]
         escaped_src = _shell_escape_single(src)
@@ -1640,11 +2118,11 @@ def generate_croc_send_commands(
         # (/etc/os-release -> ../usr/lib/os-release) was staged dangling and the
         # download failed with "no files were staged" (2026-11-11, GNU coreutils
         # 8.32). A dangling source fails both and is reported.
-        commands.append(
+        commands.extend(_staging_lines(
+            index,
             f"ln -L '{escaped_src}' \"$__DL_DIR/\"'{escaped_name}' 2>/dev/null"
-            f" || cp -rH '{escaped_src}' \"$__DL_DIR/\"'{escaped_name}'"
-            f" || {{ echo 'WARNING: Failed to stage {escaped_src} for download' >&2; }}"
-        )
+            f" || cp -rH '{escaped_src}' \"$__DL_DIR/\"'{escaped_name}'",
+            src, escaped_name))
 
     commands.extend(_generate_croc_send_core(
         timeout, cleanup_commands=[], relay=relay, transfers=transfers,
@@ -1696,17 +2174,19 @@ def generate_croc_scp_download_commands(
     # Create staging directory and SCP each file/dir from target
     commands.append('__DL_DIR=$(mktemp -d)')
 
-    for fi in file_infos:
+    for index, fi in enumerate(file_infos):
         src = fi["remote_source_path"]
         croc_name = fi["croc_filename"]
         escaped_src = _shell_escape_single(src)
         escaped_name = _shell_escape_single(croc_name)
-        # scp -r works for both files and directories
-        commands.append(
+        # scp -r works for both files and directories. It follows every symlink (the
+        # named path and those inside a directory); one it cannot copy (dangling,
+        # unreadable) fails that source - see _staging_lines.
+        commands.extend(_staging_lines(
+            index,
             f'__scp_tgt -r {ssh_opts} '
-            f'{ssh_target}:\'{escaped_src}\' "$__DL_DIR/"\'{escaped_name}\''
-            f" || {{ echo 'WARNING: SCP download failed for {escaped_src}' >&2; }}"
-        )
+            f'{ssh_target}:\'{escaped_src}\' "$__DL_DIR/"\'{escaped_name}\'',
+            src, escaped_name))
 
     # croc send all staged files to local
     commands.extend(_generate_croc_send_core(
@@ -1983,7 +2463,17 @@ def generate_croc_relay_receive_commands(
     # Attempts: one general retry (aligned after the sender's), plus the rate-limit
     # backoff waits. Success is decided by the files, not by croc's exit code.
     waits = " ".join(str(w) for w in CROC_RECEIVE_RATE_LIMIT_BACKOFF_SECONDS)
-    c.append('__RX_OK=0; __RX_RETRY=1; __RX_RC=1; __RX_ERR=""')
+    c.append('__RX_OK=0; __RX_RETRY=1; __RX_RC=1; __RX_ERR=""; __TT_RX_WHAT="croc file receive"')
+    # The Piping Server, when this side chose it (generate_transport_step): the
+    # sender's whole staging directory arrives in one verified archive.
+    c.append('if [ "${__TT_TRANSPORT:-croc}" = piping ]; then')
+    c.append('  __TT_RX_WHAT="file receive through the Piping Server"')
+    c.append('  if __tt_pp_recv "$__CROC_DIR"; then')
+    c.append('    __RX_RC=0; if __rx_verify; then __RX_OK=1; fi')
+    c.append('  else')
+    c.append('    __RX_ERR="$__TT_PP_ERR"; __RX_BAD="nothing was received"')
+    c.append('  fi')
+    c.append('else')
     c.append(f'__RX_RL_LEFT="{waits}"')
     c.append(f'for __RX_N in $(seq 1 {len(CROC_RECEIVE_RATE_LIMIT_BACKOFF_SECONDS) + 2}); do')
     c.append('  __rx_attempt')
@@ -2003,11 +2493,12 @@ def generate_croc_relay_receive_commands(
     c.append('  fi')
     c.append('  break')
     c.append('done')
+    c.append('fi')
     c.append('unset CROC_SECRET')
     c.extend(_relay_env_unset())
     c.append('if [ "$__RX_OK" -ne 1 ]; then')
     # Same wording as the upload receive's error, so extract_transfer_errors finds it.
-    c.append('  __rx_fail "croc file receive failed (exit code: $__RX_RC)${__RX_ERR:+: $__RX_ERR}; $__RX_BAD" "$__RX_RC"')
+    c.append('  __rx_fail "$__TT_RX_WHAT failed (exit code: $__RX_RC)${__RX_ERR:+: $__RX_ERR}; $__RX_BAD" "$__RX_RC"')
     c.append('fi')
     for m in manifest:
         name = m["croc_filename"]

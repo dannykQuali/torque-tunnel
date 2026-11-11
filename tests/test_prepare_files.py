@@ -227,6 +227,48 @@ class TestPrepareFilesCroc:
         # Cleanup
         shutil.rmtree(plan.croc_staging_dir, ignore_errors=True)
 
+    def _staged_tar_members(self, plan):
+        import tarfile
+        assert len(plan.croc_local_files) == 1, plan.croc_local_files
+        with tarfile.open(plan.croc_local_files[0]) as tar:
+            return {m.name.lstrip("./"): ("link" if m.issym() else "dir" if m.isdir() else "file")
+                    for m in tar.getmembers()}
+
+    def _real_dir_and_link(self, temp_dir):
+        """A directory big enough for croc, holding an inner link, and a symlink to it."""
+        real = os.path.join(temp_dir, "real")
+        os.makedirs(real)
+        create_file_of_size(os.path.join(real, "big.bin"), 500_000, compressible=False)
+        try:
+            os.symlink("big.bin", os.path.join(real, "inner-link"))
+            os.symlink(real, os.path.join(temp_dir, "link"), target_is_directory=True)
+        except OSError as e:  # Windows without the symlink privilege
+            pytest.skip(f"cannot create symlinks here: {e}")
+        return real, os.path.join(temp_dir, "link")
+
+    def test_a_symlink_to_a_large_directory_uploads_the_directory(self, temp_dir):
+        """2026-11-11: the croc path tarred a symlinked directory with
+        tar.add(path, arcname='.'), which does not follow the link: the archive held
+        one entry, '.' -> the target, instead of the directory."""
+        _, link = self._real_dir_and_link(temp_dir)
+        plan = prepare_files_with_croc([{"remote_destination_path": "/tmp/dest", "local_source_path": link}])
+        try:
+            assert plan.needs_croc, "the test needs the croc path"
+            members = self._staged_tar_members(plan)
+            assert members.get("big.bin") == "file", members
+            assert members.get("") != "link", members
+        finally:
+            shutil.rmtree(plan.croc_staging_dir, ignore_errors=True)
+
+    def test_links_inside_an_uploaded_directory_stay_links(self, temp_dir):
+        """Only the path that was named is followed, as for the small (inline) path."""
+        _, link = self._real_dir_and_link(temp_dir)
+        plan = prepare_files_with_croc([{"remote_destination_path": "/tmp/dest", "local_source_path": link}])
+        try:
+            assert self._staged_tar_members(plan).get("inner-link") == "link"
+        finally:
+            shutil.rmtree(plan.croc_staging_dir, ignore_errors=True)
+
     def test_large_directory_triggers_croc_and_tars(self, temp_dir):
         """Large directories should be tarred and sent via croc."""
         dir_path = os.path.join(temp_dir, "bigdir")

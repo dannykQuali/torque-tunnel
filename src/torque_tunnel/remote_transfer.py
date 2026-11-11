@@ -43,6 +43,20 @@ class SenderReport:
     ready: bool = False      # the relay room is registered NOW (no RETRY after it)
     done: bool = False
     failure: str = ""        # the FAILED sentinel's payload, "" when none
+    # Transports the sender offers ("croc", "piping"); empty: a sender from before
+    # offers existed, which means croc (docs/piping-transport.md)
+    offers: list = field(default_factory=list)
+    # The Piping Server archive's (encrypted bytes, sha256), from the sender's log: the
+    # receiver's reference, which never goes through the Piping Server
+    piping_archive: Optional[tuple] = None
+
+
+def parse_archive_line(payload: str) -> Optional[tuple]:
+    """``<bytes> <sha256>`` after croc_manager.PIPING_ARCHIVE_SENTINEL, or None."""
+    parts = (payload or "").split()
+    if len(parts) == 2 and parts[0].isdigit() and int(parts[0]) > 0 and re.fullmatch(r"[0-9a-f]{64}", parts[1]):
+        return int(parts[0]), parts[1]
+    return None
 
 
 def parse_sender_log(log: str) -> SenderReport:
@@ -70,6 +84,12 @@ def parse_sender_log(log: str) -> SenderReport:
     failures = list(_sentinel_lines(log, croc_manager.CROC_SENTINEL_FAILED))
     if failures:
         report.failure = failures[-1] or "exit_code=unknown"
+    offers = list(_sentinel_lines(log, croc_manager.TRANSPORT_OFFER_SENTINEL))
+    if offers:
+        report.offers = [t for t in offers[-1].split() if t in croc_manager.TRANSPORTS]
+    archives = [a for a in map(parse_archive_line, _sentinel_lines(log, croc_manager.PIPING_ARCHIVE_SENTINEL)) if a]
+    if archives:
+        report.piping_archive = archives[-1]
     return report
 
 
@@ -92,7 +112,7 @@ def parse_receiver_log(log: str) -> ReceiverReport:
     if failures:
         report.failure = failures[-1] or "exit_code=unknown"
     for raw in (log or "").splitlines():
-        for marker in ("[croc receive]", "[direct copy]"):
+        for marker in ("[croc receive]", "[direct copy]", "[piping receive]", "[piping]"):
             idx = raw.find(marker)
             if idx >= 0 and not re.search(r"echo\s+[\"']?$", raw[:idx]):
                 report.progress = raw[idx:].strip()
@@ -141,6 +161,11 @@ def choose_relay(source_settings: dict, destination_settings: dict) -> dict:
         "relay": source_settings["relay"],
         "relay_password": source_settings["relay_password"],
         "transfers": source_settings["transfers"],
+        # The Piping Server fallback (docs/piping-transport.md): the source's server
+        # (both sides must use the same); each side may use only its own allowed ones.
+        "piping_server": source_settings.get("piping_server", ""),
+        "sender_transports": source_settings.get("transports", ["croc", "piping"]),
+        "receiver_transports": destination_settings.get("transports", ["croc", "piping"]),
         "relays_differ": (croc_manager.effective_relay(source_settings["relay"])
                           != croc_manager.effective_relay(destination_settings["relay"])),
     }

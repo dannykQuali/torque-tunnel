@@ -78,6 +78,30 @@ def _translate(value: str) -> str:
     return shell_path(value) if _WINDOWS_PATH.match(value) else value
 
 
+def start_script(script, *, env=None, prepend_path=()):
+    """Like run_script, but returns the running subprocess.Popen (text, stdout piped,
+    stderr into stdout) so a test can read its output while it runs."""
+    script = Path(script)
+    harness_bin = script.parent / ".harness-bin"
+    harness_bin.mkdir(exist_ok=True)
+    make_executable(harness_bin / "getent", "#!/bin/sh\nexit 0\n")
+    path_dirs = [shell_path(p) for p in prepend_path] + [shell_path(harness_bin)]
+    if RUNNER == "wsl":
+        lines = [f"export {k}={shlex.quote(_translate(str(v)))}" for k, v in (env or {}).items()]
+        lines.append(f'export PATH={shlex.quote(":".join(path_dirs))}:"$PATH"')
+        lines.append(f"exec bash {shlex.quote(shell_path(script))}")
+        launcher = script.with_name(script.name + ".launch.sh")
+        write_text(launcher, "\n".join(lines) + "\n")
+        argv, run_env = ["wsl.exe", "-e", "bash", shell_path(launcher)], None
+    else:
+        run_env = dict(os.environ)
+        run_env.update({k: str(v) for k, v in (env or {}).items()})
+        run_env["PATH"] = os.pathsep.join(path_dirs + [run_env.get("PATH", "")])
+        argv = ["bash", str(script)]
+    return subprocess.Popen(argv, env=run_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
+
+
 def run_script(script, *, env=None, prepend_path=(), cwd=None, timeout=120, input=None):
     """Run a bash script file; returns subprocess.CompletedProcess (text, utf-8).
 

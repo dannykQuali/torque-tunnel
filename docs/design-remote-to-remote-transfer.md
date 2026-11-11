@@ -348,6 +348,9 @@ raw log. A receiver that failed on its own is still reported as before.
 check*). The sender checks before its croc install and before staging anything. A
 relay it cannot reach ends the call at once:
 `Transfer failed before any data was sent: the sender failed: the sending side (agent mgmt-168-7) cannot reach the croc relay croc.schollz.com:9009: connecting to … timed out after 6 s …`.
+*Since the Piping Server transport* (piping-transport.md), a side that cannot reach
+croc's relay uses the Piping Server instead. That failure now happens only when it can
+reach neither: `… can reach no file transport: croc relay …: …; the Piping Server …: …`.
 The receiver checks at the start of its job, so a receiving agent that cannot reach the
 relay fails in seconds, with `the receiving side (agent …)` in the reason. It can still
 only do that once it is launched, i.e. after the sender has staged and hashed. Checking

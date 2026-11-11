@@ -237,34 +237,27 @@ class TestLocalCheck:
         assert "Invalid croc relay" in croc_manager.check_relay("bad relay;rm", timeout=FAST)
 
 
-@pytest.mark.asyncio
-async def test_an_upload_stops_before_croc_when_this_machine_cannot_reach_the_relay(monkeypatch, tmp_path):
+def test_an_upload_this_machine_cannot_send_stops_before_staging(monkeypatch, tmp_path):
+    """Neither croc's relay nor the Piping Server answers from here: the call fails in
+    preparation, naming both, before anything is staged or started."""
     monkeypatch.setattr(croc_manager, "check_relay", lambda relay="", timeout=None: "connection refused by x")
-    started = []
-
-    async def start_croc_send(**kw):
-        started.append(kw)
-
-    monkeypatch.setattr(croc_manager, "start_croc_send", start_croc_send)
-    plan = mcp_tool.FileDeploymentPlan(needs_croc=True, croc_local_files=[str(tmp_path / "f")])
-    with pytest.raises(RuntimeError, match="this machine cannot reach the croc relay croc.schollz.com:9009: connection refused by x"):
-        await mcp_tool.execute_with_croc(plan)
-    assert not started
+    big = tmp_path / "big.bin"
+    big.write_bytes(os.urandom(croc_manager.CROC_THRESHOLD_BYTES + 1024))
+    plan = mcp_tool.prepare_files_with_croc([{"remote_destination_path": "/tmp/big.bin",
+                                              "local_source_path": str(big)}])
+    assert plan.errors == ["this machine can reach no file transport: croc relay croc.schollz.com:9009: "
+                           "connection refused by x; the Piping Server is not used in tests"], plan.errors
+    assert not plan.croc_staging_dir
 
 
-@pytest.mark.asyncio
-async def test_a_download_stops_before_croc_when_this_machine_cannot_reach_the_relay(monkeypatch):
+def test_a_download_this_machine_cannot_receive_stops_before_anything(monkeypatch):
     monkeypatch.setattr(croc_manager, "check_relay", lambda relay="", timeout=None: "timed out")
-    started = []
-
-    async def start_croc_receive(**kw):
-        started.append(kw)
-
-    monkeypatch.setattr(croc_manager, "start_croc_receive", start_croc_receive)
-    plan = mcp_tool.DownloadPlan(needs_download=True, croc_relay="relay.example.com:443")
-    with pytest.raises(RuntimeError, match="relay.example.com:443: timed out"):
-        await mcp_tool.execute_download_receive(plan)
-    assert not started
+    monkeypatch.setitem(mcp_tool._config, "croc_relay", "relay.example.com:443")
+    plan = mcp_tool.prepare_download_with_croc([{"remote_source_path": "/var/log/x",
+                                                 "local_destination_path": "C:\\x"}])
+    assert plan.errors == ["this machine can reach no file transport: croc relay relay.example.com:443: "
+                           "timed out; the Piping Server is not used in tests"], plan.errors
+    assert not plan.needs_download and not plan.croc_receive_dir
 
 
 # ============================================================================
@@ -294,7 +287,7 @@ def test_a_download_checks_the_relay_first_and_reports_it_as_the_senders_failure
     try:
         cmds = plan.download_commands
         assert _before(cmds, "__tt_relay_check '", "Fast parallel croc install", "Croc file download"), cmds
-        assert f"{croc_manager.CROC_SENTINEL_FAILED} exit_code=relay reason=$__TT_RELAY_ERR" in cmds
+        assert f"{croc_manager.CROC_SENTINEL_FAILED} exit_code=relay reason=$__TT_TRANSPORT_ERR" in cmds
     finally:
         mcp_tool.shutil.rmtree(plan.croc_receive_dir, ignore_errors=True)
 
@@ -314,8 +307,10 @@ def test_a_download_from_a_blocked_agent_fails_at_once_with_the_cause(tmp_path, 
                   + plan.download_commands + "\n")
     proc = bh.run_script(script)
     assert proc.returncode == 1
-    assert (f"{croc_manager.CROC_SENTINEL_FAILED} exit_code=relay reason=the agent container cannot "
-            f"reach the croc relay 127.0.0.1:{port}: connection refused") in proc.stdout, proc.stdout
+    # (this machine cannot use the Piping Server here - conftest - so croc is all the
+    # agent may offer)
+    assert (f"{croc_manager.CROC_SENTINEL_FAILED} exit_code=relay reason=the agent container can "
+            f"reach no file transport: croc relay 127.0.0.1:{port}: connection refused") in proc.stdout, proc.stdout
     assert "CURL-RAN" not in proc.stdout
 
 

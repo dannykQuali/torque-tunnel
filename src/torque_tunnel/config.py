@@ -45,6 +45,11 @@ CONFIG_KEY_MAP = {
     "croc_relay": "croc_relay",
     "croc_relay_password": "croc_relay_password",
     "croc_transfers": "croc_transfers",
+    # The Piping Server fallback where croc's relay ports are blocked
+    # (docs/piping-transport.md), and which transports a call may use:
+    # auto (croc, else piping), croc, or piping.
+    "piping_server": "piping_server",
+    "file_transport": "file_transport",
 }
 
 # Profile YAML keys → MCP tool argument names (for injection into tool arguments)

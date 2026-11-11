@@ -34,6 +34,7 @@ from mcp.types import (
 
 from .torque_client import TorqueClient
 from . import croc_manager
+from . import piping
 from . import config as config_module
 from . import auth as auth_module
 from . import onboarding as onboarding_module
@@ -559,6 +560,15 @@ class FileDeploymentPlan:
     croc_relay: str = ""
     croc_relay_password: str = ""
     croc_transfers: Optional[int] = None
+    # What this machine offers the agent (it chooses): "croc" and/or "piping"
+    # (docs/piping-transport.md), and the Piping Server used.
+    offers: list[str] = field(default_factory=list)
+    piping_server: str = ""
+    # When piping is offered: the encrypted archive (built during preparation) and its
+    # (encrypted bytes, sha256) - which go to the agent in its commands, never through
+    # the Piping Server
+    piping_archive_path: str = ""
+    piping_archive: Optional[tuple] = None
     # Whether croc transfer is needed
     needs_croc: bool = False
     # Errors during preparation
@@ -582,11 +592,37 @@ def _croc_relay_settings(config: Optional[dict] = None) -> dict:
         transfers = int(transfers) if transfers else None
     except (TypeError, ValueError):
         transfers = None
+    choice = str(cfg.get("file_transport") or "auto").strip().lower()
+    allowed = {"croc": ["croc"], "piping": ["piping"]}.get(choice, ["croc", "piping"])
     return {
         "relay": str(cfg.get("croc_relay") or ""),
         "relay_password": str(cfg.get("croc_relay_password") or ""),
         "transfers": transfers,
+        "piping_server": str(cfg.get("piping_server") or piping.DEFAULT_PIPING_SERVER),
+        "transports": allowed,
     }
+
+
+# Piping Server tasks of this machine (an upload's offer, a download's receive), by the
+# local directory they work on (the upload's staging dir, the download's receive dir),
+# so the cleanup that removes that directory also withdraws them.
+_piping_tasks: dict = {}
+
+
+def _local_transports(settings: dict) -> tuple[list[str], list[str]]:
+    """The transports THIS machine can use for a call, of those allowed: croc if the
+    relay answers croc's ping, piping if the Piping Server answers. Blocking (each check
+    is bounded); returns (usable, reasons the others are not)."""
+    from concurrent.futures import ThreadPoolExecutor
+    checks = {"croc": lambda: croc_manager.check_relay(settings["relay"]),
+              "piping": lambda: piping.check_server(settings["piping_server"])}
+    allowed = [t for t in settings["transports"] if t in checks]
+    with ThreadPoolExecutor(max_workers=max(1, len(allowed))) as pool:
+        results = dict(zip(allowed, pool.map(lambda t: checks[t](), allowed)))
+    usable = [t for t in allowed if not results[t]]
+    reasons = [f"croc relay {croc_manager.effective_relay(settings['relay'])}: {results['croc']}"
+               if t == "croc" else results[t] for t in allowed if results[t]]
+    return usable, reasons
 
 
 def _croc_secrets(plan: Optional["FileDeploymentPlan"], dl_plan: Optional["DownloadPlan"]) -> dict:
@@ -786,7 +822,15 @@ def prepare_files_with_croc(
         plan.croc_relay = relay_settings["relay"]
         plan.croc_relay_password = relay_settings["relay_password"]
         plan.croc_transfers = relay_settings["transfers"]
-        
+        plan.piping_server = relay_settings["piping_server"]
+        # What this machine can send through: offered to the agent, which chooses
+        # (docs/piping-transport.md). Checked before staging anything.
+        plan.offers, unusable = _local_transports(relay_settings)
+        if not plan.offers:
+            plan.errors.append("this machine can reach no file transport: " + "; ".join(unusable))
+            _drop_cached_payloads(files)
+            return plan
+
         # Create a staging directory with uniquely-named files to avoid basename collisions.
         # Directories are tarred to match the inline extraction semantics.
         staging_dir = tempfile.mkdtemp(prefix="torque_croc_")
@@ -822,8 +866,11 @@ def prepare_files_with_croc(
                 unique_name = f"_croc_{i}_{basename}.tar.gz"
                 tar_path = os.path.join(staging_dir, unique_name)
                 with tarfile.open(tar_path, 'w:gz') as tar:
-                    # arcname="." puts directory contents at archive root
-                    tar.add(expanded, arcname=".")
+                    # arcname="." puts directory contents at archive root. The named
+                    # path is resolved first: tarfile does not follow a symlink, so a
+                    # symlinked directory became one link entry instead of the
+                    # directory (2026-11-11). Links inside it stay links, as inline.
+                    tar.add(os.path.realpath(expanded), arcname=".")
                 plan.croc_local_files.append(tar_path)
                 croc_transfer_info.append({
                     "croc_filename": unique_name,
@@ -844,11 +891,38 @@ def prepare_files_with_croc(
                     "is_dir_tar": False,
                 })
         
-        # Generate the relay check + croc install + receive commands. The check comes
-        # first: a blocked relay then fails in seconds, naming the cause.
+        # The Piping Server offer needs its encrypted archive now: the agent's commands
+        # carry its size and sha256 (the receiver's reference never goes through the
+        # server). Kept inside the staging dir, which croc does not send as a whole and
+        # cleanup removes.
+        if "piping" in plan.offers:
+            fd, built = tempfile.mkstemp(prefix="tt_piping_", suffix=".enc")
+            os.close(fd)
+            try:
+                sha = piping.build_archive(staging_dir, built, plan.croc_code)
+                plan.piping_archive_path = os.path.join(staging_dir, ".tt-piping.enc")
+                shutil.move(built, plan.piping_archive_path)
+                plan.piping_archive = (os.path.getsize(plan.piping_archive_path), sha)
+            except Exception as e:
+                if os.path.exists(built):
+                    os.remove(built)
+                plan.offers = [t for t in plan.offers if t != "piping"]
+                print(f"[torque-tunnel] Not offering the Piping Server: could not build its archive: {e}",
+                      file=sys.stderr)
+                if not plan.offers:
+                    plan.errors.append(f"could not build the encrypted archive for the Piping Server: {e}")
+                    _drop_cached_payloads(files)
+                    return plan
+
+        # The agent first chooses among this machine's offers (croc if it reaches the
+        # relay, else the Piping Server), failing in seconds with the cause when it can
+        # use neither; then the croc install (only for croc), then the receive.
         croc_install = (
-            croc_manager.generate_relay_check_step(plan.croc_relay, "the agent container")
-            + "\n" + croc_manager.generate_remote_croc_install_script())
+            croc_manager.generate_transport_step(
+                "receive", plan.croc_relay, "the agent container",
+                piping_server=plan.piping_server, offered=plan.offers,
+                piping_archive=plan.piping_archive)
+            + "\n" + croc_manager.croc_install_when_needed(croc_manager.generate_remote_croc_install_script()))
         
         # Calculate croc timeout based on total file size: 600s base + 1s per MB
         total_croc_bytes = sum(os.path.getsize(f) for f in plan.croc_local_files)
@@ -888,29 +962,24 @@ def _drop_cached_payloads(files: list[dict]) -> None:
             file_spec.pop(key, None)
 
 
-async def _check_local_relay(relay: str) -> None:
-    """Raise unless THIS machine reaches the croc relay (a croc ping: it costs nothing
-    against the relay's rate limit). Runs before any croc process or environment."""
-    problem = await asyncio.to_thread(croc_manager.check_relay, relay)
-    if problem:
-        raise RuntimeError(f"this machine cannot reach the croc relay "
-                           f"{croc_manager.effective_relay(relay)}: {problem}")
+async def execute_with_croc(plan: FileDeploymentPlan) -> Optional[asyncio.subprocess.Process]:
+    """Start this machine's offers for a deployment plan: the local croc send, and the
+    Piping Server offer (a background task registered under the staging dir), as
+    ``plan.offers`` says (prepare_files_with_croc decided them; a plan without offers
+    offers croc, as before). The agent takes one of them.
 
-
-async def execute_with_croc(plan: FileDeploymentPlan) -> asyncio.subprocess.Process:
-    """Start the local croc send process for a deployment plan.
-    
     Must be called BEFORE launching the Torque environment.
-    The returned process stays alive until the remote side receives.
-    Caller MUST call croc_manager.cleanup_croc_send() when done.
-    
-    Args:
-        plan: A FileDeploymentPlan with needs_croc=True.
-    
+    Caller MUST call cleanup_croc_resources() when done (it also withdraws the offer).
+
     Returns:
-        The background croc send process.
+        The background croc send process, or None when croc is not offered.
     """
-    await _check_local_relay(plan.croc_relay)
+    offers = plan.offers or ["croc"]
+    if "piping" in offers and plan.piping_archive_path:
+        _piping_tasks[plan.croc_staging_dir] = asyncio.create_task(piping.send_archive(
+            plan.piping_archive_path, plan.croc_code, plan.piping_server or piping.DEFAULT_PIPING_SERVER))
+    if "croc" not in offers:
+        return None
     croc_path = await croc_manager.ensure_local_croc()
     process = await croc_manager.start_croc_send(
         croc_path=croc_path,
@@ -923,16 +992,49 @@ async def execute_with_croc(plan: FileDeploymentPlan) -> asyncio.subprocess.Proc
     return process
 
 
+async def _withdraw_piping(local_dir: str) -> str:
+    """Stop this machine's Piping Server task for ``local_dir`` (an offer nobody took,
+    or a receive that is no longer wanted). Returns its failure, if it had one."""
+    task = _piping_tasks.pop(local_dir, None) if local_dir else None
+    if task is None:
+        return ""
+    if not task.done():
+        task.cancel()
+    try:
+        await asyncio.wait_for(asyncio.shield(task), timeout=5)
+    except (asyncio.CancelledError, asyncio.TimeoutError):
+        return ""
+    except Exception as e:
+        return str(e) or type(e).__name__
+    return ""
+
+
+def _upload_local_failure(croc_process, staging_dir: str) -> str:
+    """Why this machine's side of an upload failed, whichever transport it used: its
+    croc sender's words, or its Piping Server task's. Read before cleanup."""
+    return croc_manager.local_send_failure(croc_process) or _piping_failure(staging_dir)
+
+
+def _piping_failure(local_dir: str) -> str:
+    """The failure of this machine's finished Piping Server task for ``local_dir``."""
+    task = _piping_tasks.get(local_dir) if local_dir else None
+    if task is None or not task.done() or task.cancelled() or task.exception() is None:
+        return ""
+    e = task.exception()
+    return f"this machine's Piping Server transfer failed: {str(e) or type(e).__name__}"
+
+
 async def cleanup_croc_resources(
     croc_process: Optional[asyncio.subprocess.Process] = None,
     staging_dir: str = "",
 ) -> None:
-    """Clean up croc send process and staging directory.
-    
+    """Clean up croc send process, the Piping Server offer and the staging directory.
+
     Safe to call with None/empty values.
     """
     if croc_process is not None:
         await croc_manager.cleanup_croc_send(croc_process)
+    await _withdraw_piping(staging_dir)
     if staging_dir and os.path.exists(staging_dir):
         shutil.rmtree(staging_dir, ignore_errors=True)
 
@@ -949,6 +1051,7 @@ _DOWNLOAD_SENTINELS = (
     croc_manager.CROC_SENTINEL_RETRY,
     croc_manager.CROC_SENTINEL_FAILED,
     croc_manager.CROC_SENTINEL_DONE,
+    croc_manager.CROC_SENTINEL_STAGE_FAILED,
 )
 
 
@@ -973,6 +1076,16 @@ class DownloadPlan:
     croc_relay: str = ""
     croc_relay_password: str = ""
     croc_transfers: Optional[int] = None
+    # Transports THIS machine can receive through (decided before launch), the agent's
+    # offers (its TRANSPORT_OFFER_SENTINEL), and the one chosen from them: croc if both
+    # sides reach the relay, else the Piping Server (docs/piping-transport.md).
+    local_transports: list = field(default_factory=lambda: ["croc"])
+    piping_server: str = ""
+    offered: list = field(default_factory=list)
+    transport: str = ""
+    # The agent's Piping Server archive (encrypted bytes, sha256), from its log - Torque,
+    # not the Piping Server - which the receive checks what arrives against
+    piping_archive: Optional[tuple] = None
     # Mapping from croc_filename → local_destination_path for post-receive file placement
     file_mappings: list[dict] = field(default_factory=list)
     # Whether download is needed
@@ -992,6 +1105,9 @@ class DownloadPlan:
     send_done_seen: bool = False
     remote_failed: bool = False
     remote_failure: str = ""
+    # Sources the agent could not stage completely: file index -> reason
+    # (croc_manager.CROC_SENTINEL_STAGE_FAILED). Reported instead of "not received".
+    stage_failures: dict = field(default_factory=dict)
     # Transfer timing (time.monotonic). The clock starts at the sender's FIRST
     # sentinel and stops when complete_download() is done, because the command's
     # own Duration excludes the transfer entirely: a download that spent 46 s
@@ -1019,7 +1135,19 @@ class DownloadPlan:
             if self.transfer_started_at is None and any(
                     s in line for s in _DOWNLOAD_SENTINELS):
                 self.transfer_started_at = time.monotonic()
-            if croc_manager.CROC_SENTINEL_SIZE in line:
+            if croc_manager.TRANSPORT_OFFER_SENTINEL in line and "echo" not in line:
+                self._choose_transport(line.split(croc_manager.TRANSPORT_OFFER_SENTINEL, 1)[1].split())
+            elif croc_manager.PIPING_ARCHIVE_SENTINEL in line and "echo" not in line:
+                archive = remote_transfer.parse_archive_line(
+                    line.split(croc_manager.PIPING_ARCHIVE_SENTINEL, 1)[1])
+                if archive:
+                    self.piping_archive = archive
+            elif croc_manager.CROC_SENTINEL_STAGE_FAILED in line:
+                payload = line.split(croc_manager.CROC_SENTINEL_STAGE_FAILED, 1)[1].strip()
+                index, _, reason = payload.partition(" reason=")
+                if index.isdigit():
+                    self.stage_failures[int(index)] = reason.strip() or "could not be staged"
+            elif croc_manager.CROC_SENTINEL_SIZE in line:
                 payload = line.split(croc_manager.CROC_SENTINEL_SIZE, 1)[1].strip()
                 size_str, _, name = payload.partition(" ")
                 name = name.strip()
@@ -1035,7 +1163,8 @@ class DownloadPlan:
                     self._write_expected_manifest()
             elif croc_manager.CROC_SENTINEL_READY in line:
                 self.send_ready_seen = True
-                self._signal(croc_manager.CROC_READY_SIGNAL)
+                if self.transport in ("", "croc"):   # "": a sender that made no offers
+                    self._signal(croc_manager.CROC_READY_SIGNAL)
             elif croc_manager.CROC_SENTINEL_RETRY in line:
                 # Sender is restarting croc send — hold the receiver off until
                 # the new room is registered (a fresh READY sentinel re-arms it)
@@ -1046,6 +1175,29 @@ class DownloadPlan:
                 self.signal_abort()
             elif croc_manager.CROC_SENTINEL_DONE in line:
                 self.send_done_seen = True
+
+    def _choose_transport(self, offered: list) -> None:
+        """The agent's offers arrived: take croc if offered and this machine reaches the
+        relay, else the Piping Server - whose receive then starts (the croc receiver is
+        stood down). Idempotent: the log can be fed twice."""
+        if self.transport:
+            return
+        self.offered = offered
+        if "croc" in offered and "croc" in self.local_transports:
+            self.transport = "croc"
+        elif "piping" in offered and "piping" in self.local_transports:
+            self.transport = "piping"
+            self.signal_abort()   # the gated croc receiver, if one runs, is not needed
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+            if loop is not None and self.croc_receive_dir not in _piping_tasks:
+                _piping_tasks[self.croc_receive_dir] = loop.create_task(piping.receive_dir(
+                    self.croc_receive_dir, self.croc_code, self.piping_server or piping.DEFAULT_PIPING_SERVER,
+                    archive=lambda: self.piping_archive))
+        else:
+            self.transport = "none"
 
     def signal_abort(self) -> None:
         """Tell the local receive wrapper to stop retrying immediately."""
@@ -1154,7 +1306,15 @@ def prepare_download_with_croc(
     plan.croc_relay = _dl_relay["relay"]
     plan.croc_relay_password = _dl_relay["relay_password"]
     plan.croc_transfers = _dl_relay["transfers"]
-    
+    plan.piping_server = _dl_relay["piping_server"]
+    # What this machine can receive through. The agent offers only these (of what it
+    # reaches), and this machine picks from its offer (DownloadPlan._choose_transport).
+    plan.local_transports, unusable = _local_transports(_dl_relay)
+    if not plan.local_transports:
+        plan.errors.append("this machine can reach no file transport: " + "; ".join(unusable))
+        plan.needs_download = False
+        return plan
+
     # Create local receive directory
     receive_dir = tempfile.mkdtemp(prefix="torque_dl_")
     plan.croc_receive_dir = receive_dir
@@ -1181,10 +1341,12 @@ def prepare_download_with_croc(
     # reports its own failure through the FAILED sentinel: the local receiver
     # only learns about the sender from sentinels.
     croc_install = (
-        croc_manager.generate_relay_check_step(
-            plan.croc_relay, "the agent container", croc_manager.CROC_SENTINEL_FAILED)
-        + "\n" + croc_manager.generate_remote_croc_install_script(
-            failure_sentinel=croc_manager.CROC_SENTINEL_FAILED))
+        croc_manager.generate_transport_step(
+            "send", plan.croc_relay, "the agent container",
+            failure_sentinel=croc_manager.CROC_SENTINEL_FAILED,
+            piping_server=plan.piping_server, transports=plan.local_transports)
+        + "\n" + croc_manager.croc_install_when_needed(croc_manager.generate_remote_croc_install_script(
+            failure_sentinel=croc_manager.CROC_SENTINEL_FAILED)))
 
     if transfer_mode == "ssh":
         # For SSH: SCP files from target to container, then croc send
@@ -1226,9 +1388,12 @@ async def execute_download_receive(
             command can't outlive its receiver.
 
     Returns:
-        The background croc receive process.
+        The background croc receive process, or None when this machine cannot use croc
+        (then only the Piping Server can carry the download: its receive starts when
+        the agent's offer is seen, DownloadPlan._choose_transport).
     """
-    await _check_local_relay(plan.croc_relay)
+    if "croc" not in plan.local_transports:
+        return None
     croc_path = await croc_manager.ensure_local_croc()
     receive_timeout = 1800
     if command_timeout:
@@ -1273,11 +1438,15 @@ def finalize_download(plan: DownloadPlan) -> tuple[list[str], list[str]]:
     successes = []
     errors = []
 
-    for mapping in plan.file_mappings:
+    for index, mapping in enumerate(plan.file_mappings):
         croc_filename = mapping["croc_filename"]
         local_dest = mapping["local_destination_path"]
         received_path = os.path.join(plan.croc_receive_dir, croc_filename)
 
+        if index in plan.stage_failures:
+            # Never placed, even if something arrived: the agent dropped it as partial
+            errors.append(f"Download failed for {local_dest}: the agent {plan.stage_failures[index]}")
+            continue
         if not os.path.exists(received_path):
             errors.append(f"Download failed for {local_dest}: file not received ({croc_filename})")
             continue
@@ -1390,6 +1559,24 @@ async def complete_download(
         except asyncio.TimeoutError:
             pass  # cleanup_download_resources will terminate it
 
+    # The Piping Server carried it: by now the sender has sent every chunk (its job
+    # ends after that), so what is left is decrypting, verifying and unpacking here.
+    piping_task = _piping_tasks.get(dl_plan.croc_receive_dir)
+    if piping_task is not None:
+        if context_errors:
+            piping_task.cancel()
+        try:
+            await asyncio.wait_for(asyncio.shield(piping_task), timeout=PIPING_DOWNLOAD_FINISH_SECONDS)
+        except asyncio.TimeoutError:
+            context_errors.append("the Piping Server receive did not finish in time")
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            context_errors.append(f"receive through the Piping Server failed: {e}")
+    elif dl_plan.transport == "none":
+        context_errors.append(
+            f"this machine can use none of the transports the agent offered ({' '.join(dl_plan.offered)})")
+
     successes, errors = finalize_download(dl_plan)
     if errors:
         # The context explains WHY files are missing/incomplete; drop it when
@@ -1452,7 +1639,21 @@ def format_download_summary(
     return "\n**Files Downloaded:**\n" + "\n".join(lines) + "\n"
 
 
-def format_upload_summary(files_info: list[str], grain_log: Optional[str] = None) -> str:
+def upload_failures(grain_log: Optional[str], local_failure: str = "") -> list[str]:
+    """Why an upload failed, cause first: this machine's croc sender, when it failed
+    (croc_manager.local_send_failure), then what the receiving side reported - which,
+    after a sender failure, is only its symptom ("room not ready")."""
+    remote = [describe_upload_error(e) for e in extract_transfer_errors(grain_log)]
+    if not local_failure:
+        return remote
+    first = describe_upload_error(local_failure)
+    if remote:
+        first += "; the receiving side then reported: " + "; ".join(remote)
+    return [first]
+
+
+def format_upload_summary(files_info: list[str], grain_log: Optional[str] = None,
+                          local_failure: str = "") -> str:
     """The **Files Deployed:** block, plus any upload that actually failed.
 
     Without this, a failed croc upload was still listed as deployed, and the only
@@ -1461,7 +1662,7 @@ def format_upload_summary(files_info: list[str], grain_log: Optional[str] = None
     if not files_info:
         return ""
     lines = [f"- {f}" for f in files_info]
-    lines += [f"- UPLOAD FAILED: {describe_upload_error(e)}" for e in extract_transfer_errors(grain_log)]
+    lines += [f"- UPLOAD FAILED: {e}" for e in upload_failures(grain_log, local_failure)]
     return "\n**Files Deployed:**\n" + "\n".join(lines) + "\n"
 
 
@@ -1471,7 +1672,8 @@ def describe_upload_error(error: str) -> str:
     return error + (f" ({hint})" if hint else "")
 
 
-async def _cli_upload_errors(plan: Optional["FileDeploymentPlan"], result) -> list[str]:
+async def _cli_upload_errors(plan: Optional["FileDeploymentPlan"], result,
+                             local_failure: str = "") -> list[str]:
     """The CLI's equivalent of the UPLOAD FAILED lines in format_upload_summary.
 
     The CLI streams only the output after the execution marker, and upload
@@ -1483,12 +1685,13 @@ async def _cli_upload_errors(plan: Optional["FileDeploymentPlan"], result) -> li
         return []
     if result.status == "completed" and result.exit_code == 0:
         return []
+    grain_log = None
     try:
         async with get_torque_client() as client:
             grain_log = await client.get_grain_log(result.environment_id)
     except Exception:
-        return []
-    return [describe_upload_error(e) for e in extract_transfer_errors(grain_log)]
+        pass
+    return upload_failures(grain_log, local_failure)
 
 
 # A runtime error line: optional "[hh:mm:ss.mmm]" log timestamp, then the ERROR
@@ -1498,7 +1701,8 @@ async def _cli_upload_errors(plan: Optional["FileDeploymentPlan"], result) -> li
 # there too and must not be mistaken for a failure.
 _UPLOAD_ERROR_RE = re.compile(
     r"^\s*(?:\[[^\]]*\]\s*)?ERROR: ((?:croc file receive failed|Failed to install croc"
-    r"|.* cannot reach the croc relay ).*)$")
+    r"|file receive through the Piping Server failed|.* cannot reach the croc relay "
+    r"|.* can reach no(?:ne of the)? file transport).*)$")
 
 # Where a grain log's download section begins; errors after it are the
 # download's, and reach the caller through the FAILED sentinel instead.
@@ -1566,6 +1770,7 @@ async def cleanup_download_resources(
             pass  # fall through to terminate
     if dl_process is not None:
         await croc_manager.cleanup_croc_send(dl_process)  # same cleanup logic
+    await _withdraw_piping(receive_dir)   # a Piping Server receive still running
     if receive_dir and os.path.exists(receive_dir):
         shutil.rmtree(receive_dir, ignore_errors=True)
         # Windows: deletion can transiently fail while handles close (child
@@ -1604,6 +1809,8 @@ _config = {
     "croc_relay": None,
     "croc_relay_password": None,
     "croc_transfers": None,
+    "piping_server": None,      # None: piping.DEFAULT_PIPING_SERVER
+    "file_transport": None,     # None: auto
 }
 
 # Default values for _config keys (used to reset removed keys on hot-reload)
@@ -1765,6 +1972,10 @@ CROC_DOWNLOAD_RECEIVE_WAIT_SECONDS = 120
 # failed / never registered) — just enough for the wrapper to notice the
 # abort signal and exit; cleanup terminates it afterwards regardless.
 CROC_DOWNLOAD_ABORT_WAIT_SECONDS = 10
+
+# After a download's environment ended, how long the Piping Server receive may still take
+# (the chunks have all been sent by then; this is decrypting, hashing and unpacking).
+PIPING_DOWNLOAD_FINISH_SECONDS = 900
 
 # How long cleanup_download_resources waits for the receive wrapper to exit by itself
 # after the abort signal, before terminating it.
@@ -2237,7 +2448,7 @@ docker restart/stop/kill, systemctl restart docker, reboot, shutdown, init 0/6
                     },
                     "download_files": {
                         "type": "array",
-                        "description": "Download files/directories from the remote server to your local machine AFTER the command runs. Uses croc for peer-to-peer encrypted transfer.",
+                        "description": "Download files/directories from the remote server to your local machine AFTER the command runs. Encrypted and verified; uses croc, or a Piping Server over HTTPS where croc's relay ports are blocked.",
                         "items": {
                             "type": "object",
                             "properties": {
@@ -2333,7 +2544,7 @@ for local network/VMs use regular terminal commands):
                     },
                     "download_files": {
                         "type": "array",
-                        "description": "Download files/directories from the container to your local machine AFTER the command runs. Uses croc for peer-to-peer encrypted transfer.",
+                        "description": "Download files/directories from the container to your local machine AFTER the command runs. Encrypted and verified; uses croc, or a Piping Server over HTTPS where croc's relay ports are blocked.",
                         "items": {
                             "type": "object",
                             "properties": {
@@ -2424,7 +2635,7 @@ Without the ID, a new container is created.
                     },
                     "download_files": {
                         "type": "array",
-                        "description": "Download files/directories from the remote server to your local machine AFTER the command runs. Uses croc for peer-to-peer encrypted transfer.",
+                        "description": "Download files/directories from the remote server to your local machine AFTER the command runs. Encrypted and verified; uses croc, or a Piping Server over HTTPS where croc's relay ports are blocked.",
                         "items": {
                             "type": "object",
                             "properties": {
@@ -2533,7 +2744,7 @@ systemctl restart docker, reboot, shutdown, init 0/6""",
                     },
                     "download_files": {
                         "type": "array",
-                        "description": "Download files/directories from the remote server to your local machine AFTER the command runs. Uses croc for peer-to-peer encrypted transfer.",
+                        "description": "Download files/directories from the remote server to your local machine AFTER the command runs. Encrypted and verified; uses croc, or a Piping Server over HTTPS where croc's relay ports are blocked.",
                         "items": {
                             "type": "object",
                             "properties": {
@@ -2627,7 +2838,7 @@ After restart: pass previous `environment_id` to reconnect.""",
                     },
                     "download_files": {
                         "type": "array",
-                        "description": "Download files/directories from the remote server to your local machine AFTER the command runs. Uses croc for peer-to-peer encrypted transfer.",
+                        "description": "Download files/directories from the remote server to your local machine AFTER the command runs. Encrypted and verified; uses croc, or a Piping Server over HTTPS where croc's relay ports are blocked.",
                         "items": {
                             "type": "object",
                             "properties": {
@@ -2726,7 +2937,7 @@ Only for unreachable internal network targets. For local network/VMs, use termin
                     },
                     "download_files": {
                         "type": "array",
-                        "description": "Download files/directories from the container to your local machine AFTER the command runs. Uses croc for peer-to-peer encrypted transfer.",
+                        "description": "Download files/directories from the container to your local machine AFTER the command runs. Encrypted and verified; uses croc, or a Piping Server over HTTPS where croc's relay ports are blocked.",
                         "items": {
                             "type": "object",
                             "properties": {
@@ -3542,7 +3753,8 @@ async def handle_run_on_tunneled_ssh(arguments: dict, config: dict = None):
         # Build files summary if any were uploaded
         files_summary = ""
         if files_info:
-            files_summary = format_upload_summary(files_info, grain_log)
+            files_summary = format_upload_summary(
+                files_info, grain_log, _upload_local_failure(croc_process, plan.croc_staging_dir if plan else ""))
         
         if result.status == "completed":
             output_block = format_code_block(result.command_output)
@@ -3888,7 +4100,8 @@ async def handle_run_on_tunneled_persistent_container(arguments: dict, config: d
         
         files_summary = ""
         if files_info:
-            files_summary = format_upload_summary(files_info, grain_log)
+            files_summary = format_upload_summary(
+                files_info, grain_log, _upload_local_failure(croc_process, plan.croc_staging_dir if plan else ""))
         
         if result.status == "completed":
             output_block = format_code_block(result.command_output)
@@ -4068,7 +4281,8 @@ async def handle_run_on_tunneled_disposable_container(arguments: dict, config: d
         # Build files summary if any were uploaded
         files_summary = ""
         if files_info:
-            files_summary = format_upload_summary(files_info, grain_log)
+            files_summary = format_upload_summary(
+                files_info, grain_log, _upload_local_failure(croc_process, plan.croc_staging_dir if plan else ""))
         
         if result.status == "completed":
             output_block = format_code_block(result.command_output)
@@ -4220,8 +4434,11 @@ async def handle_run_on_tunneled_ssh_async(arguments: dict, config: dict = None,
 
         # Track croc state for cleanup when execution completes
         async_state = {}
-        if croc_process is not None:
+        if croc_process is not None or (plan is not None and plan.needs_croc):
+            # (no process when only the Piping Server is offered; its task is
+            # found by the staging dir)
             async_state["process"] = croc_process
+            async_state["upload"] = True
             async_state["staging_dir"] = plan.croc_staging_dir if plan else ""
             croc_process = None  # Don't clean up in except block
         if dl_process is not None:
@@ -4374,8 +4591,9 @@ async def handle_run_on_tunneled_persistent_container_async(arguments: dict, con
             
             # Track croc state for cleanup when execution completes
             async_state = {}
-            if croc_process is not None:
+            if croc_process is not None or (plan is not None and plan.needs_croc):
                 async_state["process"] = croc_process
+                async_state["upload"] = True
                 async_state["staging_dir"] = plan.croc_staging_dir if plan else ""
                 croc_process = None  # Don't clean up in except block
             if dl_process is not None:
@@ -4513,8 +4731,11 @@ async def handle_run_on_tunneled_disposable_container_async(arguments: dict, con
 
         # Track croc state for cleanup when execution completes
         async_state = {}
-        if croc_process is not None:
+        if croc_process is not None or (plan is not None and plan.needs_croc):
+            # (no process when only the Piping Server is offered; its task is
+            # found by the staging dir)
             async_state["process"] = croc_process
+            async_state["upload"] = True
             async_state["staging_dir"] = plan.croc_staging_dir if plan else ""
             croc_process = None  # Don't clean up in except block
         if dl_process is not None:
@@ -4617,6 +4838,10 @@ async def handle_get_execution_status(arguments: dict, config: dict = None,
         details = env_data.get("details", {})
         env_url = _environment_url(connection, environment_id)
 
+        # A croc upload's outcome: the blocking tools list it under **Files Deployed:**;
+        # an async run used to say only "Command failed" (see _upload_failure_section).
+        had_croc_upload, upload_local_failure = False, ""
+
         # Stop background streamer if terminal (it may already have stopped itself)
         if status in _TERMINAL_STATUSES:
             _stop_background_streamer(environment_id)
@@ -4625,6 +4850,10 @@ async def handle_get_execution_status(arguments: dict, config: dict = None,
             # Clean up any croc send process/staging dir associated with this async execution
             croc_state = _croc_async_state.pop(environment_id, None)
             if croc_state:
+                had_croc_upload = bool(croc_state.get("upload")) or croc_state.get("process") is not None
+                # Before cleanup, which deletes the sender's output
+                upload_local_failure = _upload_local_failure(
+                    croc_state.get("process"), croc_state.get("staging_dir", ""))
                 await cleanup_croc_resources(
                     croc_state.get("process"),
                     croc_state.get("staging_dir", ""),
@@ -4651,6 +4880,20 @@ async def handle_get_execution_status(arguments: dict, config: dict = None,
         
         # We need a client for extracting outputs, cleanup, and grain log fetching
         async with _connection_client(connection) as client:
+
+            async def upload_failure_section() -> str:
+                """UPLOAD FAILED lines for a run with a croc upload that did not
+                succeed: this machine's sender first, then the receiving side."""
+                if not had_croc_upload:
+                    return ""
+                try:
+                    log = await client.get_grain_log(environment_id)
+                except Exception:
+                    log = None
+                lines = upload_failures(log, upload_local_failure)
+                return ("\n**Upload:**\n" + "\n".join(f"- UPLOAD FAILED: {l}" for l in lines) + "\n"
+                        if lines else "")
+
             # Completed successfully
             if status in ("active", "success"):
                 outputs = client._extract_outputs(env_data)
@@ -4683,7 +4926,9 @@ async def handle_get_execution_status(arguments: dict, config: dict = None,
                 dl_result = _download_results.pop(environment_id, None)
                 if dl_result:
                     dl_summary = format_download_summary(*dl_result)
-                
+                if exit_code != 0:
+                    dl_summary = await upload_failure_section() + dl_summary
+
                 output_text = f"""{status_msg}
 
 **Status:** {"COMPLETED" if exit_code == 0 else "FAILED"}
@@ -4736,11 +4981,12 @@ async def handle_get_execution_status(arguments: dict, config: dict = None,
                     
                     output_block = format_code_block(command_output)
                     status_msg = "Command completed." if exit_code == 0 else "Command failed."
+                    upload_section = await upload_failure_section() if exit_code != 0 else ""
                     output_text = f"""{status_msg}
 
 **Status:** {"COMPLETED" if exit_code == 0 else "FAILED"}
 **Exit Code:** {exit_code}
-
+{upload_section}
 **Output:**
 {output_block}
 
@@ -4785,7 +5031,7 @@ This may indicate a deployment failure. Check the environment URL for details.""
 
 **Status:** FAILED
 **Error:** {error_msg}
-
+{await upload_failure_section()}
 **Environment:** {env_url}"""
                 
                 # Try to get partial output
@@ -5278,10 +5524,16 @@ async def _start_croc_transfer(description, files, source, destination, timeout)
     relay = remote_transfer.choose_relay(_croc_relay_settings(source.cfg),
                                          _croc_relay_settings(destination.cfg))
     code = croc_manager.generate_croc_code()
+    # The sender offers croc and/or the Piping Server, whichever it reaches; the
+    # receiver (launched after the sender is READY) takes croc if it reaches the relay,
+    # else piping (docs/piping-transport.md).
     sender_commands = (
-        croc_manager.generate_relay_check_step(
-            relay["relay"], f"the sending side (agent {source.agent})", croc_manager.CROC_SENTINEL_FAILED)
-        + "\n" + croc_manager.generate_remote_croc_install_script(failure_sentinel=croc_manager.CROC_SENTINEL_FAILED)
+        croc_manager.generate_transport_step(
+            "send", relay["relay"], f"the sending side (agent {source.agent})",
+            failure_sentinel=croc_manager.CROC_SENTINEL_FAILED,
+            piping_server=relay["piping_server"], transports=relay["sender_transports"])
+        + "\n" + croc_manager.croc_install_when_needed(
+            croc_manager.generate_remote_croc_install_script(failure_sentinel=croc_manager.CROC_SENTINEL_FAILED))
         + "\n" + croc_manager.generate_croc_relay_send_commands(
             [{"source_path": f["source_path"], "croc_filename": f["croc_filename"]} for f in files],
             relay=relay["relay"], transfers=relay["transfers"], **source.ssh())
@@ -5323,11 +5575,15 @@ async def _start_croc_transfer(description, files, source, destination, timeout)
 
 **Sender environment:** {sender_url}"""
 
+    offered = [t for t in (report.offers or ["croc"]) if t in relay["receiver_transports"]]
     receiver_commands = (
-        croc_manager.generate_relay_check_step(
-            relay["relay"], f"the receiving side (agent {destination.agent})",
-            croc_manager.CROC_RX_SENTINEL_FAILED)
-        + "\n" + croc_manager.generate_remote_croc_install_script(failure_sentinel=croc_manager.CROC_RX_SENTINEL_FAILED)
+        croc_manager.generate_transport_step(
+            "receive", relay["relay"], f"the receiving side (agent {destination.agent})",
+            failure_sentinel=croc_manager.CROC_RX_SENTINEL_FAILED,
+            piping_server=relay["piping_server"], offered=offered,
+            piping_archive=report.piping_archive)
+        + "\n" + croc_manager.croc_install_when_needed(
+            croc_manager.generate_remote_croc_install_script(failure_sentinel=croc_manager.CROC_RX_SENTINEL_FAILED))
         + "\n" + croc_manager.generate_croc_relay_receive_commands(
             manifest, relay=relay["relay"], **destination.ssh())
     )
@@ -5356,8 +5612,9 @@ async def _start_croc_transfer(description, files, source, destination, timeout)
                       f"source's ({croc_manager.effective_relay(relay['relay'])}).\n")
     follow_up = _transfer_follow_up(sender_id, receiver_id, source.connection, destination.connection)
     handle = _TransferHandle(sender_id, receiver_id, source.connection, destination.connection)
+    offers_text = " and ".join({"croc": "croc", "piping": "the Piping Server"}[t] for t in (report.offers or ["croc"]))
     return handle, f"""Transfer started (async): {source.label} → {destination.label}
-The source side copied and hashed the files and is waiting for the receiver.
+The source side copied and hashed the files and is waiting for the receiver (offering {offers_text}).
 {relay_note}
 **Files:**
 {_transfer_files_summary(files, report.sizes)}
@@ -5900,6 +6157,8 @@ async def cli_dispatch(args):
                         **_croc_secrets(plan, dl_plan),
                     )
             finally:
+                # Before cleanup, which deletes the sender's output
+                local_failure = _upload_local_failure(croc_process, plan.croc_staging_dir if plan else "")
                 await cleanup_croc_resources(croc_process, plan.croc_staging_dir if plan else "")
 
             # Finalize downloads (bounded: aborts the receiver instead of
@@ -5914,7 +6173,7 @@ async def cli_dispatch(args):
                 finally:
                     await cleanup_download_resources(dl_process, dl_plan.croc_receive_dir)
 
-            upload_errors = await _cli_upload_errors(plan, result)
+            upload_errors = await _cli_upload_errors(plan, result, local_failure)
             if output_json:
                 result_dict = {
                     "status": result.status,
@@ -6189,6 +6448,8 @@ async def cli_dispatch(args):
                         except Exception:
                             pass
                 finally:
+                    # Before cleanup, which deletes the sender's output
+                    local_failure = _upload_local_failure(croc_process, plan.croc_staging_dir if plan else "")
                     await cleanup_croc_resources(croc_process, plan.croc_staging_dir if plan else "")
                 
                 # Finalize downloads (bounded: aborts the receiver instead of
@@ -6203,7 +6464,7 @@ async def cli_dispatch(args):
                     finally:
                         await cleanup_download_resources(dl_process, dl_plan.croc_receive_dir)
 
-                upload_errors = await _cli_upload_errors(plan, result)
+                upload_errors = await _cli_upload_errors(plan, result, local_failure)
                 if output_json:
                     result_dict = {
                         "status": result.status,
@@ -6321,6 +6582,8 @@ async def cli_dispatch(args):
                         **_croc_secrets(plan, dl_plan),
                     )
             finally:
+                # Before cleanup, which deletes the sender's output
+                local_failure = _upload_local_failure(croc_process, plan.croc_staging_dir if plan else "")
                 await cleanup_croc_resources(croc_process, plan.croc_staging_dir if plan else "")
 
             # Finalize downloads (bounded: aborts the receiver instead of
@@ -6335,7 +6598,7 @@ async def cli_dispatch(args):
                 finally:
                     await cleanup_download_resources(dl_process, dl_plan.croc_receive_dir)
 
-            upload_errors = await _cli_upload_errors(plan, result)
+            upload_errors = await _cli_upload_errors(plan, result, local_failure)
             if output_json:
                 result_dict = {
                     "status": result.status,
@@ -7028,6 +7291,8 @@ def main():
     _config["croc_relay"] = file_defaults_with_profile.get("croc_relay")
     _config["croc_relay_password"] = file_defaults_with_profile.get("croc_relay_password")
     _config["croc_transfers"] = file_defaults_with_profile.get("croc_transfers")
+    _config["piping_server"] = file_defaults_with_profile.get("piping_server")
+    _config["file_transport"] = file_defaults_with_profile.get("file_transport")
 
     # Record CLI overrides for hot-reload (these keys won't be changed when config file is reloaded)
     global _cli_overrides, _cli_profile, _config_explicit_path, _config_file_path, _config_file_mtime
