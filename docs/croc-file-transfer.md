@@ -84,7 +84,20 @@ confirmed live and are pinned by `tests/test_call_init_scope.py`.
 ```
 Agent container --[croc relay]--> Local machine
 ```
-Container stages files with `ln` (hardlink; `cp -r` fallback for directories or cross-device sources) to a temp dir, then runs `croc send`. Local machine runs `croc receive` in background.
+Container stages files with `ln -L` (hardlink; `cp -rH` fallback for directories or cross-device sources) to a temp dir, then runs `croc send`. Local machine runs `croc receive` in background.
+
+**A symlink is followed** (2026-11-11): croc gets what it points to, and a directory's
+own contents are sent as they are (links inside it stay links). Plain `ln` hard-linked
+the symlink itself and succeeded, so the `cp` fallback never ran:
+- a relative link (`/etc/os-release -> ../usr/lib/os-release`) was staged dangling, and
+  the download failed with `no files were staged for download`;
+- a link to a directory failed the same way;
+- a link with an absolute target was staged as a link, so the size sentinel reported
+  the length of the link instead of the file's size.
+
+Confirmed on agent `cpoc-rtp-dev` (Ubuntu 22.04, GNU coreutils 8.32), and fixed there
+live. A dangling source is reported (`WARNING: Failed to stage …`). SSH-target
+downloads are not affected: `scp -r` follows a symlink named on its command line.
 
 **SSH targets** (also used for persistent containers — the runner container SCPs from the persistent container):
 ```
@@ -169,7 +182,7 @@ Other properties of the send wrapper:
 ### Download Flow
 
 1. `prepare_download_with_croc()` creates a `DownloadPlan` with croc code, receive dir, and file mappings
-2. Generates shell commands for the remote side (croc install + `ln`/`cp -r`/SCP staging + monitored `croc send`)
+2. Generates shell commands for the remote side (relay check + croc install + `ln -L`/`cp -rH`/SCP staging + monitored `croc send`)
 3. `execute_download_receive()` starts the gated `croc receive` wrapper locally in background (idle until the READY sentinel arrives)
 4. The caller wires `make_download_watch_callback(dl_plan, log_callback)` into the environment's log stream
 5. The Torque environment runs the main command, then finally commands, then download commands

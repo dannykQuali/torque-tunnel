@@ -1632,11 +1632,17 @@ def generate_croc_send_commands(
         escaped_src = _shell_escape_single(src)
         escaped_name = _shell_escape_single(croc_name)
         # Hardlink when possible (same filesystem): no disk-usage doubling and no
-        # copy latency at GB scale. cp -r fallback covers directories and
+        # copy latency at GB scale. cp fallback covers directories and
         # cross-device sources.
+        # A symlink is FOLLOWED, so croc gets what it points to: `ln -L` links the
+        # target, `cp -rH` copies it (and keeps links inside a directory as links).
+        # Plain `ln` hard-linked the symlink itself and succeeded, so a relative link
+        # (/etc/os-release -> ../usr/lib/os-release) was staged dangling and the
+        # download failed with "no files were staged" (2026-11-11, GNU coreutils
+        # 8.32). A dangling source fails both and is reported.
         commands.append(
-            f"ln '{escaped_src}' \"$__DL_DIR/\"'{escaped_name}' 2>/dev/null"
-            f" || cp -r '{escaped_src}' \"$__DL_DIR/\"'{escaped_name}'"
+            f"ln -L '{escaped_src}' \"$__DL_DIR/\"'{escaped_name}' 2>/dev/null"
+            f" || cp -rH '{escaped_src}' \"$__DL_DIR/\"'{escaped_name}'"
             f" || {{ echo 'WARNING: Failed to stage {escaped_src} for download' >&2; }}"
         )
 

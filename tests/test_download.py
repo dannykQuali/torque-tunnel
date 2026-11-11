@@ -50,7 +50,7 @@ class TestGenerateCrocSendCommands:
         assert f'CROC_SECRET="${croc_manager.CROC_SEND_CODE_ENV}"' in cmds
         assert f"croc --relay {croc_manager.DEFAULT_CROC_RELAY} send --no-local" in cmds
         assert "_croc_dl_0_app.log" in cmds
-        assert "cp -r '/var/log/app.log'" in cmds
+        assert "'/var/log/app.log'" in cmds     # staged (how: tests/test_download_symlinks.py)
         assert "__DL_DIR=$(mktemp -d)" in cmds
 
     def test_multiple_files(self):
@@ -62,8 +62,8 @@ class TestGenerateCrocSendCommands:
         )
         assert "_croc_dl_0_a.txt" in cmds
         assert "_croc_dl_1_b.bin" in cmds
-        assert "cp -r '/tmp/a.txt'" in cmds
-        assert "cp -r '/opt/b.bin'" in cmds
+        assert "'/tmp/a.txt'" in cmds
+        assert "'/opt/b.bin'" in cmds
         # croc sends everything that was staged (glob over the staging dir)
         assert f"croc --relay {croc_manager.DEFAULT_CROC_RELAY} send --no-local" in cmds
 
@@ -74,8 +74,9 @@ class TestGenerateCrocSendCommands:
                 "croc_filename": "_croc_dl_0_results",
             }],
         )
-        # cp -r works for both files and directories
-        assert "cp -r '/opt/results'" in cmds
+        # A recursive cp is the fallback for directories (which cannot be hard-linked);
+        # that it stages them correctly is run in tests/test_download_symlinks.py
+        assert re.search(r"cp -r\w* '/opt/results'", cmds), cmds
 
     def test_cleanup_after_send(self):
         cmds = croc_manager.generate_croc_send_commands(
