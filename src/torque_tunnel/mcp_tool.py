@@ -35,6 +35,7 @@ from mcp.types import (
 from .torque_client import TorqueClient
 from . import croc_manager
 from . import piping
+from . import leftovers
 from . import config as config_module
 from . import auth as auth_module
 from . import onboarding as onboarding_module
@@ -835,7 +836,10 @@ def prepare_files_with_croc(
         # Directories are tarred to match the inline extraction semantics.
         staging_dir = tempfile.mkdtemp(prefix="torque_croc_")
         plan.croc_staging_dir = staging_dir
-        
+        # Ours while this process (or the croc it starts) runs: the sweep of a later
+        # process removes it only once both are gone (leftovers.py)
+        leftovers.claim(staging_dir)
+
         croc_transfer_info = []
         for i, file_spec in enumerate(croc_files):
             remote_path = file_spec["remote_destination_path"]
@@ -899,7 +903,9 @@ def prepare_files_with_croc(
             fd, built = tempfile.mkstemp(prefix="tt_piping_", suffix=".enc")
             os.close(fd)
             try:
-                sha = piping.build_archive(staging_dir, built, plan.croc_code)
+                # (not the owner file: it is this machine's bookkeeping, leftovers.py)
+                sha = piping.build_archive(staging_dir, built, plan.croc_code,
+                                           skip=(leftovers.OWNER_FILE, leftovers.OWNER_FILE + ".tmp"))
                 plan.piping_archive_path = os.path.join(staging_dir, ".tt-piping.enc")
                 shutil.move(built, plan.piping_archive_path)
                 plan.piping_archive = (os.path.getsize(plan.piping_archive_path), sha)
@@ -912,6 +918,10 @@ def prepare_files_with_croc(
                 if not plan.offers:
                     plan.errors.append(f"could not build the encrypted archive for the Piping Server: {e}")
                     _drop_cached_payloads(files)
+                    # Nothing will send it: the caller returns on plan.errors, before
+                    # any clean-up of its own
+                    shutil.rmtree(staging_dir, ignore_errors=True)
+                    plan.croc_staging_dir = ""
                     return plan
 
         # The agent first chooses among this machine's offers (croc if it reaches the
@@ -988,7 +998,12 @@ async def execute_with_croc(plan: FileDeploymentPlan) -> Optional[asyncio.subpro
         relay=plan.croc_relay,
         relay_password=plan.croc_relay_password,
         transfers=plan.croc_transfers,
+        # In the staging dir, so it goes with it (croc sends only the files named)
+        log_dir=plan.croc_staging_dir or None,
     )
+    # croc outlives this process if it is restarted, and still completes the upload:
+    # its staging dir must stay until croc is done too
+    leftovers.add_process(plan.croc_staging_dir, getattr(process, "pid", None))
     return process
 
 
@@ -1024,19 +1039,74 @@ def _piping_failure(local_dir: str) -> str:
     return f"this machine's Piping Server transfer failed: {str(e) or type(e).__name__}"
 
 
+# Clean-ups whose caller was cancelled: they run on in their own task (_cleanup_to_the_end).
+_detached_cleanups: set = set()
+
+
+async def _cleanup_to_the_end(coro) -> None:
+    """Run a clean-up to its end, even when the request awaiting it is cancelled.
+
+    The MCP SDK cancels a request through anyio, whose cancellation is level-triggered:
+    once a request's scope is cancelled, EVERY later await in it is cancelled at once,
+    those in its finally blocks included. A clean-up awaited there stopped at its first
+    await (waiting for croc to exit), before it removed anything. So the clean-up runs
+    in a task of its own, which that cancellation does not reach; an uncancelled caller
+    still waits for it to finish.
+    """
+    task = asyncio.ensure_future(coro)
+    _detached_cleanups.add(task)
+
+    def done(t):
+        _detached_cleanups.discard(t)
+        if not t.cancelled() and t.exception() is not None:
+            print(f"[torque-tunnel] clean-up failed: {t.exception()}", file=sys.stderr)
+
+    task.add_done_callback(done)
+    await asyncio.shield(task)
+
+
+async def release_transfer_resources(
+    croc_process=None, staging_dir: str = "", dl_process=None, receive_dir: str = "",
+) -> None:
+    """Stop a call's croc sender and receiver and its Piping Server tasks, and remove
+    its staging and receive dirs: one clean-up, finished even if the caller is
+    cancelled (_cleanup_to_the_end). Safe with None/empty values."""
+    async def both():
+        try:
+            await _cleanup_croc_now(croc_process, staging_dir)
+        finally:
+            await _cleanup_download_now(dl_process, receive_dir)
+
+    await _cleanup_to_the_end(both())
+
+
+async def _release_call_resources(croc_process, plan, dl_process, dl_plan) -> None:
+    """release_transfer_resources for what a run tool made."""
+    await release_transfer_resources(
+        croc_process, plan.croc_staging_dir if plan else "",
+        dl_process, dl_plan.croc_receive_dir if dl_plan else "")
+
+
 async def cleanup_croc_resources(
     croc_process: Optional[asyncio.subprocess.Process] = None,
     staging_dir: str = "",
 ) -> None:
-    """Clean up croc send process, the Piping Server offer and the staging directory.
+    """Clean up croc send process, the Piping Server offer and the staging directory,
+    to the end even if the caller is cancelled (_cleanup_to_the_end).
 
     Safe to call with None/empty values.
     """
-    if croc_process is not None:
-        await croc_manager.cleanup_croc_send(croc_process)
-    await _withdraw_piping(staging_dir)
-    if staging_dir and os.path.exists(staging_dir):
-        shutil.rmtree(staging_dir, ignore_errors=True)
+    await _cleanup_to_the_end(_cleanup_croc_now(croc_process, staging_dir))
+
+
+async def _cleanup_croc_now(croc_process, staging_dir: str) -> None:
+    try:
+        if croc_process is not None:
+            await croc_manager.cleanup_croc_send(croc_process)
+        await _withdraw_piping(staging_dir)
+    finally:
+        if staging_dir and os.path.exists(staging_dir):
+            shutil.rmtree(staging_dir, ignore_errors=True)
 
 
 # --- Download (remote→local) support ---
@@ -1318,6 +1388,7 @@ def prepare_download_with_croc(
     # Create local receive directory
     receive_dir = tempfile.mkdtemp(prefix="torque_dl_")
     plan.croc_receive_dir = receive_dir
+    leftovers.claim(receive_dir)   # see prepare_files_with_croc
     
     # Build file info list for croc
     file_infos = []
@@ -1407,6 +1478,7 @@ async def execute_download_receive(
         relay=plan.croc_relay,
         relay_password=plan.croc_relay_password,
     )
+    leftovers.add_process(plan.croc_receive_dir, getattr(process, "pid", None))
     return process
 
 
@@ -1756,8 +1828,14 @@ async def cleanup_download_resources(
     still being written 11 minutes after the CLI exited, plus dozens of
     stale torque_dl_* dirs).
 
+    Finished even if the caller is cancelled (_cleanup_to_the_end).
+
     Safe to call with None/empty values.
     """
+    await _cleanup_to_the_end(_cleanup_download_now(dl_process, receive_dir))
+
+
+async def _cleanup_download_now(dl_process, receive_dir: str) -> None:
     if receive_dir and dl_process is not None and dl_process.returncode is None:
         try:
             with open(os.path.join(receive_dir, croc_manager.CROC_ABORT_SIGNAL), "w") as f:
@@ -1957,6 +2035,14 @@ _background_streamers: dict[str, asyncio.Task] = {}  # env_id -> background stre
 _streamer_cache: dict[str, dict] = {}  # env_id -> {'env_data': ..., 'status': ..., 'raw_status': ...}
 _croc_async_state: dict[str, dict] = {}  # env_id -> {"process": Process, "staging_dir": str, "dl_process": Process, "dl_plan": DownloadPlan}
 _download_results: dict[str, tuple] = {}  # env_id -> (successes, errors, transfer_seconds)
+# What finishing an async run's local side found (_finish_async_run), kept for the
+# get_execution_status that reports it: env_id -> {"had_croc_upload": bool,
+# "upload_local_failure": str, "finished_at": time.monotonic()}
+_async_finish_results: dict[str, dict] = {}
+# env_id -> the task finishing it, shared by the background streamer and a poll
+_async_finish_tasks: dict[str, asyncio.Task] = {}
+# How long what a finished, never-polled run found is kept for a late poll
+ASYNC_FINISH_RESULTS_KEEP_SECONDS = 24 * 3600
 # env_id -> the Torque connection an async command was started with. Polling, streaming
 # and cancelling must use it: the call's profile can point at another Torque instance or
 # space than the default profile, and the default profile can change (hot reload) while
@@ -2024,17 +2110,22 @@ async def _background_stream_grain_log(environment_id: str) -> None:
     
     Polls the grain log every 3 seconds and prints new filtered content.
     Caches latest env_data/status in _streamer_cache for get_execution_status to read.
-    Stops when a terminal status is detected.
+    Stops when a terminal status is detected (or the environment is gone), and then
+    finishes this machine's side of the run (_finish_async_run): a caller may never
+    poll it to its end.
     """
     last_log_len = 0
     filter_state = {'found': raw_log.stream_preamble(), 'buffer': ''}
-    
+    ended = False
+    connection = None
+
     try:
         while True:
             await asyncio.sleep(2)
-            
+
             try:
-                async with _connection_client(_async_connection(environment_id)) as client:
+                connection = _async_connection(environment_id)
+                async with _connection_client(connection) as client:
                     # Check status and cache it
                     env_data = await client.get_environment_status(environment_id)
                     details = env_data.get("details", {})
@@ -2076,15 +2167,112 @@ async def _background_stream_grain_log(environment_id: str) -> None:
                                 filter_state['buffer'] = ''
                     
                     if status in _TERMINAL_STATUSES:
+                        ended = True
                         break
             except asyncio.CancelledError:
                 raise
+            except httpx.HTTPStatusError as e:
+                if e.response is not None and e.response.status_code == 404:
+                    ended = True   # deleted: it will never reach a terminal status
+                    break
             except Exception:
                 pass  # Ignore transient errors, keep polling
+        if ended:
+            await _finish_async_run(environment_id, connection)
     except asyncio.CancelledError:
         pass
     finally:
         _background_streamers.pop(environment_id, None)
+
+
+async def _finish_async_run(environment_id: str, connection: dict) -> None:
+    """Finish this machine's side of an async run that has ended: stop its croc sender
+    and Piping Server offer, remove its staging dir, and complete its download (place
+    the files, remove the receive dir). What it found is kept for the poll that reports
+    it (_async_finish_results, _download_results).
+
+    The background streamer calls this when it sees the run end, and so does
+    get_execution_status: whichever comes first does it, the other waits for it. It used
+    to happen only on a poll, so a run nobody polled to its end (the caller moved on)
+    left its staging dir and croc sender behind. Runs in a task of its own, so a
+    cancelled caller does not cut it short.
+    """
+    task = _async_finish_tasks.get(environment_id)
+    if task is None:
+        task = asyncio.ensure_future(_finish_async_run_now(environment_id, connection))
+        _async_finish_tasks[environment_id] = task
+
+        def done(t, env=environment_id):
+            if _async_finish_tasks.get(env) is t:
+                del _async_finish_tasks[env]
+            if not t.cancelled() and t.exception() is not None:
+                print(f"[torque-tunnel] finishing async run {env} failed: {t.exception()}", file=sys.stderr)
+
+        task.add_done_callback(done)
+    await asyncio.shield(task)
+
+
+async def _finish_async_run_now(environment_id: str, connection: dict) -> None:
+    croc_state = _croc_async_state.pop(environment_id, None)
+    if not croc_state:
+        return   # nothing local, or already finished (or cancelled)
+    process, staging_dir = croc_state.get("process"), croc_state.get("staging_dir", "")
+    dl_process, dl_plan = croc_state.get("dl_process"), croc_state.get("dl_plan")
+    _async_finish_results[environment_id] = {
+        "had_croc_upload": bool(croc_state.get("upload")) or process is not None,
+        # Before the clean-up, which deletes the sender's output
+        "upload_local_failure": _upload_local_failure(process, staging_dir),
+        "finished_at": time.monotonic(),
+    }
+    try:
+        await cleanup_croc_resources(process, staging_dir)
+        if dl_plan is not None and dl_plan.needs_download:
+            # The streamer stops on terminal status and may have missed the tail of the
+            # log; refeed the full log so the watcher sees the final sentinels
+            # (idempotent) before the download's fate is decided.
+            try:
+                async with _connection_client(connection) as log_client:
+                    final_log = await log_client.get_grain_log(environment_id) or ""
+                dl_plan.observe_output("\n" + final_log + "\n")
+            except Exception:
+                pass
+            try:
+                dl_successes, dl_errors = await complete_download(dl_plan, dl_process)
+            except Exception as e:
+                dl_successes, dl_errors = [], [f"Download finalization error: {e}"]
+            _download_results[environment_id] = (dl_successes, dl_errors, dl_plan.transfer_seconds)
+    finally:
+        await cleanup_download_resources(dl_process, dl_plan.croc_receive_dir if dl_plan else "")
+
+
+def _prune_finished_runs(now: Optional[float] = None) -> None:
+    """Forget what finished runs nobody polled found, once it is a day old."""
+    now = time.monotonic() if now is None else now
+    for env_id, found in list(_async_finish_results.items()):
+        if now - found.get("finished_at", now) > ASYNC_FINISH_RESULTS_KEEP_SECONDS:
+            _async_finish_results.pop(env_id, None)
+            _download_results.pop(env_id, None)
+            _streamer_cache.pop(env_id, None)
+
+
+# How often the MCP server sweeps the temp folders dead processes left (leftovers.py)
+LEFTOVERS_SWEEP_SECONDS = 3600
+
+
+async def _sweep_leftovers_periodically() -> None:
+    """At start and then hourly: remove the transfer folders whose processes are gone
+    (an earlier run of this server that was restarted mid-transfer, a croc that has
+    since finished), and forget old results of runs nobody polled."""
+    while True:
+        try:
+            removed = await asyncio.to_thread(leftovers.sweep)
+            if removed:
+                print(f"[torque-tunnel] removed {len(removed)} temp folder(s)/file(s) left by "
+                      f"transfers whose processes are gone", file=sys.stderr)
+            _prune_finished_runs()
+        except Exception as e:
+            print(f"[torque-tunnel] temp folder sweep failed: {e}", file=sys.stderr)
+        await asyncio.sleep(LEFTOVERS_SWEEP_SECONDS)
 
 
 def _start_background_streamer(environment_id: str) -> None:
@@ -3632,61 +3820,63 @@ async def handle_run_on_tunneled_ssh(arguments: dict, config: dict = None):
         if warning:
             return [TextContent(type="text", text=warning)]
 
-    # Process files parameter - generate deployment commands (with croc for large files)
     files_info = []
     init_commands = None
     container_pre_commands = None
     plan = None
     croc_process = None
-    if files:
-        plan = prepare_files_with_croc(
-            files, transfer_mode="ssh",
-            target_ip=target_ip, ssh_user=ssh_user,
-            config=cfg,
-        )
-        if plan.errors:
-            return [TextContent(
-                type="text",
-                text="Error preparing files:\n" + "\n".join(f"- {e}" for e in plan.errors),
-            )]
-        if plan.inline_commands:
-            init_commands = plan.inline_commands
-        if plan.croc_container_pre_commands:
-            container_pre_commands = plan.croc_container_pre_commands
-        files_info = plan.files_info
-    
-    # Process download_files parameter
     dl_plan = None
     dl_process = None
-    if download_files:
-        dl_plan = prepare_download_with_croc(
-            download_files, transfer_mode="ssh",
-            target_ip=target_ip, ssh_user=ssh_user,
-            config=cfg,
-        )
-        if dl_plan.errors:
-            return [TextContent(
-                type="text",
-                text="Error preparing downloads:\n" + "\n".join(f"- {e}" for e in dl_plan.errors),
-            )]
-    
-    # If no command, use a simple echo
-    effective_command = command or "echo 'Files deployed successfully'"
-    
-    # Create log streamer for real-time output
-    log_callback = None
+    # Everything from the staging of the upload on is inside the try: every way out,
+    # the early returns included, goes through the finally's clean-up.
     try:
-        session = server.request_context.session
-        log_callback = create_log_streamer(session)
-    except Exception:
-        pass  # Streaming not available
+        # Process files parameter - generate deployment commands (with croc for large files)
+        if files:
+            plan = prepare_files_with_croc(
+                files, transfer_mode="ssh",
+                target_ip=target_ip, ssh_user=ssh_user,
+                config=cfg,
+            )
+            if plan.errors:
+                return [TextContent(
+                    type="text",
+                    text="Error preparing files:\n" + "\n".join(f"- {e}" for e in plan.errors),
+                )]
+            if plan.inline_commands:
+                init_commands = plan.inline_commands
+            if plan.croc_container_pre_commands:
+                container_pre_commands = plan.croc_container_pre_commands
+            files_info = plan.files_info
 
-    # Downloads are gated on the sender's READY sentinel, so the watcher must
-    # observe the streamed output even when MCP streaming is unavailable
-    if dl_plan is not None and dl_plan.needs_download:
-        log_callback = make_download_watch_callback(dl_plan, log_callback)
+        # Process download_files parameter
+        if download_files:
+            dl_plan = prepare_download_with_croc(
+                download_files, transfer_mode="ssh",
+                target_ip=target_ip, ssh_user=ssh_user,
+                config=cfg,
+            )
+            if dl_plan.errors:
+                return [TextContent(
+                    type="text",
+                    text="Error preparing downloads:\n" + "\n".join(f"- {e}" for e in dl_plan.errors),
+                )]
 
-    try:
+        # If no command, use a simple echo
+        effective_command = command or "echo 'Files deployed successfully'"
+
+        # Create log streamer for real-time output
+        log_callback = None
+        try:
+            session = server.request_context.session
+            log_callback = create_log_streamer(session)
+        except Exception:
+            pass  # Streaming not available
+
+        # Downloads are gated on the sender's READY sentinel, so the watcher must
+        # observe the streamed output even when MCP streaming is unavailable
+        if dl_plan is not None and dl_plan.needs_download:
+            log_callback = make_download_watch_callback(dl_plan, log_callback)
+
         # Start croc send locally if needed (must happen BEFORE Torque environment)
         if plan is not None and plan.needs_croc:
             try:
@@ -3803,8 +3993,8 @@ async def handle_run_on_tunneled_ssh(arguments: dict, config: dict = None):
             return [TextContent(type="text", text=f"Credential error: {e}")]
         return [TextContent(type="text", text=f"Error executing remote command: {str(e)}")]
     finally:
-        await cleanup_croc_resources(croc_process, plan.croc_staging_dir if plan else "")
-        await cleanup_download_resources(dl_process, dl_plan.croc_receive_dir if dl_plan else "")
+        # One clean-up of both sides, finished even if this request is cancelled
+        await _release_call_resources(croc_process, plan, dl_process, dl_plan)
 
 
 async def _ensure_persistent_container(
@@ -3965,60 +4155,62 @@ async def handle_run_on_tunneled_persistent_container(arguments: dict, config: d
     except Exception as e:
         return [TextContent(type="text", text=f"Error setting up persistent container: {str(e)}")]
     
-    # Process files parameter - generate deployment commands (with croc for large files)
     files_info = []
     init_commands = None
     container_pre_commands = None
     plan = None
     croc_process = None
-    if files:
-        plan = prepare_files_with_croc(
-            files, transfer_mode="ssh",
-            target_ip=container_ip, ssh_user="root",
-            config=cfg,
-        )
-        if plan.errors:
-            return [TextContent(
-                type="text",
-                text="Error preparing files:\n" + "\n".join(f"- {e}" for e in plan.errors),
-            )]
-        if plan.inline_commands:
-            init_commands = plan.inline_commands
-        if plan.croc_container_pre_commands:
-            container_pre_commands = plan.croc_container_pre_commands
-        files_info = plan.files_info
-    
-    # Process download_files parameter
     dl_plan = None
     dl_process = None
-    if download_files:
-        dl_plan = prepare_download_with_croc(
-            download_files, transfer_mode="ssh",
-            target_ip=container_ip, ssh_user="root",
-            config=cfg,
-        )
-        if dl_plan.errors:
-            return [TextContent(
-                type="text",
-                text="Error preparing downloads:\n" + "\n".join(f"- {e}" for e in dl_plan.errors),
-            )]
-    
-    effective_command = command or "echo 'Files deployed successfully'"
-    
-    # Create log streamer for real-time output
-    log_callback = None
+    # Everything from the staging of the upload on is inside the try: every way out,
+    # the early returns included, goes through the finally's clean-up.
     try:
-        session = server.request_context.session
-        log_callback = create_log_streamer(session)
-    except Exception:
-        pass
+        # Process files parameter - generate deployment commands (with croc for large files)
+        if files:
+            plan = prepare_files_with_croc(
+                files, transfer_mode="ssh",
+                target_ip=container_ip, ssh_user="root",
+                config=cfg,
+            )
+            if plan.errors:
+                return [TextContent(
+                    type="text",
+                    text="Error preparing files:\n" + "\n".join(f"- {e}" for e in plan.errors),
+                )]
+            if plan.inline_commands:
+                init_commands = plan.inline_commands
+            if plan.croc_container_pre_commands:
+                container_pre_commands = plan.croc_container_pre_commands
+            files_info = plan.files_info
 
-    # Downloads are gated on the sender's READY sentinel, so the watcher must
-    # observe the streamed output even when MCP streaming is unavailable
-    if dl_plan is not None and dl_plan.needs_download:
-        log_callback = make_download_watch_callback(dl_plan, log_callback)
+        # Process download_files parameter
+        if download_files:
+            dl_plan = prepare_download_with_croc(
+                download_files, transfer_mode="ssh",
+                target_ip=container_ip, ssh_user="root",
+                config=cfg,
+            )
+            if dl_plan.errors:
+                return [TextContent(
+                    type="text",
+                    text="Error preparing downloads:\n" + "\n".join(f"- {e}" for e in dl_plan.errors),
+                )]
 
-    try:
+        effective_command = command or "echo 'Files deployed successfully'"
+
+        # Create log streamer for real-time output
+        log_callback = None
+        try:
+            session = server.request_context.session
+            log_callback = create_log_streamer(session)
+        except Exception:
+            pass
+
+        # Downloads are gated on the sender's READY sentinel, so the watcher must
+        # observe the streamed output even when MCP streaming is unavailable
+        if dl_plan is not None and dl_plan.needs_download:
+            log_callback = make_download_watch_callback(dl_plan, log_callback)
+
         # Start croc send locally if needed (must happen BEFORE Torque environment)
         if plan is not None and plan.needs_croc:
             try:
@@ -4149,8 +4341,8 @@ async def handle_run_on_tunneled_persistent_container(arguments: dict, config: d
             return [TextContent(type="text", text=f"Credential error: {e}")]
         return [TextContent(type="text", text=f"Error executing command on container: {str(e)}")]
     finally:
-        await cleanup_croc_resources(croc_process, plan.croc_staging_dir if plan else "")
-        await cleanup_download_resources(dl_process, dl_plan.croc_receive_dir if dl_plan else "")
+        # One clean-up of both sides, finished even if this request is cancelled
+        await _release_call_resources(croc_process, plan, dl_process, dl_plan)
 
 
 async def handle_run_on_tunneled_disposable_container(arguments: dict, config: dict = None):
@@ -4173,56 +4365,58 @@ async def handle_run_on_tunneled_disposable_container(arguments: dict, config: d
             text="Error: Must provide either 'command', 'upload_files', or 'download_files' (or any combination).",
         )]
 
-    # Process files parameter - generate deployment commands (with croc for large files)
     files_info = []
     init_commands = None
     plan = None
     croc_process = None
-    if files:
-        plan = prepare_files_with_croc(files, transfer_mode="container", config=cfg)
-        if plan.errors:
-            return [TextContent(
-                type="text",
-                text="Error preparing files:\n" + "\n".join(f"- {e}" for e in plan.errors),
-            )]
-        # Combine croc init + inline commands for container target
-        combined = []
-        if plan.croc_init_commands:
-            combined.append(plan.croc_init_commands)
-        if plan.inline_commands:
-            combined.append(plan.inline_commands)
-        if combined:
-            init_commands = "\n".join(combined)
-        files_info = plan.files_info
-    
-    # Process download_files parameter
     dl_plan = None
     dl_process = None
-    if download_files:
-        dl_plan = prepare_download_with_croc(download_files, transfer_mode="container", config=cfg)
-        if dl_plan.errors:
-            return [TextContent(
-                type="text",
-                text="Error preparing downloads:\n" + "\n".join(f"- {e}" for e in dl_plan.errors),
-            )]
-    
-    # If no command, use a simple echo
-    effective_command = command or "echo 'Files deployed successfully'"
-    
-    # Create log streamer for real-time output
-    log_callback = None
+    # Everything from the staging of the upload on is inside the try: every way out,
+    # the early returns included, goes through the finally's clean-up.
     try:
-        session = server.request_context.session
-        log_callback = create_log_streamer(session)
-    except Exception:
-        pass  # Streaming not available
+        # Process files parameter - generate deployment commands (with croc for large files)
+        if files:
+            plan = prepare_files_with_croc(files, transfer_mode="container", config=cfg)
+            if plan.errors:
+                return [TextContent(
+                    type="text",
+                    text="Error preparing files:\n" + "\n".join(f"- {e}" for e in plan.errors),
+                )]
+            # Combine croc init + inline commands for container target
+            combined = []
+            if plan.croc_init_commands:
+                combined.append(plan.croc_init_commands)
+            if plan.inline_commands:
+                combined.append(plan.inline_commands)
+            if combined:
+                init_commands = "\n".join(combined)
+            files_info = plan.files_info
 
-    # Downloads are gated on the sender's READY sentinel, so the watcher must
-    # observe the streamed output even when MCP streaming is unavailable
-    if dl_plan is not None and dl_plan.needs_download:
-        log_callback = make_download_watch_callback(dl_plan, log_callback)
+        # Process download_files parameter
+        if download_files:
+            dl_plan = prepare_download_with_croc(download_files, transfer_mode="container", config=cfg)
+            if dl_plan.errors:
+                return [TextContent(
+                    type="text",
+                    text="Error preparing downloads:\n" + "\n".join(f"- {e}" for e in dl_plan.errors),
+                )]
 
-    try:
+        # If no command, use a simple echo
+        effective_command = command or "echo 'Files deployed successfully'"
+
+        # Create log streamer for real-time output
+        log_callback = None
+        try:
+            session = server.request_context.session
+            log_callback = create_log_streamer(session)
+        except Exception:
+            pass  # Streaming not available
+
+        # Downloads are gated on the sender's READY sentinel, so the watcher must
+        # observe the streamed output even when MCP streaming is unavailable
+        if dl_plan is not None and dl_plan.needs_download:
+            log_callback = make_download_watch_callback(dl_plan, log_callback)
+
         # Start croc send locally if needed (must happen BEFORE Torque environment)
         if plan is not None and plan.needs_croc:
             try:
@@ -4331,8 +4525,8 @@ async def handle_run_on_tunneled_disposable_container(arguments: dict, config: d
             return [TextContent(type="text", text=f"Credential error: {e}")]
         return [TextContent(type="text", text=f"Error executing command on agent: {str(e)}")]
     finally:
-        await cleanup_croc_resources(croc_process, plan.croc_staging_dir if plan else "")
-        await cleanup_download_resources(dl_process, dl_plan.croc_receive_dir if dl_plan else "")
+        # One clean-up of both sides, finished even if this request is cancelled
+        await _release_call_resources(croc_process, plan, dl_process, dl_plan)
 
 
 async def handle_run_on_tunneled_ssh_async(arguments: dict, config: dict = None,
@@ -4363,41 +4557,44 @@ async def handle_run_on_tunneled_ssh_async(arguments: dict, config: dict = None,
         if warning:
             return [TextContent(type="text", text=warning)]
 
-    # Process files parameter - generate deployment commands (with croc for large files)
     files_info = []
     init_commands = None
     container_pre_commands = None
     plan = None
     croc_process = None
-    if files:
-        plan = prepare_files_with_croc(
-            files, transfer_mode="ssh",
-            target_ip=target_ip, ssh_user=ssh_user,
-            config=cfg,
-        )
-        if plan.errors:
-            return [TextContent(type="text", text="Error preparing files:\n" + "\n".join(f"- {e}" for e in plan.errors))]
-        if plan.inline_commands:
-            init_commands = plan.inline_commands
-        if plan.croc_container_pre_commands:
-            container_pre_commands = plan.croc_container_pre_commands
-        files_info = plan.files_info
-    
-    # Process download_files parameter
     dl_plan = None
     dl_process = None
-    if download_files:
-        dl_plan = prepare_download_with_croc(
-            download_files, transfer_mode="ssh",
-            target_ip=target_ip, ssh_user=ssh_user,
-            config=cfg,
-        )
-        if dl_plan.errors:
-            return [TextContent(type="text", text="Error preparing downloads:\n" + "\n".join(f"- {e}" for e in dl_plan.errors))]
-    
-    effective_command = command or "echo 'Files deployed successfully'"
-    
+    # Until the run's local side is handed to _croc_async_state (whose owner, the
+    # streamer or a poll, finishes it), every way out cleans it up in the finally.
+    handed_off = False
     try:
+        # Process files parameter - generate deployment commands (with croc for large files)
+        if files:
+            plan = prepare_files_with_croc(
+                files, transfer_mode="ssh",
+                target_ip=target_ip, ssh_user=ssh_user,
+                config=cfg,
+            )
+            if plan.errors:
+                return [TextContent(type="text", text="Error preparing files:\n" + "\n".join(f"- {e}" for e in plan.errors))]
+            if plan.inline_commands:
+                init_commands = plan.inline_commands
+            if plan.croc_container_pre_commands:
+                container_pre_commands = plan.croc_container_pre_commands
+            files_info = plan.files_info
+
+        # Process download_files parameter
+        if download_files:
+            dl_plan = prepare_download_with_croc(
+                download_files, transfer_mode="ssh",
+                target_ip=target_ip, ssh_user=ssh_user,
+                config=cfg,
+            )
+            if dl_plan.errors:
+                return [TextContent(type="text", text="Error preparing downloads:\n" + "\n".join(f"- {e}" for e in dl_plan.errors))]
+
+        effective_command = command or "echo 'Files deployed successfully'"
+
         # Start croc send locally if needed (must happen BEFORE Torque environment)
         if plan is not None and plan.needs_croc:
             try:
@@ -4432,7 +4629,8 @@ async def handle_run_on_tunneled_ssh_async(arguments: dict, config: dict = None,
                 **_croc_secrets(plan, dl_plan),
             )
 
-        # Track croc state for cleanup when execution completes
+        # Hand this run's local side to _croc_async_state: the background streamer
+        # finishes it when the run ends (or a poll, or cancel_execution, does)
         async_state = {}
         if croc_process is not None or (plan is not None and plan.needs_croc):
             # (no process when only the Piping Server is offered; its task is
@@ -4440,14 +4638,15 @@ async def handle_run_on_tunneled_ssh_async(arguments: dict, config: dict = None,
             async_state["process"] = croc_process
             async_state["upload"] = True
             async_state["staging_dir"] = plan.croc_staging_dir if plan else ""
-            croc_process = None  # Don't clean up in except block
-        if dl_process is not None:
+        if dl_plan is not None and dl_plan.needs_download:
+            # (no process when only the Piping Server can carry it: the streamer must
+            # still feed the plan the agent's offer, which starts that receive)
             async_state["dl_process"] = dl_process
             async_state["dl_plan"] = dl_plan
-            dl_process = None  # Don't clean up in except block
         if async_state:
             _croc_async_state[environment_id] = async_state
-        
+        handed_off = True
+
         # Start background streaming of grain log to stderr
         _remember_async_connection(environment_id, dict(connection, profile=profile_name))
         _start_background_streamer(environment_id)
@@ -4476,14 +4675,15 @@ Use `cancel_execution` with {_follow_up_args(environment_id, dict(connection, pr
         return [TextContent(type="text", text=output_text)]
     
     except Exception as e:
-        # Clean up croc on error (not tracked for async cleanup)
-        await cleanup_croc_resources(croc_process, plan.croc_staging_dir if plan else "")
-        await cleanup_download_resources(dl_process, dl_plan.croc_receive_dir if dl_plan else "")
         # A credential problem carries a message written for the caller (which space
         # allows it, why its type cannot be used) - pass it through verbatim.
         if isinstance(e, credentials_module.CredentialError):
             return [TextContent(type="text", text=f"Credential error: {e}")]
         return [TextContent(type="text", text=f"Error starting async command: {str(e)}")]
+    finally:
+        if not handed_off:
+            # One clean-up of both sides, finished even if this request is cancelled
+            await _release_call_resources(croc_process, plan, dl_process, dl_plan)
 
 
 async def handle_run_on_tunneled_persistent_container_async(arguments: dict, config: dict = None,
@@ -4519,41 +4719,44 @@ async def handle_run_on_tunneled_persistent_container_async(arguments: dict, con
     except Exception as e:
         return [TextContent(type="text", text=f"Error setting up persistent container: {str(e)}")]
     
-    # Process files parameter - generate deployment commands (with croc for large files)
     files_info = []
     init_commands = None
     container_pre_commands = None
     plan = None
     croc_process = None
-    if files:
-        plan = prepare_files_with_croc(
-            files, transfer_mode="ssh",
-            target_ip=container_ip, ssh_user="root",
-            config=cfg,
-        )
-        if plan.errors:
-            return [TextContent(type="text", text="Error preparing files:\n" + "\n".join(f"- {e}" for e in plan.errors))]
-        if plan.inline_commands:
-            init_commands = plan.inline_commands
-        if plan.croc_container_pre_commands:
-            container_pre_commands = plan.croc_container_pre_commands
-        files_info = plan.files_info
-    
-    # Process download_files parameter
     dl_plan = None
     dl_process = None
-    if download_files:
-        dl_plan = prepare_download_with_croc(
-            download_files, transfer_mode="ssh",
-            target_ip=container_ip, ssh_user="root",
-            config=cfg,
-        )
-        if dl_plan.errors:
-            return [TextContent(type="text", text="Error preparing downloads:\n" + "\n".join(f"- {e}" for e in dl_plan.errors))]
-    
-    effective_command = command or "echo 'Files deployed successfully'"
-    
+    # Until the run's local side is handed to _croc_async_state (whose owner, the
+    # streamer or a poll, finishes it), every way out cleans it up in the finally.
+    handed_off = False
     try:
+        # Process files parameter - generate deployment commands (with croc for large files)
+        if files:
+            plan = prepare_files_with_croc(
+                files, transfer_mode="ssh",
+                target_ip=container_ip, ssh_user="root",
+                config=cfg,
+            )
+            if plan.errors:
+                return [TextContent(type="text", text="Error preparing files:\n" + "\n".join(f"- {e}" for e in plan.errors))]
+            if plan.inline_commands:
+                init_commands = plan.inline_commands
+            if plan.croc_container_pre_commands:
+                container_pre_commands = plan.croc_container_pre_commands
+            files_info = plan.files_info
+
+        # Process download_files parameter
+        if download_files:
+            dl_plan = prepare_download_with_croc(
+                download_files, transfer_mode="ssh",
+                target_ip=container_ip, ssh_user="root",
+                config=cfg,
+            )
+            if dl_plan.errors:
+                return [TextContent(type="text", text="Error preparing downloads:\n" + "\n".join(f"- {e}" for e in dl_plan.errors))]
+
+        effective_command = command or "echo 'Files deployed successfully'"
+
         # Start croc send locally if needed (must happen BEFORE Torque environment)
         if plan is not None and plan.needs_croc:
             try:
@@ -4589,20 +4792,22 @@ async def handle_run_on_tunneled_persistent_container_async(arguments: dict, con
                 **_croc_secrets(plan, dl_plan),
             )
             
-            # Track croc state for cleanup when execution completes
+            # Hand this run's local side to _croc_async_state: the background streamer
+            # finishes it when the run ends (or a poll, or cancel_execution, does)
             async_state = {}
             if croc_process is not None or (plan is not None and plan.needs_croc):
                 async_state["process"] = croc_process
                 async_state["upload"] = True
                 async_state["staging_dir"] = plan.croc_staging_dir if plan else ""
-                croc_process = None  # Don't clean up in except block
-            if dl_process is not None:
+            if dl_plan is not None and dl_plan.needs_download:
+                # (no process when only the Piping Server can carry it: the streamer
+                # must still feed the plan the agent's offer, which starts that receive)
                 async_state["dl_process"] = dl_process
                 async_state["dl_plan"] = dl_plan
-                dl_process = None  # Don't clean up in except block
             if async_state:
                 _croc_async_state[environment_id] = async_state
-            
+            handed_off = True
+
             # Arm the container's end time: it must outlive this async command
             # (idle window or command timeout + slack, whichever is larger).
             # The command runs unattended, so the idle window is re-armed from
@@ -4644,14 +4849,15 @@ Use `cancel_execution` with {_follow_up_args(environment_id, dict(connection, pr
         return [TextContent(type="text", text=output_text)]
     
     except Exception as e:
-        # Clean up croc on error (not tracked for async cleanup)
-        await cleanup_croc_resources(croc_process, plan.croc_staging_dir if plan else "")
-        await cleanup_download_resources(dl_process, dl_plan.croc_receive_dir if dl_plan else "")
         # A credential problem carries a message written for the caller (which space
         # allows it, why its type cannot be used) - pass it through verbatim.
         if isinstance(e, credentials_module.CredentialError):
             return [TextContent(type="text", text=f"Credential error: {e}")]
         return [TextContent(type="text", text=f"Error starting async command on container: {str(e)}")]
+    finally:
+        if not handed_off:
+            # One clean-up of both sides, finished even if this request is cancelled
+            await _release_call_resources(croc_process, plan, dl_process, dl_plan)
 
 
 async def handle_run_on_tunneled_disposable_container_async(arguments: dict, config: dict = None,
@@ -4671,36 +4877,39 @@ async def handle_run_on_tunneled_disposable_container_async(arguments: dict, con
     if not command and not files and not download_files:
         return [TextContent(type="text", text="Error: Must provide either 'command', 'upload_files', or 'download_files' (or any combination).")]
 
-    # Process files parameter - generate deployment commands (with croc for large files)
     files_info = []
     init_commands = None
     plan = None
     croc_process = None
-    if files:
-        plan = prepare_files_with_croc(files, transfer_mode="container", config=cfg)
-        if plan.errors:
-            return [TextContent(type="text", text="Error preparing files:\n" + "\n".join(f"- {e}" for e in plan.errors))]
-        # Combine croc init + inline commands for container target
-        combined = []
-        if plan.croc_init_commands:
-            combined.append(plan.croc_init_commands)
-        if plan.inline_commands:
-            combined.append(plan.inline_commands)
-        if combined:
-            init_commands = "\n".join(combined)
-        files_info = plan.files_info
-    
-    # Process download_files parameter
     dl_plan = None
     dl_process = None
-    if download_files:
-        dl_plan = prepare_download_with_croc(download_files, transfer_mode="container", config=cfg)
-        if dl_plan.errors:
-            return [TextContent(type="text", text="Error preparing downloads:\n" + "\n".join(f"- {e}" for e in dl_plan.errors))]
-    
-    effective_command = command or "echo 'Files deployed successfully'"
-    
+    # Until the run's local side is handed to _croc_async_state (whose owner, the
+    # streamer or a poll, finishes it), every way out cleans it up in the finally.
+    handed_off = False
     try:
+        # Process files parameter - generate deployment commands (with croc for large files)
+        if files:
+            plan = prepare_files_with_croc(files, transfer_mode="container", config=cfg)
+            if plan.errors:
+                return [TextContent(type="text", text="Error preparing files:\n" + "\n".join(f"- {e}" for e in plan.errors))]
+            # Combine croc init + inline commands for container target
+            combined = []
+            if plan.croc_init_commands:
+                combined.append(plan.croc_init_commands)
+            if plan.inline_commands:
+                combined.append(plan.inline_commands)
+            if combined:
+                init_commands = "\n".join(combined)
+            files_info = plan.files_info
+
+        # Process download_files parameter
+        if download_files:
+            dl_plan = prepare_download_with_croc(download_files, transfer_mode="container", config=cfg)
+            if dl_plan.errors:
+                return [TextContent(type="text", text="Error preparing downloads:\n" + "\n".join(f"- {e}" for e in dl_plan.errors))]
+
+        effective_command = command or "echo 'Files deployed successfully'"
+
         # Start croc send locally if needed (must happen BEFORE Torque environment)
         if plan is not None and plan.needs_croc:
             try:
@@ -4729,7 +4938,8 @@ async def handle_run_on_tunneled_disposable_container_async(arguments: dict, con
                 **_croc_secrets(plan, dl_plan),
             )
 
-        # Track croc state for cleanup when execution completes
+        # Hand this run's local side to _croc_async_state: the background streamer
+        # finishes it when the run ends (or a poll, or cancel_execution, does)
         async_state = {}
         if croc_process is not None or (plan is not None and plan.needs_croc):
             # (no process when only the Piping Server is offered; its task is
@@ -4737,14 +4947,15 @@ async def handle_run_on_tunneled_disposable_container_async(arguments: dict, con
             async_state["process"] = croc_process
             async_state["upload"] = True
             async_state["staging_dir"] = plan.croc_staging_dir if plan else ""
-            croc_process = None  # Don't clean up in except block
-        if dl_process is not None:
+        if dl_plan is not None and dl_plan.needs_download:
+            # (no process when only the Piping Server can carry it: the streamer must
+            # still feed the plan the agent's offer, which starts that receive)
             async_state["dl_process"] = dl_process
             async_state["dl_plan"] = dl_plan
-            dl_process = None  # Don't clean up in except block
         if async_state:
             _croc_async_state[environment_id] = async_state
-        
+        handed_off = True
+
         # Start background streaming of grain log to stderr
         _remember_async_connection(environment_id, dict(connection, profile=profile_name))
         _start_background_streamer(environment_id)
@@ -4773,14 +4984,15 @@ Use `cancel_execution` with {_follow_up_args(environment_id, dict(connection, pr
         return [TextContent(type="text", text=output_text)]
     
     except Exception as e:
-        # Clean up croc on error (not tracked for async cleanup)
-        await cleanup_croc_resources(croc_process, plan.croc_staging_dir if plan else "")
-        await cleanup_download_resources(dl_process, dl_plan.croc_receive_dir if dl_plan else "")
         # A credential problem carries a message written for the caller (which space
         # allows it, why its type cannot be used) - pass it through verbatim.
         if isinstance(e, credentials_module.CredentialError):
             return [TextContent(type="text", text=f"Credential error: {e}")]
         return [TextContent(type="text", text=f"Error starting async command: {str(e)}")]
+    finally:
+        if not handed_off:
+            # One clean-up of both sides, finished even if this request is cancelled
+            await _release_call_resources(croc_process, plan, dl_process, dl_plan)
 
 
 def _not_found_text(environment_id: str, connection: dict, what: str = "Environment") -> str:
@@ -4847,36 +5059,12 @@ async def handle_get_execution_status(arguments: dict, config: dict = None,
             _stop_background_streamer(environment_id)
             _streamer_cache.pop(environment_id, None)
             _async_env_connections.pop(environment_id, None)
-            # Clean up any croc send process/staging dir associated with this async execution
-            croc_state = _croc_async_state.pop(environment_id, None)
-            if croc_state:
-                had_croc_upload = bool(croc_state.get("upload")) or croc_state.get("process") is not None
-                # Before cleanup, which deletes the sender's output
-                upload_local_failure = _upload_local_failure(
-                    croc_state.get("process"), croc_state.get("staging_dir", ""))
-                await cleanup_croc_resources(
-                    croc_state.get("process"),
-                    croc_state.get("staging_dir", ""),
-                )
-                # Finalize file downloads if any
-                dl_process = croc_state.get("dl_process")
-                dl_plan = croc_state.get("dl_plan")
-                if dl_plan is not None and dl_plan.needs_download:
-                    # The background streamer stops on terminal status and may
-                    # have missed the tail of the log; refeed the full log so
-                    # the watcher sees the final sentinels (idempotent) before
-                    # the download's fate is decided.
-                    try:
-                        async with _connection_client(connection) as log_client:
-                            final_log = await log_client.get_grain_log(environment_id) or ""
-                        dl_plan.observe_output("\n" + final_log + "\n")
-                    except Exception:
-                        pass
-                    dl_successes, dl_errors = await complete_download(dl_plan, dl_process)
-                    # Store results for output formatting
-                    _download_results[environment_id] = (
-                        dl_successes, dl_errors, dl_plan.transfer_seconds)
-                    await cleanup_download_resources(dl_process, dl_plan.croc_receive_dir)
+            # This machine's side (croc sender, staging dir, download): finished here, or
+            # already by the background streamer when it saw the run end
+            await _finish_async_run(environment_id, connection)
+            found = _async_finish_results.pop(environment_id, None) or {}
+            had_croc_upload = found.get("had_croc_upload", False)
+            upload_local_failure = found.get("upload_local_failure", "")
         
         # We need a client for extracting outputs, cleanup, and grain log fetching
         async with _connection_client(connection) as client:
@@ -5117,18 +5305,12 @@ async def handle_cancel_execution(arguments: dict, config: dict = None,
     # Clean up any croc send process/staging dir associated with this execution
     croc_state = _croc_async_state.pop(environment_id, None)
     if croc_state:
-        await cleanup_croc_resources(
-            croc_state.get("process"),
-            croc_state.get("staging_dir", ""),
-        )
-        # Clean up download resources too
-        dl_process = croc_state.get("dl_process")
         dl_plan = croc_state.get("dl_plan")
-        await cleanup_download_resources(
-            dl_process,
-            dl_plan.croc_receive_dir if dl_plan else "",
-        )
+        await release_transfer_resources(
+            croc_state.get("process"), croc_state.get("staging_dir", ""),
+            croc_state.get("dl_process"), dl_plan.croc_receive_dir if dl_plan else "")
     _download_results.pop(environment_id, None)
+    _async_finish_results.pop(environment_id, None)
     
     try:
         async with _connection_client(connection) as client:
@@ -6156,6 +6338,10 @@ async def cli_dispatch(args):
                         credential_context=__cred_ctx,
                         **_croc_secrets(plan, dl_plan),
                     )
+            except BaseException:
+                # The run never finished: nothing below will complete the download
+                await cleanup_download_resources(dl_process, dl_plan.croc_receive_dir if dl_plan else "")
+                raise
             finally:
                 # Before cleanup, which deletes the sender's output
                 local_failure = _upload_local_failure(croc_process, plan.croc_staging_dir if plan else "")
@@ -6447,6 +6633,10 @@ async def cli_dispatch(args):
                             )
                         except Exception:
                             pass
+                except BaseException:
+                    # The run never finished: nothing below will complete the download
+                    await cleanup_download_resources(dl_process, dl_plan.croc_receive_dir if dl_plan else "")
+                    raise
                 finally:
                     # Before cleanup, which deletes the sender's output
                     local_failure = _upload_local_failure(croc_process, plan.croc_staging_dir if plan else "")
@@ -6581,6 +6771,10 @@ async def cli_dispatch(args):
                         credential_context=__cred_ctx,
                         **_croc_secrets(plan, dl_plan),
                     )
+            except BaseException:
+                # The run never finished: nothing below will complete the download
+                await cleanup_download_resources(dl_process, dl_plan.croc_receive_dir if dl_plan else "")
+                raise
             finally:
                 # Before cleanup, which deletes the sender's output
                 local_failure = _upload_local_failure(croc_process, plan.croc_staging_dir if plan else "")
@@ -7341,6 +7535,9 @@ def main():
         # Run as MCP server
         async def run_server():
             watcher = asyncio.create_task(_watch_config_file())
+            # Temp folders an earlier run of this server left (it was restarted
+            # mid-transfer), and later those of croc processes that have since finished
+            sweeper = asyncio.create_task(_sweep_leftovers_periodically())
             try:
                 async with stdio_server() as (read_stream, write_stream):
                     await server.run(
@@ -7349,11 +7546,12 @@ def main():
                         server.create_initialization_options(),
                     )
             finally:
-                watcher.cancel()
-                try:
-                    await watcher
-                except asyncio.CancelledError:
-                    pass
+                for task in (watcher, sweeper):
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
         asyncio.run(run_server())
     elif args.command == "profiles":
         # List profiles

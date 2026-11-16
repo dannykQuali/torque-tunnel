@@ -138,15 +138,17 @@ class _HashEncryptWriter:
         self._out.write(self._enc.finalize())
 
 
-def build_archive(source_dir: str, cipher_path: str, code: str) -> str:
-    """tar (the directory's entries; links kept as links) | gzip -1 | encrypt, into
-    ``cipher_path``. Returns the sha256 hex of the plaintext archive (tar.gz)."""
+def build_archive(source_dir: str, cipher_path: str, code: str, skip=()) -> str:
+    """tar (the directory's entries, except those named in ``skip``; links kept as
+    links) | gzip -1 | encrypt, into ``cipher_path``. Returns the sha256 hex of the
+    plaintext archive (tar.gz)."""
     with open(cipher_path, "wb") as out:
         sink = _HashEncryptWriter(out, code)
         with gzip.GzipFile(fileobj=sink, mode="wb", compresslevel=1, mtime=0) as gz:
             with tarfile.open(fileobj=gz, mode="w|", format=tarfile.GNU_FORMAT) as tar:
                 for name in sorted(os.listdir(source_dir)):
-                    tar.add(os.path.join(source_dir, name), arcname=name)
+                    if name not in skip:
+                        tar.add(os.path.join(source_dir, name), arcname=name)
         sink.finish()
     return sink.sha256.hexdigest()
 

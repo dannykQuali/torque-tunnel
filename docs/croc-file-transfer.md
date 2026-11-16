@@ -76,7 +76,8 @@ confirmed live and are pinned by `tests/test_call_init_scope.py`.
 3. Generates a 2048-bit cryptographic code for the transfer
 4. `execute_with_croc()` starts `croc send` locally in background
 5. The Torque environment starts, and the remote side runs `croc receive`
-6. After execution, the croc process and staging directory are cleaned up
+6. After execution, the croc process and staging directory are cleaned up, by every
+   way out of the tool (see *Temp folders and their clean-up*)
 
 A **symlinked directory** is tarred as the directory it points to
 (`tar.add(os.path.realpath(path), arcname=".")`). Links inside it stay links, as in the
@@ -229,12 +230,27 @@ need out-of-band file-existence checks.
 
 ### Async Handlers
 
-For async tools (`run_on_tunneled_ssh_async`, etc.), the croc send process (uploads) and croc receive process (downloads) are tracked in `_croc_async_state[environment_id]` and cleaned up when:
-- `get_execution_status` detects a terminal status (also finalizes downloads and includes results in output)
-- `cancel_execution` is called
-- An error occurs during environment startup
+For async tools (`run_on_tunneled_ssh_async`, etc.), the run's local side is tracked in
+`_croc_async_state[environment_id]`: the croc sender and staging dir of an upload, and
+the receiver (none when only the Piping Server can carry it) and plan of a download. It
+is finished (`_finish_async_run`: sender stopped, staging dir removed, download
+completed and placed, receive dir removed) when:
+- the **background streamer** sees the run end, or sees it deleted (404);
+- `get_execution_status` sees a terminal status, if the streamer has not done it yet
+  (whichever comes first does it; the other waits for it);
+- `cancel_execution` is called (stopped and removed, not completed);
+- starting it fails, by any way out of the tool (see *Temp folders and their clean-up*).
 
-Download results for async executions are stored in `_download_results[environment_id]` and included in the `get_execution_status` response.
+What finishing found (the upload's failure, the download's results) is kept in
+`_async_finish_results` / `_download_results` for the `get_execution_status` that
+reports it, for up to a day (`ASYNC_FINISH_RESULTS_KEEP_SECONDS`).
+
+Until 2026-11-16 only the poll and the cancel did it. A caller that never polled the
+run to its end (it moved on, or handed off) left the staging dir and croc's log behind:
+50 folders, 2.2 GB, on the worktogether broker's VM (wt-agent-dannyk), every one from an
+async run. An async download that only the Piping Server could carry was not tracked at
+all (the tool stored a download only when it had a croc receiver), so its receive never
+started and its folder stayed.
 
 **The Torque each async environment lives on is remembered** (`_async_env_connections`,
 2026-11-03). The background streamer, `get_execution_status` and `cancel_execution` use
@@ -261,6 +277,74 @@ Now:
 
 Those three are all that locate an environment: the agent, the SSH target and the rest
 only matter when one is launched.
+
+## Temp folders and their clean-up
+
+Each upload stages its files in `<temp>/torque_croc_*`. Each download receives into
+`<temp>/torque_dl_*`. croc's send output goes inside the staging folder, as
+`torque_croc_send_*.log`; before 2026-11-16 it was written to `<temp>` itself. The
+process that made a folder removes it when the transfer ends. Since 2026-11-16 every
+way out does this.
+
+**Every exit of every tool cleans up.**
+- The six run tools prepare the upload and the download inside the `try` whose
+  `finally` releases both.
+- The async tools skip that release only once the run is handed to
+  `_croc_async_state` (`handed_off`).
+- Before this:
+  - A failed download preparation returned after the upload was staged but before the
+    `try`.
+  - The async tools' own early returns ("Error starting croc file transfer / download
+    receiver") sat in a `try` with no `finally`. The second one also left the croc
+    sender running.
+  - `prepare_files_with_croc` returned on an archive it could not build without
+    removing the folder.
+  - The CLI left the download's receiver and folder when the run itself raised.
+
+**Clean-up finishes even when the request is cancelled.** The MCP SDK cancels a request
+through anyio. anyio's cancellation is level-triggered: every later await in the
+cancelled scope is cancelled too, including those in its `finally` blocks.
+`cleanup_croc_resources` stopped at its first await (waiting for croc to exit), before
+it removed anything. Now the clean-up runs in a task of its own
+(`_cleanup_to_the_end`), which that cancellation does not reach. A caller that is not
+cancelled still waits for it. `release_transfer_resources` does both sides in that one
+task.
+
+**A sweep removes what a dead process left** (`leftovers.py`):
+- **When:** at server start, then hourly (`_sweep_leftovers_periodically`).
+- **Why it is needed:** a restart loses the in-memory state. The worktogether broker
+  restarts its MCP servers at every agent restart: 112 times between 20 Oct and 16 Nov.
+- **Who uses a folder:** each folder names its users in `.tt-owner`, by PID and start
+  time. They are the torque-tunnel process that made it, and the croc sender or receive
+  wrapper it started.
+- **When a folder goes:** once none of them runs. The start time catches a reused PID.
+- **Why a croc sender keeps its folder:** it outlives a restarted server and still
+  completes its upload (seen on wt-agent-dannyk: #21336's croc finished three minutes
+  after the agent restarted).
+- **Why other instances are safe:** several torque-tunnel instances can share one temp
+  dir, for example one per Claude session on a laptop. Each one's folders count as live
+  while it runs.
+- **Folders and files with no owner file:**
+  - What they are: folders from older versions, the old send logs, and a cut-short
+    `tt_piping_*.enc`.
+  - When they go: once older than a day.
+  - Except: where `/proc` exists, not while a running process names them in its command
+    line, works in them, or holds a file in them open.
+- **Never touched:** anything else in the temp dir, and links.
+- **Not sent:** `.tt-owner` is left out of the Piping Server archive.
+- **Process checks by platform:**
+  - Linux: `/proc/<pid>/stat`.
+  - Windows: `OpenProcess` + `GetProcessTimes`.
+  - Elsewhere: `kill(pid, 0)`, without a start time.
+
+**croc's send log no longer keeps the code.** croc prints the code ("Code is: …" and the
+command line for the other side) before it dials the relay. Once the sender holds its
+relay connection, `start_croc_send` blanks every copy out of the file with `*` of the
+same length, in place: croc keeps writing at its own file offset. The code stays only in
+memory, to scrub croc's words if it fails later (`local_send_failure`).
+
+Tests: `tests/test_temp_leftovers.py`. The Linux paths of `leftovers.py` (start times,
+zombies, a folder held by a running process) were also checked under WSL.
 
 ## Relay per call
 
@@ -637,6 +721,7 @@ That's harmless on these IPv4-only networks, and `croc_relay` can override it.
 |---|---|
 | `src/torque_tunnel/croc_manager.py` | Cross-platform croc binary management, code generation, shell command generation (upload + download) |
 | `src/torque_tunnel/mcp_tool.py` | `FileDeploymentPlan`, `DownloadPlan`, prepare/execute/finalize/cleanup helpers, handler integration |
+| `src/torque_tunnel/leftovers.py` | Which temp folders are still in use (owner file, PID + start time), and the sweep of those that are not |
 | `blueprints/remote-shell-executor.yaml` | `container_pre_commands_b64` for pre-SSH croc uploads, `download_commands_b64` for post-SSH croc downloads |
 | `blueprints/local-shell-executor.yaml` | `download_commands_b64` for post-command croc downloads on containers |
 | `src/torque_tunnel/torque_client.py` | `container_pre_commands` and `download_commands` parameters |

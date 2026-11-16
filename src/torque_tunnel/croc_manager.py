@@ -1582,6 +1582,7 @@ async def start_croc_send(
     relay: str = "",
     relay_password: str = "",
     transfers: Optional[int] = None,
+    log_dir: Optional[str] = None,
 ) -> asyncio.subprocess.Process:
     """Start croc send as a background process.
 
@@ -1594,7 +1595,9 @@ async def start_croc_send(
     fill the buffer and deadlock it — that deadlock is why this used to be
     DEVNULL, which in turn is why a rate-limited send reported nothing but
     "exited immediately with code 1". The path is stashed on the returned
-    process as ``croc_log_path`` and removed by cleanup_croc_send.
+    process as ``croc_log_path`` and removed by cleanup_croc_send. croc prints the
+    code into it; that is blanked out once croc is connected (_blank_in_file), so the
+    file never keeps it, even when it outlives this process.
 
     A send rejected by the relay's admission limiter is retried after a backoff
     (see CROC_SEND_RATE_LIMIT_BACKOFF_SECONDS); any other failure raises at once,
@@ -1611,6 +1614,8 @@ async def start_croc_send(
         transfers: Optional number of parallel transfer streams. Each stream costs
             a relay admission, so lowering it buys more transfers per minute at
             the price of throughput. None leaves croc's default (4).
+        log_dir: Where croc's output file goes (default: the temp dir). Uploads pass
+            their staging dir, so it is removed with it.
 
     Returns:
         The asyncio subprocess Process handle.
@@ -1643,7 +1648,7 @@ async def start_croc_send(
     # connection grows with the payload.
     connect_deadline = CROC_SEND_CONNECT_MIN_SECONDS + _total_size(files) / CROC_SEND_PREPARE_RATE_BYTES_PER_SEC
 
-    log_fd, log_path = tempfile.mkstemp(prefix="torque_croc_send_", suffix=".log")
+    log_fd, log_path = tempfile.mkstemp(prefix="torque_croc_send_", suffix=".log", dir=log_dir or None)
     os.close(log_fd)
 
     max_attempts = len(CROC_SEND_RATE_LIMIT_BACKOFF_SECONDS) + 1
@@ -1670,8 +1675,11 @@ async def start_croc_send(
         connected = await _wait_for_relay_connection(process, connect_deadline)
 
         if process.returncode is None and connected:
-            # Registered and waiting for the receiver. The code stays in memory only,
-            # to scrub it from the output should croc fail later (local_send_failure).
+            # Registered and waiting for the receiver. croc printed the code before it
+            # dialed the relay; blank it out of the file. The code stays in memory
+            # only, to scrub it from the output should croc fail later
+            # (local_send_failure).
+            _blank_in_file(log_path, code)
             process.croc_log_path = log_path
             process.croc_secret = code
             return process
@@ -1710,6 +1718,29 @@ async def start_croc_send(
                 " config to a private relay to leave the shared budget behind."
             )
         raise RuntimeError(message)
+
+
+def _blank_in_file(path: str, secret: str) -> None:
+    """Overwrite every copy of ``secret`` in ``path`` with '*', in place.
+
+    croc prints its code ("Code is: ..." and the command line for the other side) into
+    the output file it keeps writing to. Same length and in place because croc writes
+    on at its own file offset: a shorter or recreated file would leave that offset past
+    the end, and croc's next line would land after a run of NUL bytes.
+    """
+    if not secret:
+        return
+    needle = secret.encode()
+    try:
+        with open(path, "r+b") as f:
+            data = f.read()
+            start = data.find(needle)
+            while start != -1:
+                f.seek(start)
+                f.write(b"*" * len(needle))
+                start = data.find(needle, start + len(needle))
+    except OSError:
+        pass
 
 
 def local_send_failure(process) -> str:
